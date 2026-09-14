@@ -58,13 +58,19 @@ Post tweets from Claude Code via the X API v2. Supports single tweets, threads (
 
 ## Tweet Drafting Guidelines
 
-Read `references/drafting-guidelines.md` for baseline rules, `config.json` for operational defaults (char target, thread style), and `LEARNINGS.json` for user-specific voice and preferences.
+Read `references/drafting-guidelines.md` for baseline rules, `config.json` for operational defaults (char target, thread style), and `LEARNINGS.local.json` for user-specific voice and preferences.
 
 ## Voice Learning
 
-Before drafting any tweet, read `LEARNINGS.json` to match the user's established voice and preferences. Read `config.json` for operational defaults.
+`LEARNINGS.json` in this directory is a **template only** (ships with the plugin, same for every installer — do not read it for voice, do not edit it with real preferences, and never copy its example entries into a real learnings file). The file that actually holds this user's learned voice is `LEARNINGS.local.json`, which is gitignored and per-installer.
 
-After each tweet is posted (confirmed via script output), append a new entry to the `entries` array in `LEARNINGS.json` for any patterns you noticed:
+Before drafting any tweet: if `LEARNINGS.local.json` does not exist yet in this directory, create it with an empty `entries` array by running:
+```
+python3 -c "import json, os; f='LEARNINGS.local.json'; os.path.exists(f) or json.dump({'entries': []}, open(f, 'w'), indent=2)"
+```
+Then read `LEARNINGS.local.json` to match the user's established voice and preferences. Read `config.json` for operational defaults.
+
+After each tweet is posted (confirmed via script output), append a new entry to the `entries` array in `LEARNINGS.local.json` (never edit the tracked `LEARNINGS.json` template) for any patterns you noticed:
 - Tone adjustments the user made during editing
 - Phrasing preferences (words they added, removed, or rephrased)
 - Structural preferences (thread vs. single tweet, use of lists, data, visuals)

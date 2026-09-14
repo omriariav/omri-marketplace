@@ -62,9 +62,13 @@ Read `references/drafting-guidelines.md` for baseline rules, `config.json` for o
 
 ## Voice Learning
 
-`LEARNINGS.json` in this directory is a **template only** (ships with the plugin, same for every installer — do not read it for voice, do not edit it with real preferences). The file that actually holds this user's learned voice is `LEARNINGS.local.json`, which is gitignored and per-installer.
+`LEARNINGS.json` in this directory is a **template only** (ships with the plugin, same for every installer — do not read it for voice, do not edit it with real preferences, and never copy its example entries into a real learnings file). The file that actually holds this user's learned voice is `LEARNINGS.local.json`, which is gitignored and per-installer.
 
-Before drafting any tweet: if `LEARNINGS.local.json` does not exist yet in this directory, create it by copying `LEARNINGS.json` (the template). Then read `LEARNINGS.local.json` to match the user's established voice and preferences. Read `config.json` for operational defaults.
+Before drafting any tweet: if `LEARNINGS.local.json` does not exist yet in this directory, create it with an empty `entries` array by running:
+```
+python3 -c "import json, os; f='LEARNINGS.local.json'; os.path.exists(f) or json.dump({'entries': []}, open(f, 'w'), indent=2)"
+```
+Then read `LEARNINGS.local.json` to match the user's established voice and preferences. Read `config.json` for operational defaults.
 
 After each tweet is posted (confirmed via script output), append a new entry to the `entries` array in `LEARNINGS.local.json` (never edit the tracked `LEARNINGS.json` template) for any patterns you noticed:
 - Tone adjustments the user made during editing

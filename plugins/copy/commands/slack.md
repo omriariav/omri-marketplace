@@ -71,7 +71,7 @@ Write Slack's own composer markup, per Slack's help pages [Format your messages]
 - Links: Markdown `[text](url)`. Do NOT use `<url|text>`: that is API `mrkdwn` syntax and renders literally in the composer. If link text isn't important, raw URLs are the most compatible fallback (Slack auto-unfurls them).
 - Bulleted list: `- ` at line start. Never `•` and never `* ` (a leading `*` collides with bold markup).
 - Numbered list: `1. `, `2. `, `3. ` at line start.
-- Slack markup has no list syntax, and with markup enabled Slack does not auto-format lists, so list lines send as typed. Keep lists flat: no nested or indented items.
+- On paste, Slack converts `- ` and `1. ` lines into real bulleted and numbered lists. Keep lists flat: no nested or indented items.
 - Headings: there is no heading markup. Use a `*bold*` line; never `#` / `##`.
 - @mentions: they do not resolve on paste (no link, no notification). Write the name as plain `@Name` and, in the confirmation, tell the user to retype each mention in Slack and pick it from autocomplete.
 - Tables in triple backticks (```) with ASCII art (│ and ─)

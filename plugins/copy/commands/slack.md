@@ -60,10 +60,39 @@ When the paste contains a `<table>` plus surrounding `<p>` paragraphs, Slack ign
 
 ## Slack Formatting Rules (mixed/prose path)
 
+Write Slack's own composer markup, per Slack's help pages [Format your messages](https://slack.com/help/articles/202288908-Format-your-messages-in-Slack) and [Format your messages with markup](https://slack.com/help/articles/360039953113-Format-your-messages-in-Slack-with-markup). Use only the syntax below, not general Markdown. Markup renders on send only when "Format messages with markup" is enabled (Slack → Preferences → Advanced → Input options).
+
+- Bold: `*text*` (single asterisks). Never `**text**`.
+- Italic: `_text_`. Never `*text*`: that is bold in Slack.
+- Strikethrough: `~text~`. Never `~~text~~`.
+- Inline code: `` `text` ``.
+- Code block: three backticks on their own line before and after the block.
+- Quote: `>` at the start of every quoted line (`>quoted text`).
+- Links: Markdown `[text](url)`. Do NOT use `<url|text>`: that is API `mrkdwn` syntax and renders literally in the composer. If link text isn't important, raw URLs are the most compatible fallback (Slack auto-unfurls them).
+- Bulleted list: `- ` at line start. Never `•` and never `* ` (a leading `*` collides with bold markup).
+- Numbered list: `1. `, `2. `, `3. ` at line start.
+- On paste, Slack converts `- ` and `1. ` lines into real bulleted and numbered lists. Keep lists flat: no nested or indented items.
+- Headings: there is no heading markup. Use a `*bold*` line; never `#` / `##`.
+- @mentions: they do not resolve on paste (no link, no notification). Write the name as plain `@Name` and, in the confirmation, tell the user to retype each mention in Slack and pick it from autocomplete.
 - Tables in triple backticks (```) with ASCII art (│ and ─)
-- Bold: single `*text*`
-- Links: Markdown `[text](url)` (renders as a hyperlink in the composer when "Format messages with markup" is enabled in Slack preferences). Do NOT use `<url|text>` — that's API/`mrkdwn` syntax and renders literally in the composer. If link text isn't important, raw URLs are the most compatible fallback (Slack auto-unfurls them).
 - Generate QuickChart URL for numeric comparisons
+
+Sample paste (mixed/prose path):
+
+```text
+*Weekly update*
+
+Shipped:
+- New onboarding flow (_beta_)
+- ~Three~ Two bugs fixed, see [the tracker](https://example.com/tracker)
+- `retry_limit` raised to 5
+
+Next:
+1. Roll out to 10%
+2. Review metrics with @Owner
+
+>Blocked on legal sign-off
+```
 
 ## ASCII Table Format
 
@@ -103,3 +132,5 @@ After copying, show:
 Preview:
 [first 5-10 lines of copied content]
 ```
+
+If the content has @mentions, add one line after the preview: `Retype in Slack and pick from autocomplete: @Name1, @Name2` (pasted mentions don't resolve).

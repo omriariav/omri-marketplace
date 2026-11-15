@@ -1,5 +1,16 @@
 # Releases
 
+## copy v2.4.1 (2026-11-15)
+
+Fix: `/copy:slack` writes Slack's own composer markup on the mixed/prose path, aligned with Slack's help pages ([Format your messages](https://slack.com/help/articles/202288908-Format-your-messages-in-Slack), [Format your messages with markup](https://slack.com/help/articles/360039953113-Format-your-messages-in-Slack-with-markup)).
+
+- Previously the rules covered only bold, links and tables, so the model improvised the rest (for example `•` bullets).
+- Explicit rules for bold `*text*`, italic `_text_`, strikethrough `~text~`, inline code, code blocks and `>` quotes, plus "never" forms (`**bold**`, `~~strike~~`, `#` headings, `<url|text>`).
+- Bulleted lists use `- ` (never `•` or `* `), numbered lists use `1. `, and lists stay flat. Headings become a `*bold*` line.
+- @mentions don't resolve on paste. The confirmation now lists them and tells the user to retype each one and pick it from autocomplete.
+- Added a sample paste, and kept the note that markup renders only with "Format messages with markup" enabled (now with its location in Preferences).
+- Native manifests (Codex/Grok/Cursor) and the generated `copy-slack` skill regenerated via `scripts/sync-native-manifests.py`.
+
 ## natbag v1.2.3 (2026-08-21)
 
 Bugfix: SSL fallback for Python installs without a CA bundle.

@@ -12,7 +12,7 @@
       "name": "copy",
       "source": "plugins/copy",
       "description": "Format and copy AI-assistant output to clipboard for Slack, Email, Google Chat, Google Docs, or Jira.",
-      "version": "2.4.0",
+      "version": "2.4.1",
       "author": {
         "name": "Omri Ariav",
         "email": "omri.ariav@gmail.com"

@@ -436,20 +436,22 @@ def _tok(n):
 
 
 def format_report(r):
-    lines = [f"model-picker report ({r['period']})", ""]
+    """Render the report as Markdown that survives any renderer: a bold title, bullet lists (never bare
+    lines, which Markdown joins into one paragraph), and blank lines around the table."""
+    lines = [f"**model-picker report ({r['period']})**", ""]
     if not r["launches"] and not r["subagents"] and not r.get("local_calls"):
         return "\n".join(lines + ["No launches logged yet. The ledger fills as agents launch "
-                                  "(MODEL_PICKER_LOG must not be 0)."])
+                                  "(`MODEL_PICKER_LOG` must not be `0`)."])
     tiers = ", ".join(f"{k} {v}" for k, v in sorted(r["launch_tiers"].items(), key=lambda kv: -kv[1]))
     lines += [
-        f"Launches: {r['launches']} ({r['checked']} checked, {r['skipped']} skipped as fork/pinned/built-in"
+        f"- Launches: {r['launches']} ({r['checked']} checked, {r['skipped']} skipped as fork/pinned/built-in"
         + (f"; {r['denied']} denied in enforce mode and retried" if r.get("denied") else "") + ")",
-        f"Explicit model: {r['explicit']}/{r['checked']} ({_pct(r['explicit'], r['checked'])})",
-        f"Followed recommendation: {r['followed']}/{r['compared']} ({_pct(r['followed'], r['compared'])})",
-        f"Launch models: {tiers or 'n/a'}",
+        f"- Explicit model: {r['explicit']}/{r['checked']} ({_pct(r['explicit'], r['checked'])})",
+        f"- Followed recommendation: {r['followed']}/{r['compared']} ({_pct(r['followed'], r['compared'])})",
+        f"- Launch models: {tiers or 'n/a'}",
     ]
     if r["router_calls"]:
-        lines.append(f"Router: {r['router_hits']}/{r['router_calls']} answered by the decisions API "
+        lines.append(f"- Router: {r['router_hits']}/{r['router_calls']} answered by the decisions API "
                      f"(p50 {r['router_p50_ms']} ms, avg confidence {r['router_avg_conf']}); rest by heuristic")
     if r["by_model"]:
         lines += ["", "| Model | Agents | Input | Output | Cache read | Cost | At session model | Saved |",
@@ -458,27 +460,28 @@ def format_report(r):
             lines.append(f"| {key} | {row['agents']} | {_tok(row['input'] + row['cache_write'])} | "
                          f"{_tok(row['output'])} | {_tok(row['cache_read'])} | ${row['cost']:.2f} | "
                          f"${row['baseline_cost']:.2f} | ${row['saving']:.2f} |")
-        lines += ["", f"Subagent spend: ${r['cost']:.2f}; at the session model it would have been "
-                      f"${r['baseline_cost']:.2f}. Total difference: ${r['saving']:.2f} "
-                      f"({_pct(r['saving'], r['baseline_cost'])})."]
         labels = {"model-picker": "followed model-picker's recommendation",
                   "definition": "model set by the agent's own definition (would have happened anyway)",
                   "explicit": "explicit model that differed from the recommendation",
                   "unjudged": "explicit model with no confident recommendation to compare against",
                   "inherited": "inherited the session model", "unknown": "no launch record"}
         attr = r.get("saving_by_attribution") or {}
-        lines.append(f"Credited to model-picker: ${r.get('credited_saving', 0):.2f} "
-                     f"({attr.get('model-picker', {}).get('agents', 0)} agent(s) that followed its recommendation).")
+        lines += ["",
+                  f"- Subagent spend: ${r['cost']:.2f}; at the session model it would have been "
+                  f"${r['baseline_cost']:.2f}. Total difference: ${r['saving']:.2f} "
+                  f"({_pct(r['saving'], r['baseline_cost'])}).",
+                  f"- **Credited to model-picker: ${r.get('credited_saving', 0):.2f}** "
+                  f"({attr.get('model-picker', {}).get('agents', 0)} agent(s) that followed its recommendation)."]
         for key in ("definition", "explicit", "unjudged", "inherited", "unknown"):
             if key in attr:
-                lines.append(f"  not credited — {labels[key]}: {attr[key]['agents']} agent(s), "
+                lines.append(f"  - Not credited, {labels[key]}: {attr[key]['agents']} agent(s), "
                              f"${attr[key]['saving']:.2f}")
         if r["local_agents"]:
-            lines.append(f"{r['local_agents']} subagent(s) ran on a local model, counted at $0.")
-        lines.append("Estimate: same tokens at list prices; a larger model may have used fewer tokens.")
+            lines.append(f"- {r['local_agents']} subagent(s) ran on a local model, counted at $0.")
+        lines += ["", "_Estimate: same tokens at list prices; a larger model may have used fewer tokens._"]
     if r.get("local_calls"):
         ok = r["local_calls"] - r["local_errors"]
-        lines += ["", f"Local model (ask_local): {ok} call(s), {_tok(r['local_input'])} in / "
+        lines += ["", f"- Local model (ask_local): {ok} call(s), {_tok(r['local_input'])} in / "
                       f"{_tok(r['local_output'])} out tokens, $0; ~${r['local_haiku_equiv']:.3f} at Haiku prices"
                       + (f"; {r['local_errors']} failed" if r["local_errors"] else "") + "."]
     return "\n".join(lines)

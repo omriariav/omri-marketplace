@@ -98,23 +98,23 @@ Rotated files are kept as `log.<epoch>.jsonl` (newest 10); writes are serialized
 
 `/model-picker:report 7d` (or `today`, `24h`, `30d`, `all`; `--json` for raw numbers):
 
-```
-model-picker report (7d)
+```markdown
+**model-picker report (7d)**
 
-Launches: 23 (19 checked, 4 skipped as fork/pinned/built-in)
-Explicit model: 17/19 (89%)
-Followed recommendation: 14/17 (82%)
-Launch models: haiku 11, sonnet 5, opus 3
-Router: 16/17 answered by the decisions API (p50 720 ms, avg confidence 0.9); rest by heuristic
+- Launches: 23 (19 checked, 4 skipped as fork/pinned/built-in)
+- Explicit model: 17/19 (89%)
+- Followed recommendation: 14/17 (82%)
+- Launch models: haiku 11, sonnet 5, opus 3
+- Router: 16/17 answered by the decisions API (p50 720 ms, avg confidence 0.9); rest by heuristic
 
 | Model | Agents | Input | Output | Cache read | Cost | At session model | Saved |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | sonnet | 5 | 410.2K | 38.1K | 2.10M | $1.43 | $2.86 | $1.43 |
 | haiku | 11 | 320.5K | 61.0K | 3.40M | $0.10 | $3.87 | $3.77 |
 
-Subagent spend: $1.53; at the session model it would have been $6.73. Total difference: $5.20 (77%).
-Credited to model-picker: $3.94 (13 agent(s) that followed its recommendation).
-  not credited — model set by the agent's own definition (would have happened anyway): 3 agent(s), $1.26
+- Subagent spend: $1.53; at the session model it would have been $6.73. Total difference: $5.20 (77%).
+- **Credited to model-picker: $3.94** (13 agent(s) that followed its recommendation).
+  - Not credited, model set by the agent's own definition (would have happened anyway): 3 agent(s), $1.26
 ```
 
 (Illustrative numbers.) Prices are Claude API list prices per million tokens: Haiku 5.5 $0.10 input / $0.50 output for prompts up to 100K tokens ($0.50 / $2.50 above), Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20, Fable 5.2 $8 / $40, with cache reads at $0.01 (Haiku), $0.10, $0.20, $0.20. Cache writes use the standard 1.25x (5-minute) and 2x (1-hour) input multipliers. The saving is an estimate: same tokens, different price. A larger model may finish in fewer tokens, so treat it as an upper bound.

@@ -1,8 +1,8 @@
 """Local usage ledger for model-picker: decision log, subagent token usage, cost and savings.
 
 Everything stays on this machine in $MODEL_PICKER_STATE_DIR (default ~/.config/model-picker):
-  log.jsonl     one JSON object per line, {"kind": "decision" | "usage", ...}
-  log.1.jsonl   previous file after rotation (at 5 MB)
+  log.jsonl                 one JSON object per line, {"kind": "decision" | "usage", ...}
+  log.<epoch>.jsonl         rotated files (at 5 MB); the newest KEEP_ROTATED are kept
 
 Prices are Claude API list prices per million tokens from Anthropic's "Which Claude model should
 you build with?" (Nov 2026). Cache writes are not listed there; they use Anthropic's standard
@@ -12,6 +12,7 @@ Savings are estimates: the same tokens priced at the session model, which a suba
 explicit model would have inherited. A larger model may need fewer tokens for the same task.
 """
 
+import fcntl
 import json
 import os
 import time
@@ -29,6 +30,7 @@ PRICES = {
 HAIKU_LONG_PROMPT = 100_000
 TIERS = ("haiku", "sonnet", "opus", "fable")
 ROTATE_BYTES = 5 * 1024 * 1024
+KEEP_ROTATED = 10
 
 
 def state_dir(cfg):
@@ -44,30 +46,51 @@ def logging_enabled(cfg):
 
 
 def append(cfg, record):
-    """Append one record; never raises (the ledger must not break a hook)."""
+    """Append one record; never raises (the ledger must not break a hook).
+
+    Concurrent hooks (parallel subagents) serialize on an flock, so rotation happens once and
+    no line interleaves. Files are created 0600 inside a 0700 directory.
+    """
     if not logging_enabled(cfg):
         return
     try:
         path = log_path(cfg)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and path.stat().st_size > ROTATE_BYTES:
-            path.replace(path.with_name("log.1.jsonl"))
-        record = {"ts": round(time.time(), 3), **record}
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        line = json.dumps({"ts": round(time.time(), 3), **record}, separators=(",", ":")) + "\n"
+        lock_fd = os.open(path.with_name(".log.lock"), os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if path.exists() and path.stat().st_size > ROTATE_BYTES:
+                path.replace(path.with_name(f"log.{int(time.time() * 1000)}.jsonl"))
+                for old in _rotated(path.parent)[:-KEEP_ROTATED]:
+                    old.unlink(missing_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, line.encode("utf-8"))
+            finally:
+                os.close(fd)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
     except Exception:
         pass
+
+
+def _rotated(directory):
+    """Rotated ledger files, oldest first."""
+    files = []
+    for p in directory.glob("log.*.jsonl"):
+        stem = p.name[len("log."):-len(".jsonl")]
+        if stem.isdigit():
+            files.append((int(stem), p))
+    return [p for _, p in sorted(files)]
 
 
 def read(cfg, since=0.0):
     """All records newer than `since` (epoch seconds), oldest first, across rotated files."""
     out = []
-    for name in ("log.1.jsonl", "log.jsonl"):
-        path = state_dir(cfg) / name
+    directory = state_dir(cfg)
+    for path in _rotated(directory) + [directory / "log.jsonl"]:
         try:
             with open(path, encoding="utf-8") as fh:
                 for line in fh:
@@ -80,6 +103,17 @@ def read(cfg, since=0.0):
         except OSError:
             continue
     return out
+
+
+def find_decision(cfg, tool_use_id):
+    """The decision record logged for a launch, by its tool_use_id (latest wins), or None."""
+    if not tool_use_id:
+        return None
+    found = None
+    for rec in read(cfg, time.time() - 7 * 86400):
+        if rec.get("kind") == "decision" and rec.get("tool_use_id") == tool_use_id:
+            found = rec
+    return found
 
 
 # --- transcripts -----------------------------------------------------------------
@@ -179,6 +213,28 @@ def subagent_transcript(payload):
     return None
 
 
+def attribute(decision):
+    """Why a subagent ran on its model, for crediting savings honestly.
+
+    model-picker  explicit model that matched the recommendation, not already set by the agent definition
+    definition    the agent's own definition set that model (saving would have happened anyway)
+    explicit      explicit model that differed from the recommendation
+    inherited     no model: ran on the session model (no saving)
+    unknown       no launch record (hooks inactive at launch, or a non-Agent launch)
+    """
+    if not decision:
+        return "unknown"
+    outcome = decision.get("outcome")
+    pinned_tier = tier_of(decision.get("pinned"))
+    if outcome == "pinned" or (pinned_tier and pinned_tier == decision.get("chosen_tier")):
+        return "definition"
+    if outcome == "explicit":
+        return "model-picker" if decision.get("followed") else "explicit"
+    if outcome in ("missing", "denied"):
+        return "inherited"
+    return "unknown"
+
+
 # --- pricing ---------------------------------------------------------------------
 
 def price_table(cfg):
@@ -228,8 +284,10 @@ def summarize_usage(messages, baseline_tier, table):
         else:
             cost = message_cost(msg, tier, table)
             if cost is None:
+                # Unknown Claude model: no price, so no claimed saving either.
                 tot["unpriced"] = True
-                cost = 0.0
+                tot["baseline_cost"] += 0.0
+                continue
         tot["cost"] += cost
         base = message_cost(msg, baseline_tier, table) if baseline_tier else None
         tot["baseline_cost"] += cost if base is None else base
@@ -257,12 +315,19 @@ def since_epoch(period, now=None):
 def report(cfg, period="7d", now=None):
     """Aggregate the ledger into a dict (see format_report for the rendered view)."""
     recs = read(cfg, since_epoch(period, now))
-    dec = [r for r in recs if r.get("kind") == "decision"]
-    use = [r for r in recs if r.get("kind") == "usage"]
+    # A denied launch (enforce mode) is retried with a model; count the retry, not both.
+    dec = [r for r in recs if r.get("kind") == "decision" and r.get("outcome") != "denied"]
+    denied = sum(1 for r in recs if r.get("kind") == "decision" and r.get("outcome") == "denied")
+    # A resumed subagent stops more than once; each usage row is cumulative, so keep the last.
+    last_use = {}
+    for r in recs:
+        if r.get("kind") == "usage":
+            last_use[r.get("agent_id") or id(r)] = r
+    use = list(last_use.values())
     checked = [d for d in dec if d.get("outcome") in ("explicit", "missing")]
     explicit = [d for d in checked if d["outcome"] == "explicit"]
     compared = [d for d in explicit if d.get("followed") is not None]
-    routed = [d for d in dec if d.get("source")]
+    routed = [d for d in dec if d.get("router_ms") is not None]  # the router was actually called
     router_hits = [d for d in routed if not str(d["source"]).startswith("heuristic")]
     latencies = sorted(d["router_ms"] for d in router_hits if isinstance(d.get("router_ms"), (int, float)))
     confidences = [d["confidence"] for d in router_hits if isinstance(d.get("confidence"), (int, float))]
@@ -274,9 +339,18 @@ def report(cfg, period="7d", now=None):
         row["agents"] += 1
         for k in ("input", "output", "cache_read", "cache_write", "cost", "baseline_cost", "saving"):
             row[k] += u.get(k) or 0
+    by_attr = {}
+    for u in use:
+        a = u.get("attribution") or "unknown"
+        row = by_attr.setdefault(a, {"agents": 0, "saving": 0.0})
+        row["agents"] += 1
+        row["saving"] += u.get("saving") or 0
     tiers = {}
     for d in dec:
-        tiers[d.get("chosen_tier") or "inherit"] = tiers.get(d.get("chosen_tier") or "inherit", 0) + 1
+        if d.get("outcome") == "skipped":
+            continue
+        key = d.get("chosen_tier") or d.get("chosen") or "unknown"
+        tiers[key] = tiers.get(key, 0) + 1
     return {
         "period": period,
         "launches": len(dec),
@@ -284,6 +358,7 @@ def report(cfg, period="7d", now=None):
         "explicit": len(explicit),
         "missing_model": len(checked) - len(explicit),
         "skipped": len(dec) - len(checked),
+        "denied": denied,
         "followed": sum(1 for d in compared if d["followed"]),
         "compared": len(compared),
         "launch_tiers": tiers,
@@ -297,6 +372,9 @@ def report(cfg, period="7d", now=None):
         "cost": round(sum(u.get("cost") or 0 for u in use), 4),
         "baseline_cost": round(sum(u.get("baseline_cost") or 0 for u in use), 4),
         "saving": round(sum(u.get("saving") or 0 for u in use), 4),
+        "saving_by_attribution": {k: {"agents": v["agents"], "saving": round(v["saving"], 4)}
+                                  for k, v in by_attr.items()},
+        "credited_saving": round(by_attr.get("model-picker", {}).get("saving", 0.0), 4),
         "local_agents": sum(1 for u in use if u.get("local")),
     }
 
@@ -324,7 +402,8 @@ def format_report(r):
                                   "(MODEL_PICKER_LOG must not be 0)."])
     tiers = ", ".join(f"{k} {v}" for k, v in sorted(r["launch_tiers"].items(), key=lambda kv: -kv[1]))
     lines += [
-        f"Launches: {r['launches']} ({r['checked']} checked, {r['skipped']} skipped as fork/pinned/built-in)",
+        f"Launches: {r['launches']} ({r['checked']} checked, {r['skipped']} skipped as fork/pinned/built-in"
+        + (f"; {r['denied']} denied in enforce mode and retried" if r.get("denied") else "") + ")",
         f"Explicit model: {r['explicit']}/{r['checked']} ({_pct(r['explicit'], r['checked'])})",
         f"Followed recommendation: {r['followed']}/{r['compared']} ({_pct(r['followed'], r['compared'])})",
         f"Launch models: {tiers or 'n/a'}",
@@ -340,8 +419,19 @@ def format_report(r):
                          f"{_tok(row['output'])} | {_tok(row['cache_read'])} | ${row['cost']:.2f} | "
                          f"${row['baseline_cost']:.2f} | ${row['saving']:.2f} |")
         lines += ["", f"Subagent spend: ${r['cost']:.2f}; at the session model it would have been "
-                      f"${r['baseline_cost']:.2f}. Estimated saving: ${r['saving']:.2f} "
+                      f"${r['baseline_cost']:.2f}. Total difference: ${r['saving']:.2f} "
                       f"({_pct(r['saving'], r['baseline_cost'])})."]
+        labels = {"model-picker": "followed model-picker's recommendation",
+                  "definition": "model set by the agent's own definition (would have happened anyway)",
+                  "explicit": "explicit model that differed from the recommendation",
+                  "inherited": "inherited the session model", "unknown": "no launch record"}
+        attr = r.get("saving_by_attribution") or {}
+        lines.append(f"Credited to model-picker: ${r.get('credited_saving', 0):.2f} "
+                     f"({attr.get('model-picker', {}).get('agents', 0)} agent(s) that followed its recommendation).")
+        for key in ("definition", "explicit", "inherited", "unknown"):
+            if key in attr:
+                lines.append(f"  not credited — {labels[key]}: {attr[key]['agents']} agent(s), "
+                             f"${attr[key]['saving']:.2f}")
         if r["local_agents"]:
             lines.append(f"{r['local_agents']} subagent(s) ran on a local model, counted at $0.")
         lines.append("Estimate: same tokens at list prices; a larger model may have used fewer tokens.")

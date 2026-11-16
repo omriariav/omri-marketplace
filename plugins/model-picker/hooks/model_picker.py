@@ -314,14 +314,14 @@ def _short(text, n=120):
     return text if len(text) <= n else text[:n - 1] + "…"
 
 
-def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None):
+def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_model=None, pinned=None):
     """One ledger line per checked launch. Description only (local file); never the prompt."""
     chosen_tier = ledger.tier_of(chosen) if chosen else None
     entry = {
         "kind": "decision", "session": payload.get("session_id"), "tool_use_id": payload.get("tool_use_id"),
         "tool": payload.get("tool_name"), "agent_type": str(inp.get("subagent_type") or "general-purpose"),
         "description": _short(inp.get("description") or inp.get("name")), "outcome": outcome,
-        "chosen": chosen, "chosen_tier": chosen_tier,
+        "chosen": chosen, "chosen_tier": chosen_tier, "session_model": session_model, "pinned": pinned,
     }
     if rec:
         entry.update({"rec_tier": rec["tier"], "rec_effort": rec["effort"], "source": rec["source"],
@@ -351,15 +351,17 @@ def handle_agent(payload, mode, cfg):
         log_decision(cfg, payload, inp, "skipped")
         return
     model = inp.get("model")
-    pinned = None if model else pinned_model(agent_type, payload.get("cwd"))
-    if pinned:
-        log_decision(cfg, payload, inp, "pinned", chosen=pinned)
+    pinned = pinned_model(agent_type, payload.get("cwd"))
+    if pinned and not model:
+        log_decision(cfg, payload, inp, "pinned", chosen=pinned, pinned=pinned)
         return  # the agent definition already pins a model
 
     # An explicit model only needs a mismatch check: keep it local and instant (no router call).
     rec = decide(inp, cfg, use_router=not model)
-    session_model = None if model else ledger.last_model(payload.get("transcript_path"))
-    log_decision(cfg, payload, inp, "explicit" if model else "missing", chosen=model or session_model, rec=rec)
+    session_model = ledger.last_model(payload.get("transcript_path"))
+    outcome = "explicit" if model else ("denied" if mode == "enforce" else "missing")
+    log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,
+                 pinned=pinned)
     note = verbose_note(cfg, label, model, rec)
     if model:
         chosen = tier_of(model)
@@ -390,15 +392,19 @@ def handle_subagent_stop(payload, cfg):
     if not messages:
         return
     meta = ledger.subagent_meta(path)
-    session_model = ledger.last_model(payload.get("transcript_path"))
+    # Price the baseline at the session model as of launch (the user may switch /model later).
+    launch = ledger.find_decision(cfg, meta.get("toolUseId")) or {}
+    session_model = launch.get("session_model") or ledger.last_model(payload.get("transcript_path"))
     baseline = ledger.tier_of(session_model)
     totals = ledger.summarize_usage(messages, baseline, ledger.price_table(cfg))
+    attribution = ledger.attribute(launch)
     main_model = max(totals["models"], key=totals["models"].get)
     ledger.append(cfg, {
         "kind": "usage", "session": payload.get("session_id"), "agent_id": payload.get("agent_id"),
         "tool_use_id": meta.get("toolUseId"), "agent_type": meta.get("agentType") or payload.get("agent_type"),
         "description": _short(meta.get("description")), "model": main_model, "tier": ledger.tier_of(main_model)
         or ("local" if totals["local"] else None), "session_model": session_model,
+        "attribution": attribution,
         **{k: totals[k] for k in ("messages", "input", "output", "cache_read", "cache_write", "cost",
                                   "baseline_cost", "saving", "local", "unpriced")},
     })
@@ -481,7 +487,11 @@ def main():
     if event == "report":
         args = sys.argv[2:]
         period = next((a for a in args if not a.startswith("-")), "7d")
-        data = ledger.report(cfg, period)
+        try:
+            data = ledger.report(cfg, period)
+        except ValueError as exc:
+            print(f"model-picker report: {exc}", file=sys.stderr)
+            sys.exit(2)
         print(json.dumps(data, indent=2) if "--json" in args else ledger.format_report(data))
         return
     root = sys.argv[2]

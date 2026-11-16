@@ -326,7 +326,71 @@ with tempfile.TemporaryDirectory() as d:
     big = Path(st["MODEL_PICKER_STATE_DIR"]) / "log.jsonl"
     big.write_text("x" * (ledger.ROTATE_BYTES + 1))
     ledger.append(st, {"kind": "decision", "outcome": "skipped"})
-    results.append(check("ledger rotates at 5 MB", (big.parent / "log.1.jsonl").exists() and big.stat().st_size < 1000))
+    rotated = ledger._rotated(big.parent)
+    results.append(check("ledger rotates at 5 MB", len(rotated) == 1 and big.stat().st_size < 1000))
+    results.append(check("ledger files private", oct(big.stat().st_mode & 0o777) == "0o600"))
+
+    # Review round: router stats, resumed subagents, enforce retries, unpriced models, attribution.
+    st = fresh_state()
+    for mid in ("x1", "x2", "x3"):
+        run({**base, "tool_use_id": mid, "tool_name": "Agent",
+             "tool_input": {"description": "Find logs", "prompt": "p", "model": "haiku"}}, "advise", st)
+    rep = ledger.report(st, "all")
+    results.append(check("router stats ignore launches that never called the router",
+                         rep["router_calls"] == 0 and "Router:" not in ledger.format_report(rep)))
+    run({**base, "tool_use_id": "e1", "tool_name": "Agent", "tool_input": {"description": "Find logs", "prompt": "p"}},
+        "enforce", st)
+    run({**base, "tool_use_id": "e2", "tool_name": "Agent",
+         "tool_input": {"description": "Find logs", "prompt": "p", "model": "haiku"}}, "enforce", st)
+    rep = ledger.report(st, "all")
+    results.append(check("enforce deny + retry counts once", rep["launches"] == 4 and rep["denied"] == 1
+                         and rep["explicit"] == 4 and rep["missing_model"] == 0))
+    for cost in (0.1, 0.3):  # resumed subagent: two cumulative rows
+        ledger.append(st, {"kind": "usage", "agent_id": "same", "tier": "haiku", "cost": cost,
+                           "baseline_cost": 1.0, "saving": 1.0 - cost, "attribution": "model-picker"})
+    rep = ledger.report(st, "all")
+    results.append(check("resumed subagent counted once (last row)", rep["subagents"] == 1 and abs(rep["cost"] - 0.3) < 1e-9))
+    unp = ledger.summarize_usage([{"model": "claude-legacy-x", "input": 1000, "output": 1000, "cache_read": 0,
+                                   "cache_write": 0, "cache_write_1h": 0}], "opus", tbl)
+    results.append(check("unpriced claude model claims no saving", unp["unpriced"] and unp["saving"] == 0))
+    results.append(check("skipped launches not counted as a launch model",
+                         "unknown" not in ledger.report(st, "all")["launch_tiers"]))
+    results += [
+        check("attribution: followed explicit -> model-picker",
+              ledger.attribute({"outcome": "explicit", "followed": True, "chosen_tier": "haiku"}) == "model-picker"),
+        check("attribution: definition already set it -> definition",
+              ledger.attribute({"outcome": "explicit", "followed": True, "chosen_tier": "haiku",
+                                "pinned": "haiku"}) == "definition"),
+        check("attribution: pinned launch -> definition", ledger.attribute({"outcome": "pinned"}) == "definition"),
+        check("attribution: not followed -> explicit",
+              ledger.attribute({"outcome": "explicit", "followed": False, "chosen_tier": "opus"}) == "explicit"),
+        check("attribution: no record -> unknown", ledger.attribute(None) == "unknown"),
+    ]
+    st2 = fresh_state()
+    for aid, attr, sav in (("a1", "model-picker", 0.5), ("a2", "definition", 0.3)):
+        ledger.append(st2, {"kind": "usage", "agent_id": aid, "tier": "haiku", "cost": 0.01,
+                            "baseline_cost": sav + 0.01, "saving": sav, "attribution": attr})
+    rep = ledger.report(st2, "all")
+    txt = ledger.format_report(rep)
+    results.append(check("report: only followed recommendations credited",
+                         abs(rep["credited_saving"] - 0.5) < 1e-9 and "Credited to model-picker: $0.50" in txt
+                         and "would have happened anyway" in txt))
+    proc = subprocess.run([sys.executable, "-I", str(HOOK), "report", "14d"], capture_output=True, text=True,
+                          env={**os.environ, **st2})
+    results.append(check("report CLI: bad period is a clean error",
+                         proc.returncode == 2 and "unknown period" in proc.stderr and "hook error" not in proc.stdout))
+
+    # SubagentStop prices the baseline at the launch-time session model and attributes the saving.
+    st3 = fresh_state()
+    run({**base, "tool_use_id": "toolu_1", "tool_name": "Agent",
+         "tool_input": {"description": "Find logs", "prompt": "p", "model": "haiku"}}, "advise", st3)
+    write_transcript(sess, [amsg("m0", "claude-sonnet-5-5", inp=10, out=10)])  # user switched /model later
+    subprocess.run([sys.executable, "-I", str(HOOK), "subagentstop", str(ROOT)],
+                   input=json.dumps({"session_id": "s", "agent_id": "abc", "transcript_path": str(sess)}),
+                   capture_output=True, text=True, env={**os.environ, **st3})
+    u = [r for r in ledger.read(st3) if r.get("kind") == "usage"][-1]
+    results.append(check("subagentstop: launch-time session model + attribution",
+                         u.get("session_model") == "claude-opus-5-5" and u.get("attribution") == "model-picker"))
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

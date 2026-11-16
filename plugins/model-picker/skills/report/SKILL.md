@@ -15,6 +15,8 @@ python3 <this skill's directory>/../../hooks/model_picker.py report <period>
 Print its output as-is (it is already a short summary plus a Markdown table). Then add at most
 two lines of your own:
 
+- When quoting a saving, quote **Credited to model-picker**, not the total difference: the total
+  includes agents whose own definition already chose a cheap model.
 - The single most useful observation (for example: "8 of 11 launches without a model inherited
   opus; setting haiku on the search agents would have saved most of the remaining spend").
 - If `Followed recommendation` is under 50% or many launches had no explicit model, suggest

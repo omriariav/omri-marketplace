@@ -22,7 +22,7 @@ claude plugin install model-picker@omri-marketplace
 | SubagentStop hook | Records each finished subagent's tokens, model, cost, and the cost at the session model. |
 | PostToolUse hook on `Agent` | With `MODEL_PICKER_STAMP=1`, stamps each subagent result with the model that actually ran, its tokens, and cost. |
 | `ask_local` MCP tool | Runs tool-free text work on a local Ollama model at $0, stamped and logged. |
-| `/model-picker:report [period]` | Launches, model mix, follow rate, router stats, spend by model, estimated saving. |
+| `/model-picker:report [period]` | Launches, model mix, follow rate, router stats, spend by model, estimated saving; also opens an HTML version. |
 
 ## Settings
 
@@ -96,7 +96,7 @@ Every checked launch and every finished subagent is appended to a local ledger, 
 
 Rotated files are kept as `log.<epoch>.jsonl` (newest 10); writes are serialized with a file lock, so parallel subagents never interleave or lose lines. A subagent resumed and stopped again is counted once (its latest, cumulative usage); a launch denied in `enforce` mode and retried counts once.
 
-`/model-picker:report 7d` (or `today`, `24h`, `30d`, `all`; `--json` for raw numbers):
+`/model-picker:report 7d` (or `today`, `24h`, `30d`, `all`; `--json` for raw numbers) prints the summary below and opens the same numbers as an HTML page (`~/.config/model-picker/report.html`: one self-contained, owner-only file with no network requests, in light or dark mode):
 
 ```markdown
 **model-picker report (7d)**

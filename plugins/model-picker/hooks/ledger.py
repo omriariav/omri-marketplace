@@ -13,8 +13,10 @@ explicit model would have inherited. A larger model may need fewer tokens for th
 """
 
 import fcntl
+import html
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -614,3 +616,152 @@ def format_report(r):
                       f"{_tok(r['local_output'])} out tokens, $0; ~${r['local_haiku_equiv']:.3f} at Haiku prices"
                       + (f"; {r['local_errors']} failed" if r["local_errors"] else "") + "."]
     return "\n".join(lines)
+
+
+# --- HTML report -------------------------------------------------------------------
+
+_ATTR_LABELS = {"model-picker": "Followed model-picker", "definition": "Agent definition's own model",
+                "explicit": "Explicit, differed from recommendation", "unjudged": "Explicit, no confident recommendation",
+                "inherited": "Inherited the session model", "unknown": "No launch record"}
+_TIER_ORDER = ("local", "haiku", "sonnet", "opus", "fable")
+
+_CSS = """
+:root{color-scheme:light;--bg:#fcfcfb;--card:#ffffff;--line:#e4e3df;--ink:#0b0b0b;--ink2:#52514e;--muted:#7a7974;
+--s1:#2a78d6;--s2:#eb6834;--good:#006300}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#1a1a19;--card:#232322;
+--line:#383835;--ink:#f0efec;--ink2:#c3c2b7;--muted:#9a998f;--s1:#3987e5;--s2:#d95926;--good:#5fc45f}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#1a1a19;--card:#232322;--line:#383835;--ink:#f0efec;--ink2:#c3c2b7;
+--muted:#9a998f;--s1:#3987e5;--s2:#d95926;--good:#5fc45f}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+main{max-width:960px;margin:0 auto;padding:32px 16px 48px}h1{font-size:22px;margin:0 0 4px}
+h2{font-size:15px;margin:32px 0 12px;color:var(--ink2);font-weight:600}.sub{color:var(--muted);font-size:13px;margin:0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(170px,100%),1fr));gap:12px;margin-top:24px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.tile .k{font-size:12px;color:var(--ink2)}.tile .v{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums}
+.tile .n{font-size:12px;color:var(--muted)}.tile.hero .v{color:var(--good)}
+.card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;overflow-x:auto}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--ink2);margin-bottom:10px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.row{display:grid;grid-template-columns:70px 1fr;gap:10px;align-items:center;margin:6px 0}
+.row .lab{font-size:13px;color:var(--ink2)}.bars{display:flex;flex-direction:column;gap:2px}
+.bar{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink2);font-variant-numeric:tabular-nums}
+.bar i{display:block;height:10px;border-radius:0 4px 4px 0;min-width:2px}
+table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th{color:var(--ink2);font-weight:600}th:first-child,td:first-child{text-align:left;white-space:normal;min-width:90px}
+tr:last-child td{border-bottom:none}td.credited{color:var(--good);font-weight:600}
+.inline{display:inline-block;height:8px;border-radius:0 3px 3px 0;background:var(--s1);vertical-align:middle;margin-right:6px}
+ul.facts{margin:0;padding-left:18px;color:var(--ink2);font-size:13px}.foot{margin-top:28px;font-size:12px;color:var(--muted)}
+"""
+
+
+def _money(x):
+    return f"${x:,.2f}"
+
+
+def format_html(r, generated=None):
+    """Render the report dict as one self-contained HTML page (no external assets, nothing fetched)."""
+    e = lambda v: html.escape(str(v))
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(generated or time.time()))
+    head = (f"<!doctype html><html lang=en><head><meta charset=utf-8>"
+            f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>model-picker report ({e(r['period'])})</title><style>{_CSS}</style></head><body><main>"
+            f"<h1>model-picker report</h1><p class=sub>Period: {e(r['period'])} · generated {e(when)} · "
+            f"from the local ledger</p>")
+    if not r["launches"] and not r["subagents"] and not r.get("local_calls"):
+        return head + "<p>No launches logged yet. The ledger fills as agents launch.</p></main></body></html>"
+    attr = r.get("saving_by_attribution") or {}
+    credited_agents = attr.get("model-picker", {}).get("agents", 0)
+    tiles = [
+        ("Subagent spend", _money(r["cost"]), f"{r['subagents']} subagent(s)", ""),
+        ("At the session model", _money(r["baseline_cost"]),
+         f"difference {_money(r['saving'])} ({_pct(r['saving'], r['baseline_cost'])})", ""),
+        ("Credited to model-picker", _money(r.get("credited_saving", 0)),
+         f"{credited_agents} agent(s) that followed it", " hero"),
+        ("Followed recommendation", _pct(r["followed"], r["compared"]), f"{r['followed']} of {r['compared']} launches", ""),
+    ]
+    out = [head, "<div class=tiles>"]
+    for k, v, n, cls in tiles:
+        out.append(f"<div class='tile{cls}'><div class=k>{e(k)}</div><div class=v>{e(v)}</div><div class=n>{e(n)}</div></div>")
+    out.append("</div>")
+
+    rec, got = r.get("recommended_tiers") or {}, r.get("launch_tiers") or {}
+    keys = [t for t in _TIER_ORDER if t in rec or t in got] + sorted((set(rec) | set(got)) - set(_TIER_ORDER))
+    if keys:
+        top = max([rec.get(k, 0) for k in keys] + [got.get(k, 0) for k in keys] + [1])
+        out.append("<h2>Recommended vs launched, by model</h2><div class=card><div class=legend>"
+                   "<span><span class=sw style='background:var(--s1)'></span>Recommended</span>"
+                   "<span><span class=sw style='background:var(--s2)'></span>Launched</span></div>")
+        for k in keys:
+            out.append(f"<div class=row><div class=lab>{e(k)}</div><div class=bars>")
+            for name, src, color in (("Recommended", rec, "--s1"), ("Launched", got, "--s2")):
+                n = src.get(k, 0)
+                out.append(f"<div class=bar title='{e(name)} {e(k)}: {n}'><i style='width:{100 * n / top:.1f}%;"
+                           f"background:var({color})'></i>{n}</div>")
+            out.append("</div></div>")
+        out.append("</div>")
+
+    if r["by_model"]:
+        rows = sorted(r["by_model"].items(), key=lambda kv: -kv[1]["cost"])
+        top = max([row["cost"] for _, row in rows] + [1e-9])
+        out.append("<h2>Subagent spend by model</h2><div class=card><table><thead><tr><th>Model</th><th>Agents</th>"
+                   "<th>Input</th><th>Output</th><th>Cache read</th><th style='text-align:left'>Cost</th>"
+                   "<th>At session model</th><th>Saved</th></tr></thead><tbody>")
+        for key, row in rows:
+            w = 80 * row["cost"] / top
+            out.append(f"<tr><td>{e(key)}</td><td>{row['agents']}</td><td>{_tok(row['input'] + row['cache_write'])}</td>"
+                       f"<td>{_tok(row['output'])}</td><td>{_tok(row['cache_read'])}</td>"
+                       f"<td style='text-align:left'><span class=inline style='width:{w:.0f}px'></span>{_money(row['cost'])}</td>"
+                       f"<td>{_money(row['baseline_cost'])}</td><td>{_money(row['saving'])}</td></tr>")
+        out.append("</tbody></table></div>")
+
+    if attr:
+        out.append("<h2>Who gets credit for the difference</h2><div class=card><table><thead><tr><th>Why the model "
+                   "was cheaper</th><th>Agents</th><th>Saved</th></tr></thead><tbody>")
+        for key in sorted(attr, key=lambda k: (k != "model-picker", -attr[k]["saving"])):
+            cls = " class=credited" if key == "model-picker" else ""
+            out.append(f"<tr><td>{e(_ATTR_LABELS.get(key, key))}</td><td>{attr[key]['agents']}</td>"
+                       f"<td{cls}>{_money(attr[key]['saving'])}</td></tr>")
+        out.append("</tbody></table></div>")
+
+    facts = [f"Launches: {r['launches']} ({r['checked']} checked, {r['skipped']} skipped as fork/pinned/built-in"
+             + (f"; {r['denied']} denied in enforce mode" if r.get("denied") else "") + ")",
+             f"Explicit model: {r['explicit']}/{r['checked']} ({_pct(r['explicit'], r['checked'])})"]
+    if r["router_calls"]:
+        facts.append(f"Router: {r['router_hits']}/{r['router_calls']} answered by the decisions API "
+                     f"(p50 {r['router_p50_ms']} ms, avg confidence {r['router_avg_conf']}); rest by heuristic")
+    if r["local_agents"]:
+        facts.append(f"{r['local_agents']} subagent(s) ran on a local model, counted at $0")
+    if r.get("local_calls"):
+        facts.append(f"Local model (ask_local): {r['local_calls'] - r['local_errors']} call(s), "
+                     f"{_tok(r['local_input'])} in / {_tok(r['local_output'])} out, $0; "
+                     f"~${r['local_haiku_equiv']:.3f} at Haiku prices"
+                     + (f"; {r['local_errors']} failed" if r["local_errors"] else ""))
+    out.append("<h2>Details</h2><div class=card><ul class=facts>" + "".join(f"<li>{e(f)}</li>" for f in facts) + "</ul></div>")
+    out.append("<p class=foot>Estimates: the same tokens at list prices. A larger model may have used fewer tokens. "
+               "Only launches that followed model-picker's recommendation are credited to it.</p></main></body></html>")
+    return "".join(out)
+
+
+def write_html(cfg, r, path=None):
+    """Write the HTML report (default: <state dir>/report.html) and return its path.
+
+    Written to an owner-only temp file and renamed over the target, so the result is 0600 even when
+    a wider-mode file was there before, and a symlink at the target is replaced, never followed."""
+    target = Path(path).expanduser() if path else state_dir(cfg) / "report.html"
+    if target.is_dir():
+        raise IsADirectoryError(f"{target} is a directory; pass a file path")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".report.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(format_html(r))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return target

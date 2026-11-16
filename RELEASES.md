@@ -1,5 +1,9 @@
 # Releases
 
+## model-picker v0.4.5 (2026-11-16)
+
+`/model-picker:report` now also writes an HTML report and opens it in the browser: headline tiles (subagent spend, cost at the session model, saving credited to model-picker, follow rate), recommended vs launched models, spend by model, and who gets credit for each saving. It is one self-contained file (no scripts, fonts or network requests), owner-only (`0600`), at `~/.config/model-picker/report.html` (or under `MODEL_PICKER_STATE_DIR`), and follows the system light/dark mode. CLI: `model_picker.py report <period> --html [--out PATH] [--open]`.
+
 ## model-picker v0.4.4 (2026-11-16)
 
 Fix: stamps for background agents never reached anyone. Claude Code runs most agents in the background, and their stamp was only a SubagentStop `systemMessage`, which Claude never receives and the user didn't see.

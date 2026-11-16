@@ -653,7 +653,9 @@ def handle_workflow(payload, mode, cfg):
     msg = (f"model-picker: {missing} of {len(calls)} agent() calls in this workflow set no `model`. "
            f"Pass {{model: ...}} using the available tiers: {advice}.")
     if local_enabled(cfg):
-        msg += f" For tool-free text steps, use the local model: {local_hint(cfg)}."
+        # A workflow agent() step is a tool-using agent: never route it to the local model. Plain text
+        # transformation belongs outside the workflow (ask_local from the main session), if anywhere.
+        msg += " Text-only transformation of text you already have can be done with ask_local before or after the workflow, not as an agent() step."
     if mode == "enforce":
         emit("deny", msg + " Add the model options and re-run.")
     else:

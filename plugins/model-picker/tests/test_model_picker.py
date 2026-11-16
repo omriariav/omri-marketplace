@@ -883,7 +883,7 @@ results.append(check(f"prompt hook on a ~5MB ledger stays fast ({dt*1000:.0f} ms
 
 # --- local guard: `local` must be earned (both review rounds' examples) ------------------
 LV = {"tier": "local", "effort": "low", "reason": "r", "source": "openai-decisions:x (0.90)", "confidence": 0.9}
-TOOL_WORK = [  # (description, prompt): must never stay local
+TOOL_WORK = [  # (description, prompt): tool work; checked below: never `local` on launch
     ("Label vendor-dependent keys pending", "Add a pending label to the two keys in SKILL.md and open a PR"),
     ("Tidy config", "edit config.yaml and commit the change"),
     ("Docs", "update the README"), ("Bug", "fix the bug in auth"), ("Logs", "look at the logs"),
@@ -895,7 +895,7 @@ TOOL_WORK = [  # (description, prompt): must never stay local
     ("Summarize text", "Summarize this:\n" + "word " * 120 + "\nthen git commit the changes and open a PR"),
     ("Notes", "Summarize the meeting notes"),  # nothing pasted: ask_local can't see them
 ]
-TEXT_WORK = [  # must stay local
+TEXT_WORK = [  # pasted-text work; never `local` on launch, but `local` via the skill/route path
     ("Summarize this email", "Summarize this email in 3 bullets:\n\nHi team, see the link and page 3.5 e.g. and/or notes."),
     ("Summarize", "Summarize the 3.5 results: revenue up 3.5%, churn flat, NPS 41 (see page 2)."),
     ("Extract names", "Extract the names from the paragraph below: Bob and/or Alice met Carol in Paris."),
@@ -914,6 +914,8 @@ results += [
     check("fake router really answers local (skill path keeps a confident local)", probe["tier"] == "local"),
     check(f"agent launches never get local, even when the router says so ({len(TOOL_WORK + TEXT_WORK)} cases)",
           not launch_local),
+    check("skill path: pasted-text tasks keep a confident local",
+          all(mp.decide({"description": d, "prompt": p}, ALWAYS_LOCAL)["tier"] == "local" for d, p in TEXT_WORK)),
     check("launch path: router not even offered local",
           "local" not in mp.decide({"description": "d", "prompt": "p"}, {**ALWAYS_LOCAL}, for_launch=True)["tier"]),
     check("skill path: shaky local call falls back with honest metadata",
@@ -921,6 +923,12 @@ results += [
               mp.guard_local({**LV, "confidence": 0.6}, {"description": "Summarize", "prompt": "Summarize: x"}, {}))),
     check("local guard: non-local recs untouched", mp.guard_local({**LV, "tier": "sonnet"}, {"prompt": "x"}, {})["tier"] == "sonnet"),
 ]
+
+wf = subprocess.run([sys.executable, "-I", str(HOOK), "pretool", str(ROOT)],
+                    input=json.dumps({"tool_name": "Workflow", "tool_input": {"script": 'agent("a")'}}),
+                    capture_output=True, text=True, env={**os.environ, **OL, **fresh_state()}).stdout
+results.append(check("workflow advice never routes an agent() step to local",
+                     "not as an agent() step" in wf and "use the local model" not in wf))
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

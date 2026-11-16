@@ -9,7 +9,7 @@ Fix: stamps for background agents never reached anyone. Claude Code runs most ag
 - Agent launches are never recommended `local`. By the time the launch hook runs, Claude is already launching a tool-using agent, and guessing "call ask_local instead" from a one-line description sent tool work to a model with no tools (found in a real session: Jev picked `local` at 0.60 for what was a code-and-git task; three rounds of text-matching rules couldn't make that guess safe). The local tier is offered where the choice is still open: the session rules ("before launching an agent, consider ask_local for pasted text") and `/model-picker:model-picker`, where a `local` pick below 0.75 confidence falls back to a Claude tier.
 - `ledger.read()` skips rotated files older than the requested window by their name; a tail-read edge case no longer drops a complete record.
 - Smoke-tested three times in real headless sessions: a background Haiku agent's stamp was quoted verbatim by Claude when its result arrived.
-- Tests: 188 (incl. 27 launch prompts that must never get `local` even when the router answers `local`).
+- Tests: 190 (incl. 27 launch prompts that must never get `local` even when the router answers `local`).
 
 ## model-picker v0.4.3 (2026-11-16)
 

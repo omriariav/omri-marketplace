@@ -50,6 +50,10 @@ Rules for the recommendation:
 - Recommend effort changes before model changes. Past high, recommend the next model up at lower effort.
 - Recommend a split only for work larger than one context window or with clearly separable read-only side work (search, logs, summaries → haiku).
 
+## Report
+
+For usage, spend, and savings, use `/model-picker:report` instead.
+
 ## Launching agents
 
 When this skill is active and you launch an Agent, teammate, or workflow `agent()`, always pass

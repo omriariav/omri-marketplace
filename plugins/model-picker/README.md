@@ -12,6 +12,8 @@ Applies Anthropic's [Which Claude model should you build with?](https://claude.d
 | `/model-picker:model-picker [task]` | Per-request recommendation (model, effort, why, source, optional split). No argument loads the rules (Codex/Cursor/Grok fallback). |
 | `hooks/model_picker.py route "<task>"` | CLI: prints the recommendation as JSON. |
 | `model-picker:scout` agent | Haiku read-only scout for search, logs, and test output. |
+| SubagentStop hook | Records each finished subagent's tokens, model, cost, and the cost at the session model. |
+| `/model-picker:report [period]` | Launches, model mix, follow rate, router stats, spend by model, estimated saving. |
 
 ## Settings
 
@@ -33,6 +35,10 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_ROUTER_INPUT` | What task text leaves the machine: `description` (agent's short description), `brief` (+ first 500 prompt chars), `full` (+ up to 8000) | `description` |
 | `MODEL_PICKER_ROUTER_TIMEOUT` | Seconds | `3` |
 | `MODEL_PICKER_ROUTER_MIN_CONFIDENCE` | Below this, the heuristic decides | `0.5` |
+| `MODEL_PICKER_LOG` | `0` turns off the local ledger | `1` |
+| `MODEL_PICKER_STATE_DIR` | Where the ledger lives | `~/.config/model-picker` |
+| `MODEL_PICKER_VERBOSE` | `1` shows a one-line note per launch and per finished subagent | `0` |
+| `MODEL_PICKER_PRICES` | JSON price overrides per tier, $ per million tokens | built-in list prices |
 
 API keys are read from the environment or `API_KEY_CMD`, never from the config file.
 
@@ -60,6 +66,47 @@ Example (LiteLLM gateway, in `~/.config/model-picker/config.json`):
   "MODEL_PICKER_ROUTER_HEADERS": {"x-litellm-enable-message-redaction": "true"},
   "MODEL_PICKER_ROUTER_METADATA": {"tags": ["service:model-picker"]}
 }
+```
+
+## Visibility and savings
+
+Every checked launch and every finished subagent is appended to a local ledger, `~/.config/model-picker/log.jsonl` (mode 600, rotated at 5 MB). Nothing leaves the machine.
+
+- **Decisions** (PreToolUse): time, session, agent type, the short description (never the prompt), the model chosen (or the session model it inherited), the recommended tier and effort, what decided it (decisions API or heuristic) with confidence and latency, and whether the launch followed the recommendation. Skipped and pinned launches are logged too.
+- **Usage** (SubagentStop): the subagent's tokens (input, output, cache reads, 5-minute and 1-hour cache writes), deduplicated per API message, read from its transcript. It is joined to the launch through the transcript's `toolUseId`.
+- **Cost and saving**: each subagent is priced at its actual model and again at the session model, which it would have inherited without an explicit `model`. A local model (no Claude tier in its id) counts as $0; a Claude model with no known price claims no saving.
+- **Attribution**: only subagents whose explicit model matched model-picker's recommendation, and whose agent definition did not already set that model, are credited to model-picker. Agents pinned by their own definition (like `model-picker:scout`), explicit models that ignored the recommendation, inherited models, and launches with no record are listed separately and not credited.
+
+Rotated files are kept as `log.<epoch>.jsonl` (newest 10); writes are serialized with a file lock, so parallel subagents never interleave or lose lines. A subagent resumed and stopped again is counted once (its latest, cumulative usage); a launch denied in `enforce` mode and retried counts once.
+
+`/model-picker:report 7d` (or `today`, `24h`, `30d`, `all`; `--json` for raw numbers):
+
+```
+model-picker report (7d)
+
+Launches: 23 (19 checked, 4 skipped as fork/pinned/built-in)
+Explicit model: 17/19 (89%)
+Followed recommendation: 14/17 (82%)
+Launch models: haiku 11, sonnet 5, opus 3
+Router: 16/17 answered by the decisions API (p50 720 ms, avg confidence 0.9); rest by heuristic
+
+| Model | Agents | Input | Output | Cache read | Cost | At session model | Saved |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| sonnet | 5 | 410.2K | 38.1K | 2.10M | $1.43 | $2.86 | $1.43 |
+| haiku | 11 | 320.5K | 61.0K | 3.40M | $0.10 | $3.87 | $3.77 |
+
+Subagent spend: $1.53; at the session model it would have been $6.73. Total difference: $5.20 (77%).
+Credited to model-picker: $3.94 (13 agent(s) that followed its recommendation).
+  not credited — model set by the agent's own definition (would have happened anyway): 3 agent(s), $1.26
+```
+
+(Illustrative numbers.) Prices are Claude API list prices per million tokens: Haiku 5.5 $0.10 input / $0.50 output for prompts up to 100K tokens ($0.50 / $2.50 above), Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20, Fable 5.2 $8 / $40, with cache reads at $0.01 (Haiku), $0.10, $0.20, $0.20. Cache writes use the standard 1.25x (5-minute) and 2x (1-hour) input multipliers. The saving is an estimate: same tokens, different price. A larger model may finish in fewer tokens, so treat it as an upper bound.
+
+With `MODEL_PICKER_VERBOSE=1` you also see each decision as it happens:
+
+```
+model-picker: model-picker:scout on haiku → recommends haiku/medium (jev-latest 0.97, 640 ms)
+model-picker: model-picker:scout on claude-haiku-5-5 used 247,607 tokens, ~$0.009 vs ~$0.337 on opus
 ```
 
 ## Local models

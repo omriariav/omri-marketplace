@@ -97,9 +97,12 @@ results += [
     check("local: pure text -> local", mp.recommend("summarize this paragraph", local=True)[0] == "local"),
     check("local: needs files -> not local", mp.recommend("summarize the log files", local=True)[0] == "haiku"),
     check("local: disabled -> haiku", mp.recommend("summarize this paragraph")[0] == "haiku"),
-    check("local: hint in deny reason",
-          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify the sentiment of this sentence: I love it, works great"),
-                                                 "enforce", LOCAL))),
+    check("local: never recommended for an agent launch (even pure text)",
+          "local" not in json.dumps(run(agent(description="classify", prompt="classify the sentiment of this sentence: I love it, works great"),
+                                        "enforce", LOCAL)).replace("pure text", "")),
+    check("local: hint offered in the session rules instead",
+          "gateway maps haiku" in (subprocess.run([sys.executable, "-I", str(HOOK), "session", str(ROOT)], input="{}",
+                                                  capture_output=True, text=True, env={**os.environ, **LOCAL}).stdout)),
 ]
 
 # --- review round 2 regressions -------------------------------------------------
@@ -901,18 +904,21 @@ TEXT_WORK = [  # must stay local
     ("Summarize log", "Summarize this log: Traceback (most recent call last): File main.py line 3 KeyError 'x'"),
     ("Classify", "Classify the sentiment of this review: The battery died after two days."),
 ]
-bad_local = [p for d, p in TOOL_WORK if mp.guard_local(LV, {"description": d, "prompt": p}, {})["tier"] == "local"]
-bad_vetoed = [p for d, p in TEXT_WORK if mp.guard_local(LV, {"description": d, "prompt": p}, {})["tier"] != "local"]
+ALWAYS_LOCAL = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_OLLAMA_MODEL": "qwen2.5:7b-instruct",
+                "MODEL_PICKER_ROUTER_CMD": f"{sys.executable} -c \"print('{{\\\"tier\\\": \\\"local\\\", "
+                                           f"\\\"effort\\\": \\\"low\\\", \\\"confidence\\\": 0.9}}')\""}
+probe = mp.decide({"description": "Translate", "prompt": "Translate to French: hello"}, ALWAYS_LOCAL)
+launch_local = [p for d, p in TOOL_WORK + TEXT_WORK
+                if mp.decide({"description": d, "prompt": p}, ALWAYS_LOCAL, for_launch=True)["tier"] == "local"]
 results += [
-    check(f"local guard: no tool work stays local ({len(TOOL_WORK)} cases){' -> ' + str(bad_local) if bad_local else ''}",
-          not bad_local),
-    check(f"local guard: pasted-text work stays local ({len(TEXT_WORK)} cases){' -> ' + str(bad_vetoed) if bad_vetoed else ''}",
-          not bad_vetoed),
-    check("local guard: low confidence falls back",
-          mp.guard_local({**LV, "confidence": 0.6}, {"description": d, "prompt": p}, {})["tier"] != "local") if (d := TEXT_WORK[0][0]) and (p := TEXT_WORK[0][1]) else False,
-    check("local guard: vetoed rec metadata reset",
-          (lambda r: r["source"].startswith("heuristic (local vetoed") and r["confidence"] is None and r["effort"] == "medium")(
-              mp.guard_local(LV, {"description": "Docs", "prompt": "update the README"}, {}))),
+    check("fake router really answers local (skill path keeps a confident local)", probe["tier"] == "local"),
+    check(f"agent launches never get local, even when the router says so ({len(TOOL_WORK + TEXT_WORK)} cases)",
+          not launch_local),
+    check("launch path: router not even offered local",
+          "local" not in mp.decide({"description": "d", "prompt": "p"}, {**ALWAYS_LOCAL}, for_launch=True)["tier"]),
+    check("skill path: shaky local call falls back with honest metadata",
+          (lambda r: r["tier"] != "local" and r["source"].startswith("heuristic (local vetoed") and r["confidence"] is None)(
+              mp.guard_local({**LV, "confidence": 0.6}, {"description": "Summarize", "prompt": "Summarize: x"}, {}))),
     check("local guard: non-local recs untouched", mp.guard_local({**LV, "tier": "sonnet"}, {"prompt": "x"}, {})["tier"] == "sonnet"),
 ]
 

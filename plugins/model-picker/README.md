@@ -142,7 +142,7 @@ Asking a model which model it is gives unreliable answers, and behind a gateway 
 
 The plugin ships a small stdlib MCP server (`mcp/local_server.py`) with two tools: `ask_local(prompt, system?, max_tokens?, model?)` and `list_local_models()`. Set `MODEL_PICKER_OLLAMA_MODEL` (for example `qwen2.5:7b-instruct`) and:
 
-- the `local` tier turns on, and model-picker recommends calling `ask_local` directly, instead of launching an agent, for tool-free text work (summarize, classify, extract, translate, rephrase text you pass in);
+- the `local` tier turns on: the session rules tell Claude to consider calling `ask_local` directly, instead of launching an agent, for tool-free text work on text it already has (summarize, classify, extract, translate, rephrase), and `/model-picker:model-picker` can recommend it. Agent launches themselves are never recommended `local` (the agent is already being launched with tools), so the launch hook can't misroute tool work to a model that has none;
 - each call is logged to the ledger (model, token counts, seconds; never the prompt or answer) and shows up in `/model-picker:report` with what it would have cost at Haiku prices.
 
 Without a configured model the tools still list but return a clear error naming the installed models; with Ollama stopped they return "not reachable" instead of failing. `MODEL_PICKER_OLLAMA=0` hides them. Small local models are fine for simple transformation and weak at reasoning or long structured writing, so check what they return.

@@ -333,68 +333,36 @@ def fit_to_available(rec, cfg):
 
 
 LOCAL_MIN_CONFIDENCE = 0.75  # a wrong "local" call costs the most: the local model can't use tools at all
-# `local` must be earned: the local model only transforms text that is already in the prompt.
-LOCAL_TASK_START_RE = re.compile(
-    r"^\W*(please\s+)?(summari[sz]e|translate|classify|categori[sz]e|extract|rephrase|rewrite|paraphrase|"
-    r"proofread|shorten|simplify|tag|label)\b", re.I)
-# Action verbs inside an otherwise text-transform instruction ("summarize the logs and fix the bug").
-# Tasks that don't start with a transform verb are not local anyway, so words like review/check aren't needed.
-INSTRUCTION_ACTION_RE = re.compile(
-    r"\b(fix|update|debug|delete|remove|rename|run|execute|curl|find|search|grep|commit|push|merge|deploy|"
-    r"install|edit|modify|implement|refactor|create|write to|save)\b",
-    re.I)
-# Unmistakable tool work anywhere in the prompt (multi-word, so pasted prose rarely trips it).
-STRONG_TOOL_RE = re.compile(
-    r"\b(git (add|commit|push|pull|diff|log|checkout|rebase)|pull request|open (a|the) pr|run (the )?tests|pytest|"
-    r"npm (test|run|install)|commit (the|your|these|all) changes|edit (the )?(repo|repository|codebase|files?)|"
-    r"in the (repo|repository|codebase))\b", re.I)
-LOCAL_MIN_MATERIAL = 12  # chars of pasted material after the instruction
-
-
-def local_ok(inp):
-    """True only when the task is plainly "transform this pasted text": a text-transform verb starts the
-    instruction, the material is included, and nothing asks for tools. (Checked locally; never sent.)"""
-    desc = str(inp.get("description") or inp.get("name") or "")
-    prompt = str(inp.get("prompt") or "")
-    m = re.search(r"[:\n]", prompt)
-    instruction = prompt[:m.start()] if m else prompt
-    material = prompt[m.end():].strip() if m else ""
-    starts_right = bool(LOCAL_TASK_START_RE.search(instruction) or LOCAL_TASK_START_RE.search(desc))
-    return (starts_right and len(material) >= LOCAL_MIN_MATERIAL
-            and not INSTRUCTION_ACTION_RE.search(f"{desc} {instruction}")
-            and not STRONG_TOOL_RE.search(prompt))
-
-
 def guard_local(rec, inp, cfg):
-    """Only keep a `local` recommendation for plain text transformation of pasted material.
-
-    The router only sees a one-line description ("label the keys" sounds like text work). The full
-    prompt stays on this machine and must show the task is pure transformation (local_ok); a local
-    call below LOCAL_MIN_CONFIDENCE is also not trusted.
-    """
+    """Don't trust a shaky `local` call: below LOCAL_MIN_CONFIDENCE fall back to the best non-local tier.
+    (Agent launches never get `local` at all; see decide(for_launch=True).)"""
     if rec.get("tier") != "local":
         return rec
-    ok = local_ok(inp)
-    unsure = isinstance(rec.get("confidence"), (int, float)) and rec["confidence"] < LOCAL_MIN_CONFIDENCE
-    if ok and not unsure:
+    if not (isinstance(rec.get("confidence"), (int, float)) and rec["confidence"] < LOCAL_MIN_CONFIDENCE):
         return rec
     text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt")).lower()[:2000]
     tier, why = recommend(text, str(inp.get("subagent_type") or ""), local=False)
-    note = "not a pure text task on pasted material" if not ok else f"local confidence {rec['confidence']:.2f} too low"
-    # The router chose local, not this tier: don't keep its effort, confidence or source on a tier it never picked.
+    note = f"local confidence {rec['confidence']:.2f} too low"
     return {**rec, "tier": tier, "effort": "medium", "reason": f"{why} (not local: {note})",
             "source": f"heuristic (local vetoed: {note})", "confidence": None,
             "unsure": why == UNSURE_REASON, "local_vetoed": True}
 
 
-def decide(inp, cfg, use_router=True):
-    """Recommendation dict: tier, effort, reason, source, limited to the available tiers."""
-    return fit_to_available(guard_local(_decide(inp, cfg, use_router), inp, cfg), cfg)
+def decide(inp, cfg, use_router=True, for_launch=False):
+    """Recommendation dict: tier, effort, reason, source, limited to the available tiers.
+
+    for_launch: the call is an Agent/teammate launch that is already happening. `local` (call ask_local
+    instead of launching an agent) can't apply there, and guessing it from a one-line description sends
+    tool work to a model that has no tools; so launches only ever get Claude tiers. The local tier is
+    offered where the choice is still open: the session rules and the /model-picker skill.
+    """
+    rec = _decide(inp, cfg, use_router, allow_local=not for_launch)
+    return fit_to_available(guard_local(rec, inp, cfg), cfg)
 
 
-def _decide(inp, cfg, use_router=True):
+def _decide(inp, cfg, use_router=True, allow_local=True):
     """Router first (if configured), heuristic fallback; may name a tier that is not available."""
-    local = local_enabled(cfg)
+    local = allow_local and local_enabled(cfg)
     agent_type = str(inp.get("subagent_type") or "")
     text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name"))
     tier, why = recommend(text, agent_type, local)
@@ -442,7 +410,8 @@ def _route(router, name, inp, cfg, local):
             if not key:
                 raise ValueError("no API key")
             rcfg["_api_key"] = key
-        return router(task_text(inp, cfg), available_tiers(cfg), rcfg)
+        tiers = [t for t in available_tiers(cfg) if local or t != "local"]
+        return router(task_text(inp, cfg), tiers, rcfg)
     except Exception as exc:  # router trouble never blocks a launch
         return exc
 
@@ -518,7 +487,7 @@ def handle_agent(payload, mode, cfg):
     chosen_unavailable = bool(model) and bool(tier_of(model)) and tier_of(model) not in available_tiers(cfg)
     # No router round trip for a launch that is about to be redirected anyway.
     rec = decide(inp, cfg, use_router=not chosen_unavailable and (
-        not model or _enabled(cfg, "MODEL_PICKER_ROUTER_ON_EXPLICIT", default=False)))
+        not model or _enabled(cfg, "MODEL_PICKER_ROUTER_ON_EXPLICIT", default=False)), for_launch=True)
     session_model = ledger.last_model(payload.get("transcript_path"))
     outcome = ("denied" if mode == "enforce" and (not model or chosen_unavailable)
                else "explicit" if model else "missing")
@@ -706,7 +675,8 @@ def handle_session(root, cfg):
     if tiers_warning:
         context += f"\nmodel-picker warning: {tiers_warning}"
     if local_enabled(cfg):
-        context += ("\nLocal tier enabled: for pure text work that needs no tools or files (summarize, classify, "
+        context += ("\nLocal tier enabled: before launching an agent, consider whether the task is pure text work on text "
+                    "you already have (summarize, classify, "
                     f"extract, translate text you paste into the prompt itself), use the local model: {local_hint(cfg)}. "
                     "It cannot open files, URLs, PRs or tickets. Check its output: "
                     "small local models are fine for simple transformation, weak at anything else.")

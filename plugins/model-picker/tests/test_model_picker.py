@@ -800,5 +800,71 @@ with tempfile.TemporaryDirectory() as d:
     sess_ctx = hookrun("session", {}, {"MODEL_PICKER_STAMP": "1"})["hookSpecificOutput"]["additionalContext"]
     results.append(check("session rules describe next-turn delivery", "arrives with your next turn" in sess_ctx))
 
+# --- v0.4.4 review fixes ----------------------------------------------------------------
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sd = Path(d) / "sess" / "subagents"
+    write_transcript(sd / "agent-x.jsonl", [amsg("x1", "claude-haiku-5-5", inp=100, out=5)])
+    (sd / "agent-x.meta.json").write_text(json.dumps({"agentType": "x", "toolUseId": "t_x", "requestShape": "background"}))
+    nolog = {**fresh_state(), "MODEL_PICKER_STAMP": "1", "MODEL_PICKER_LOG": "0"}
+    out = hookrun("subagentstop", {"session_id": "S", "agent_id": "x", "transcript_path": str(sess)}, nolog)
+    results.append(check("LOG=0: background stamp falls back to a user-visible line",
+                         out and "ran on claude-haiku-5-5" in out.get("systemMessage", "")))
+
+    on = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+    # Race: a resumed agent's second pending lands after the first delivery read: it must still be delivered.
+    hookrun("subagentstop", {"session_id": "S", "agent_id": "x", "transcript_path": str(sess)}, on)
+    first = hookrun("prompt", {"session_id": "S"}, on)
+    ledger.append(on, {"kind": "pending_stamp", "pid": "late", "session": "S", "agent_id": "x", "text": "[model-picker] x ran on late"})
+    second = hookrun("prompt", {"session_id": "S"}, on)
+    third = hookrun("prompt", {"session_id": "S"}, on)
+    results += [
+        check("pid dedupe: first delivered", first is not None),
+        check("pid dedupe: a later pending for the same agent is still delivered",
+              second and "ran on late" in second["hookSpecificOutput"]["additionalContext"]),
+        check("pid dedupe: nothing delivered twice", third is None),
+    ]
+    # Concurrency: while another turn holds the delivery lock, this turn skips (no double delivery).
+    import fcntl as _fc
+    ledger.append(on, {"kind": "pending_stamp", "pid": "busy", "session": "S", "agent_id": "y", "text": "[model-picker] y ran on z"})
+    lfd = os.open(Path(on["MODEL_PICKER_STATE_DIR"]) / ".prompt.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    _fc.flock(lfd, _fc.LOCK_EX)
+    skipped = hookrun("prompt", {"session_id": "S"}, on)
+    _fc.flock(lfd, _fc.LOCK_UN)
+    os.close(lfd)
+    picked = hookrun("prompt", {"session_id": "S"}, on)
+    results += [
+        check("lock busy: this turn skips delivery", skipped is None),
+        check("lock free: next turn delivers it", picked and "y ran on z" in picked["hookSpecificOutput"]["additionalContext"]),
+    ]
+    results.append(check("prompt hook errors are silent", subprocess.run(
+        [sys.executable, "-I", str(HOOK), "prompt", str(ROOT)], input="not json", capture_output=True, text=True,
+        env={**os.environ, **on}).stdout == ""))
+
+# read(): rotated files older than `since` are skipped; tail mode still sees a just-rotated pending stamp.
+st = fresh_state()
+sdir = Path(st["MODEL_PICKER_STATE_DIR"])
+sdir.mkdir(parents=True, exist_ok=True)
+old_ms = int((time.time() - 3 * 86400) * 1000)
+(sdir / f"log.{old_ms}.jsonl").write_text(json.dumps({"ts": time.time() - 3 * 86400 - 10, "kind": "decision"}) + "\n")
+new_ms = int(time.time() * 1000)
+(sdir / f"log.{new_ms}.jsonl").write_text(json.dumps({"ts": time.time() - 5, "kind": "pending_stamp", "pid": "r",
+                                                      "session": "S", "text": "t"}) + "\n")
+recent = ledger.read(st, time.time() - 86400)
+tail = ledger.read(st, time.time() - 86400, tail_bytes=4096)
+results += [
+    check("read: old rotated file skipped by its name", all(r.get("kind") != "decision" for r in recent)),
+    check("read tail: just-rotated pending stamp still seen", any(r.get("pid") == "r" for r in tail)),
+]
+big = sdir / "log.jsonl"
+with open(big, "w") as fh:
+    for i in range(38000):
+        fh.write(json.dumps({"ts": time.time() - 100, "kind": "decision", "outcome": "explicit", "i": i}) + "\n")
+t0 = time.monotonic()
+hookrun("prompt", {"session_id": "S"}, {**st, "MODEL_PICKER_STAMP": "1"})
+dt = time.monotonic() - t0
+results.append(check(f"prompt hook on a ~5MB ledger stays fast ({dt*1000:.0f} ms incl. interpreter start)", dt < 0.35))
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

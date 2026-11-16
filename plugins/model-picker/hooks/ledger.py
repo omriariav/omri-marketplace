@@ -86,22 +86,34 @@ def _rotated(directory):
     return [p for _, p in sorted(files)]
 
 
-def read(cfg, since=0.0):
-    """All records newer than `since` (epoch seconds), oldest first, across rotated files."""
-    out = []
+def read(cfg, since=0.0, tail_bytes=None):
+    """All records newer than `since` (epoch seconds), oldest first, across rotated files.
+
+    A rotated file is named log.<epoch ms when rotated>.jsonl, so every record in it is older than
+    its name: files rotated before `since` are skipped unread. With `tail_bytes` (hot paths that only
+    need recent records), only the end of the newest rotated file and of the current log are read.
+    """
     directory = state_dir(cfg)
-    for path in _rotated(directory) + [directory / "log.jsonl"]:
+    rotated = [p for p in _rotated(directory) if int(p.name[len("log."):-len(".jsonl")]) >= since * 1000]
+    if tail_bytes:
+        rotated = rotated[-1:]
+    out = []
+    for path in rotated + [directory / "log.jsonl"]:
         try:
-            with open(path, encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(rec, dict) and rec.get("ts", 0) >= since:
-                        out.append(rec)
+            if tail_bytes:
+                lines = _tail_lines(path, tail_bytes)
+            else:
+                with open(path, encoding="utf-8") as fh:
+                    lines = fh.readlines()
         except OSError:
             continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("ts", 0) >= since:
+                out.append(rec)
     return out
 
 

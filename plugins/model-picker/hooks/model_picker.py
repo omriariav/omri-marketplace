@@ -43,8 +43,10 @@ import os
 import re
 import subprocess
 import sys
+import fcntl
 import threading
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -527,11 +529,15 @@ def handle_subagent_stop(payload, cfg):
     # (background, or a meta with no requestShape) is stamped here, once, to the user.
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and meta.get("requestShape") != "foreground":
         line = ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)
+        if not ledger.logging_enabled(cfg):
+            # Delivery needs the ledger; without it, the user-facing line is the best we can do.
+            print(json.dumps({"systemMessage": line}))
+            return
         ledger.append(cfg, {"kind": "stamp", "agent_id": payload.get("agent_id"), "tool_use_id": meta.get("toolUseId")})
         # A SubagentStop systemMessage reaches neither Claude nor (reliably) the user, so queue the stamp:
         # the session's next turn (UserPromptSubmit, which also fires when the agent's result notification
-        # arrives) delivers it next to the agent's report.
-        ledger.append(cfg, {"kind": "pending_stamp", "session": payload.get("session_id"),
+        # arrives) delivers it next to the agent's report. `pid` makes each pending stamp uniquely deliverable.
+        ledger.append(cfg, {"kind": "pending_stamp", "pid": uuid.uuid4().hex, "session": payload.get("session_id"),
                             "agent_id": payload.get("agent_id"), "text": line})
     elif _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
         tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
@@ -568,32 +574,48 @@ def handle_posttool(payload, cfg):
 
 
 def handle_prompt(payload, cfg):
-    """UserPromptSubmit: deliver stamps of background agents that finished since the last turn."""
-    if not _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
+    """UserPromptSubmit: deliver stamps of background agents that finished since the last turn.
+
+    Runs on every prompt, so it reads only the tail of the current log. Concurrent turns of one session
+    (a prompt and a task notification) serialize on a lock; a turn that can't get it skips delivery and
+    the next turn picks the stamps up, so nothing is delivered twice or lost.
+    """
+    if not _enabled(cfg, "MODEL_PICKER_STAMP", default=False) or not ledger.logging_enabled(cfg):
         return
     session = payload.get("session_id")
     if not session:
         return
-    recent = ledger.read(cfg, time.time() - 86400)
-    pending = {}
-    for r in recent:  # a resumed agent stops more than once: keep only its latest stamp
-        if r.get("kind") == "pending_stamp" and r.get("session") == session and r.get("text"):
-            pending[r.get("agent_id")] = r
-    # Re-deliver a resumed agent's newer stamp; skip ones already delivered at or after their time.
-    last_delivery = {}
-    for r in recent:
-        if r.get("kind") == "stamp_delivered" and r.get("session") == session:
-            last_delivery[r.get("agent_id")] = r.get("ts", 0)
-    fresh = [r for a, r in pending.items() if r.get("ts", 0) > last_delivery.get(a, -1)]
-    if not fresh:
+    lock_path = ledger.state_dir(cfg) / ".prompt.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
         return
-    for r in fresh:
-        ledger.append(cfg, {"kind": "stamp_delivered", "session": session, "agent_id": r.get("agent_id")})
-    lines = [r["text"] for r in fresh]
-    context = ("Background agents finished since your last turn. Their actual models, from the transcripts:\n"
-               + "\n".join(lines) + "\nWhen you report what one of them produced, name its model.")
-    print(json.dumps({"systemMessage": "\n".join(lines),
-                      "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        recent = ledger.read(cfg, time.time() - 86400, tail_bytes=512 * 1024)
+        delivered = {r.get("pid") for r in recent if r.get("kind") == "stamp_delivered" and r.get("session") == session}
+        pending = [r for r in recent if r.get("kind") == "pending_stamp" and r.get("session") == session
+                   and r.get("text") and r.get("pid") and r["pid"] not in delivered]
+        if not pending:
+            return
+        latest = {}
+        for r in pending:  # a resumed agent stops more than once: show only its newest stamp
+            latest[r.get("agent_id") or r["pid"]] = r
+        for r in pending:  # but mark every pending one delivered
+            ledger.append(cfg, {"kind": "stamp_delivered", "session": session, "pid": r["pid"]})
+        lines = [r["text"] for r in latest.values()]
+        context = ("Background agents finished since your last turn. Their actual models, from the transcripts:\n"
+                   + "\n".join(lines) + "\nWhen you report what one of them produced, name its model.")
+        print(json.dumps({"systemMessage": "\n".join(lines),
+                          "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 def agent_calls(script):
@@ -729,4 +751,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:  # never block a launch, but never fail silently either
-        print(json.dumps({"systemMessage": f"model-picker: hook error ({type(exc).__name__}: {exc}); launch not checked."}))
+        if len(sys.argv) > 1 and sys.argv[1] == "prompt":
+            pass  # a stamp-delivery hiccup must not put a "launch not checked" line on every prompt
+        else:
+            print(json.dumps({"systemMessage": f"model-picker: hook error ({type(exc).__name__}: {exc}); "
+                                               "launch not checked."}))

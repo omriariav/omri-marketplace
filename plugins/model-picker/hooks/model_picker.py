@@ -14,7 +14,8 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
   MODEL_PICKER_ROUTER            heuristic (default) | openai-decisions | google-decisions | command
   MODEL_PICKER_ROUTER_URL        base URL (OpenAI/Google default; any LiteLLM gateway works)
   MODEL_PICKER_ROUTER_MODEL      decision model (gpt-6-luna / gemini-decision-1 by default)
-  MODEL_PICKER_ROUTER_API_KEY_ENV  env var holding the key (OPENAI_API_KEY / GEMINI_API_KEY)
+  MODEL_PICKER_ROUTER_API_KEY_ENV  env var holding the key (OPENAI_API_KEY / GEMINI_API_KEY);
+                                 "none" sends no auth header (private-network gateways)
   MODEL_PICKER_ROUTER_API_KEY_CMD  command printing the key (e.g. a Keychain lookup)
   MODEL_PICKER_ROUTER_HEADERS    JSON object of extra request headers
   MODEL_PICKER_ROUTER_METADATA   JSON object sent as the request `metadata` (OpenAI format)
@@ -268,8 +269,11 @@ def _route(router, name, inp, cfg, local):
         rcfg["_timeout"] = min(_num(cfg, "MODEL_PICKER_ROUTER_TIMEOUT", 3), ROUTER_DEADLINE)
         rcfg["_headers"] = _json_obj(cfg.get("MODEL_PICKER_ROUTER_HEADERS"))
         rcfg["_metadata"] = _json_obj(cfg.get("MODEL_PICKER_ROUTER_METADATA"))
-        if name != "command":
-            key = os.environ.get(cfg.get("MODEL_PICKER_ROUTER_API_KEY_ENV") or routers.DEFAULT_KEY_ENV[name], "")
+        key_env = str(cfg.get("MODEL_PICKER_ROUTER_API_KEY_ENV") or routers.DEFAULT_KEY_ENV.get(name, ""))
+        if name != "command" and key_env.lower() == "none":
+            rcfg["_api_key"] = ""  # gateway on a private network that needs no key
+        elif name != "command":
+            key = os.environ.get(key_env, "")
             if not key and cfg.get("MODEL_PICKER_ROUTER_API_KEY_CMD"):
                 key = subprocess.run(cfg["MODEL_PICKER_ROUTER_API_KEY_CMD"], shell=True, capture_output=True,
                                      text=True, timeout=min(rcfg["_timeout"], 2), check=True).stdout.strip()

@@ -25,7 +25,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_ROUTER` | `heuristic`, `openai-decisions`, `google-decisions`, `command` | `heuristic` |
 | `MODEL_PICKER_ROUTER_URL` | Base URL. Point `openai-decisions` at any LiteLLM gateway that serves `/v1/decisions`. | vendor URL |
 | `MODEL_PICKER_ROUTER_MODEL` | Decision model | `gpt-6-luna` / `gemini-decision-1` |
-| `MODEL_PICKER_ROUTER_API_KEY_ENV` | Name of the env var that holds the key | `OPENAI_API_KEY` / `GEMINI_API_KEY` |
+| `MODEL_PICKER_ROUTER_API_KEY_ENV` | Name of the env var that holds the key; `none` sends no auth header (gateways on a private network) | `OPENAI_API_KEY` / `GEMINI_API_KEY` |
 | `MODEL_PICKER_ROUTER_API_KEY_CMD` | Command that prints the key (e.g. `security find-generic-password -w -s my-gateway`) | unset |
 | `MODEL_PICKER_ROUTER_HEADERS` | JSON object of extra headers (attribution, redaction) | `{}` |
 | `MODEL_PICKER_ROUTER_METADATA` | JSON object sent as request `metadata` (`openai-decisions`) | `{}` |

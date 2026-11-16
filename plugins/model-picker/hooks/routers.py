@@ -71,7 +71,8 @@ def openai_decisions(task, tiers, cfg):
     }
     if cfg.get("_metadata"):
         body["metadata"] = cfg["_metadata"]
-    headers = {"Authorization": f"Bearer {cfg['_api_key']}", **cfg.get("_headers", {})}
+    auth = {"Authorization": f"Bearer {cfg['_api_key']}"} if cfg.get("_api_key") else {}
+    headers = {**auth, **cfg.get("_headers", {})}
     data = _post(f"{base}/v1/decisions", body, headers, cfg["_timeout"])
     answers = {a.get("name"): a for a in data.get("answers", []) if isinstance(a, dict)}
     tier = answers.get("tier", {})
@@ -94,7 +95,8 @@ def google_decisions(task, tiers, cfg):
             "effort": {"type": "choice", "instructions": INSTRUCTIONS["effort"], "criteria": EFFORT_CRITERIA},
         },
     }
-    headers = {"x-goog-api-key": cfg["_api_key"], **cfg.get("_headers", {})}
+    auth = {"x-goog-api-key": cfg["_api_key"]} if cfg.get("_api_key") else {}
+    headers = {**auth, **cfg.get("_headers", {})}
     data = _post(f"{base}/v1beta/decisions", body, headers, cfg["_timeout"])
     answers = data.get("answers") or {}
     tier = answers.get("tier") or {}

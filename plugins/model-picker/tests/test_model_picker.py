@@ -187,8 +187,15 @@ run(agent(description="d", prompt="find x", model="opus"), "advise", OA)
 results.append(check("explicit model: router not called", not SEEN))
 mp.ROUTER_DEADLINE = 0.2
 slow = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "sleep 2; echo '{}'"}
-results.append(check("router hard deadline -> heuristic", "timed out" in
-                     mp.decide({"description": "find x"}, {**slow, "MODEL_PICKER_ROUTER_TIMEOUT": 5})["source"]))
+import time  # noqa: E402
+t0 = time.monotonic()
+src = mp.decide({"description": "find x"}, {**slow, "MODEL_PICKER_ROUTER_TIMEOUT": 5})["source"]
+# Either the thread deadline or the (equally capped) subprocess timeout may fire first.
+results.append(check("router hard deadline -> heuristic, fast",
+                     src.startswith("heuristic (router") and time.monotonic() - t0 < 1.5))
+SEEN.clear()
+run(agent(description="d", prompt="p"), "advise", {**OA, "OPENAI_API_KEY": "", "MODEL_PICKER_ROUTER_API_KEY_ENV": "none"})
+results.append(check("keyless gateway: no auth header", SEEN and "authorization" not in SEEN[-1]["headers"]))
 srv.shutdown()
 
 print(f"\n{sum(results)}/{len(results)} passed")

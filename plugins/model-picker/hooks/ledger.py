@@ -86,23 +86,146 @@ def _rotated(directory):
     return [p for _, p in sorted(files)]
 
 
-def read(cfg, since=0.0):
-    """All records newer than `since` (epoch seconds), oldest first, across rotated files."""
-    out = []
+def read(cfg, since=0.0, tail_bytes=None):
+    """All records newer than `since` (epoch seconds), oldest first, across rotated files.
+
+    A rotated file is named log.<epoch ms when rotated>.jsonl, so every record in it is older than
+    its name: files rotated before `since` are skipped unread. With `tail_bytes` (hot paths that only
+    need recent records), only the end of the newest rotated file and of the current log are read.
+    """
     directory = state_dir(cfg)
-    for path in _rotated(directory) + [directory / "log.jsonl"]:
+    rotated = [p for p in _rotated(directory) if int(p.name[len("log."):-len(".jsonl")]) >= since * 1000]
+    if tail_bytes:
+        rotated = rotated[-1:]
+    out = []
+    for path in rotated + [directory / "log.jsonl"]:
         try:
-            with open(path, encoding="utf-8") as fh:
-                for line in fh:
-                    try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(rec, dict) and rec.get("ts", 0) >= since:
-                        out.append(rec)
+            if tail_bytes:
+                lines = _tail_lines(path, tail_bytes)
+            else:
+                with open(path, encoding="utf-8") as fh:
+                    lines = fh.readlines()
         except OSError:
             continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("ts", 0) >= since:
+                out.append(rec)
     return out
+
+
+# --- background-stamp queue ------------------------------------------------------------
+# Kept apart from log.jsonl so the per-prompt hook reads a tiny file in full (no tail window, no
+# rotation edge) and so delivery bookkeeping can fail loudly instead of being swallowed.
+QUEUE_MAX_AGE = 86400
+QUEUE_MAX_RECORDS = 500
+QUEUE_LOCK_WAIT = 1.0  # seconds; a stuck holder must never stall every prompt
+
+
+def _queue_path(cfg):
+    return state_dir(cfg) / "pending-stamps.jsonl"
+
+
+def _queue_lock(cfg):
+    d = state_dir(cfg)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(d / ".queue.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + QUEUE_LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() > deadline:
+                os.close(fd)
+                raise OSError("stamp queue busy")
+            time.sleep(0.02)
+
+
+def _queue_read(cfg):
+    try:
+        with open(_queue_path(cfg), encoding="utf-8") as fh:
+            out = []
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+            return out
+    except OSError:
+        return []
+
+
+def _queue_write(cfg, records):
+    """Atomic rewrite; raises on failure (callers must not deliver if bookkeeping failed)."""
+    path = _queue_path(cfg)
+    # Delivered stamps are done: keep only undelivered ones, newest QUEUE_MAX_RECORDS.
+    records = [r for r in records if not r.get("delivered")][-QUEUE_MAX_RECORDS:]
+    tmp = path.with_name(f".pending-stamps.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in records)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def queue_stamp(cfg, session, agent_id, text):
+    """Queue a background agent's stamp for delivery on its session's next turn. Never raises."""
+    try:
+        fd = _queue_lock(cfg)
+    except OSError:
+        return False
+    try:
+        now = time.time()
+        records = [r for r in _queue_read(cfg) if now - r.get("ts", 0) < QUEUE_MAX_AGE]
+        records.append({"ts": round(now, 3), "session": session, "agent_id": agent_id, "text": text,
+                        "delivered": False})
+        _queue_write(cfg, records)
+        return True
+    except Exception:
+        return False
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def take_stamps(cfg, session):
+    """Pop this session's undelivered stamps (newest per agent). Marks them delivered first; if that
+    write fails, returns nothing so a stamp is never shown on every prompt."""
+    try:
+        fd = _queue_lock(cfg)
+    except OSError:
+        return []
+    try:
+        now = time.time()
+        records = [r for r in _queue_read(cfg) if now - r.get("ts", 0) < QUEUE_MAX_AGE]
+        mine = [r for r in records if r.get("session") == session and not r.get("delivered") and r.get("text")]
+        if not mine:
+            return []
+        for r in mine:
+            r["delivered"] = True
+        try:
+            _queue_write(cfg, records)
+        except Exception:
+            return []
+        latest = {}
+        for r in mine:  # a resumed agent stops more than once: show only its newest stamp
+            latest[r.get("agent_id") or r["ts"]] = r
+        return [r["text"] for r in latest.values()]
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def find_decision(cfg, tool_use_id):
@@ -130,10 +253,16 @@ def _tail_lines(path, max_bytes=512 * 1024):
     with open(path, "rb") as fh:
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
-        fh.seek(max(0, size - max_bytes))
+        start = max(0, size - max_bytes)
+        if start:
+            fh.seek(start - 1)
+            starts_clean = fh.read(1) == b"\n"  # the window begins exactly at a line start
+        else:
+            starts_clean = True
+        fh.seek(start)
         data = fh.read().decode("utf-8", errors="replace")
     lines = data.splitlines()
-    return lines[1:] if size > max_bytes else lines  # drop a possibly partial first line
+    return lines if starts_clean else lines[1:]  # drop only a genuinely partial first line
 
 
 def last_model(transcript_path):

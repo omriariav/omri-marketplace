@@ -39,6 +39,7 @@ def _raises(fn):
 
 
 def check(name, cond):
+    cond = bool(cond)
     print(("ok   " if cond else "FAIL ") + name)
     return cond
 
@@ -96,9 +97,12 @@ results += [
     check("local: pure text -> local", mp.recommend("summarize this paragraph", local=True)[0] == "local"),
     check("local: needs files -> not local", mp.recommend("summarize the log files", local=True)[0] == "haiku"),
     check("local: disabled -> haiku", mp.recommend("summarize this paragraph")[0] == "haiku"),
-    check("local: hint in deny reason",
-          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify the sentiment of this sentence"),
-                                                 "enforce", LOCAL))),
+    check("local: never recommended for an agent launch (even pure text)",
+          "local" not in json.dumps(run(agent(description="classify", prompt="classify the sentiment of this sentence: I love it, works great"),
+                                        "enforce", LOCAL)).replace("pure text", "")),
+    check("local: hint offered in the session rules instead",
+          "gateway maps haiku" in (subprocess.run([sys.executable, "-I", str(HOOK), "session", str(ROOT)], input="{}",
+                                                  capture_output=True, text=True, env={**os.environ, **LOCAL}).stdout)),
 ]
 
 # --- review round 2 regressions -------------------------------------------------
@@ -451,7 +455,7 @@ results.append(check("mcp: Ollama down -> isError, not a crash",
 off = mcp([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}], {**OL, "MODEL_PICKER_OLLAMA": "0"})
 results.append(check("mcp: MODEL_PICKER_OLLAMA=0 hides tools", off[0]["result"]["tools"] == []))
 results.append(check("local tier on via OLLAMA_MODEL", mp.local_hint(OL) and "ask_local" in mp.local_hint(OL)
-                     and mp.decide({"description": "summarize this paragraph", "prompt": "summarize this paragraph"},
+                     and mp.decide({"description": "summarize this paragraph", "prompt": "summarize this paragraph: The cat sat on the mat all day long."},
                                    OL)["tier"] == "local"))
 srv.shutdown()
 
@@ -485,7 +489,8 @@ with tempfile.TemporaryDirectory() as d:
     bg = hook("subagentstop", {"agent_id": "bg", "transcript_path": str(sess)}, on)
     fgstop = hook("subagentstop", {"agent_id": "fg", "transcript_path": str(sess)}, on)
     results += [
-        check("stamp: background stamped at SubagentStop", bg and "ran on claude-haiku-5-5" in bg["systemMessage"]),
+        check("stamp: background stamp queued at SubagentStop for the next turn",
+              any("ran on claude-haiku-5-5" in r.get("text", "") for r in ledger._queue_read(on))),
         check("stamp: foreground not double-stamped at SubagentStop", fgstop is None),
     ]
     ctx = hook("session", {}, {"MODEL_PICKER_STAMP": "1", "MODEL_PICKER_STAMP_REPLIES": "1", **OL})
@@ -552,7 +557,8 @@ with tempfile.TemporaryDirectory() as d:
     pt_after = hook2("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_un", "transcript_path": str(sess)})
     results += [
         check("stamp: unknown shape, unfinished -> not stamped at PostToolUse", pt_unfinished is None),
-        check("stamp: unknown shape -> stamped once at SubagentStop", stop and "ran on claude-haiku-5-5" in stop["systemMessage"]),
+        check("stamp: unknown shape -> stamp queued once at SubagentStop",
+              len(ledger._queue_read(on)) == 1),
         check("stamp: later PostToolUse gives Claude the stamp without repeating it to the user",
               pt_after and "additionalContext" in pt_after["hookSpecificOutput"] and "systemMessage" not in pt_after),
         check("stamp: missing meta never crashes PostToolUse",
@@ -757,6 +763,172 @@ results += [
     check("report markdown: attribution nested under the credited bullet",
           any(ln.startswith("  - Not credited") for ln in md)),
 ]
+
+# --- v0.4.4: background stamps delivered on the next turn ------------------------------
+def hookrun(event, payload, env):
+    r = subprocess.run([sys.executable, "-I", str(HOOK), event, str(ROOT)], input=json.dumps(payload),
+                       capture_output=True, text=True, env={**os.environ, **env})
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sd = Path(d) / "sess" / "subagents"
+    write_transcript(sd / "agent-bg1.jsonl", [amsg("b1", "claude-haiku-5-5", inp=1000, out=50)])
+    (sd / "agent-bg1.meta.json").write_text(json.dumps({"agentType": "scout", "toolUseId": "t_bg1",
+                                                        "requestShape": "background"}))
+    on = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+    hookrun("subagentstop", {"session_id": "S1", "agent_id": "bg1", "transcript_path": str(sess)}, on)
+    other = hookrun("prompt", {"session_id": "S2"}, on)
+    first = hookrun("prompt", {"session_id": "S1"}, on)
+    again = hookrun("prompt", {"session_id": "S1"}, on)
+    ctx = (first or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+    results += [
+        check("bg stamp: not delivered to another session", other is None),
+        check("bg stamp: delivered to Claude on the next turn",
+              "ran on claude-haiku-5-5" in ctx and "name its model" in ctx and first.get("systemMessage")),
+        check("bg stamp: delivered once", again is None),
+    ]
+    # Resumed agent stops again with more work: the newer stamp is delivered once more.
+    write_transcript(sd / "agent-bg1.jsonl", [amsg("b1", "claude-haiku-5-5", inp=1000, out=50),
+                                              amsg("b2", "claude-haiku-5-5", inp=5000, out=500)])
+    time.sleep(0.01)
+    hookrun("subagentstop", {"session_id": "S1", "agent_id": "bg1", "transcript_path": str(sess)}, on)
+    resumed = hookrun("prompt", {"session_id": "S1"}, on)
+    results.append(check("bg stamp: resumed agent's newer stamp delivered",
+                         resumed and "ran on claude-haiku-5-5" in resumed["hookSpecificOutput"]["additionalContext"]))
+    results.append(check("bg stamp: off when STAMP is off", hookrun("prompt", {"session_id": "S1"}, fresh_state()) is None))
+    sess_ctx = hookrun("session", {}, {"MODEL_PICKER_STAMP": "1"})["hookSpecificOutput"]["additionalContext"]
+    results.append(check("session rules describe next-turn delivery", "arrives with your next turn" in sess_ctx))
+
+# --- v0.4.4 review fixes ----------------------------------------------------------------
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sd = Path(d) / "sess" / "subagents"
+    write_transcript(sd / "agent-x.jsonl", [amsg("x1", "claude-haiku-5-5", inp=100, out=5)])
+    (sd / "agent-x.meta.json").write_text(json.dumps({"agentType": "x", "toolUseId": "t_x", "requestShape": "background"}))
+    nolog = {**fresh_state(), "MODEL_PICKER_STAMP": "1", "MODEL_PICKER_LOG": "0"}
+    out = hookrun("subagentstop", {"session_id": "S", "agent_id": "x", "transcript_path": str(sess)}, nolog)
+    results.append(check("LOG=0: background stamp falls back to a user-visible line",
+                         out and "ran on claude-haiku-5-5" in out.get("systemMessage", "")))
+
+    on = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+    # Race: a resumed agent's second pending lands after the first delivery read: it must still be delivered.
+    hookrun("subagentstop", {"session_id": "S", "agent_id": "x", "transcript_path": str(sess)}, on)
+    first = hookrun("prompt", {"session_id": "S"}, on)
+    ledger.queue_stamp(on, "S", "x", "[model-picker] x ran on late")
+    second = hookrun("prompt", {"session_id": "S"}, on)
+    third = hookrun("prompt", {"session_id": "S"}, on)
+    results += [
+        check("pid dedupe: first delivered", first is not None),
+        check("pid dedupe: a later pending for the same agent is still delivered",
+              second and "ran on late" in second["hookSpecificOutput"]["additionalContext"]),
+        check("pid dedupe: nothing delivered twice", third is None),
+    ]
+    # Concurrency: 8 turns of one session racing for one stamp deliver it exactly once.
+    ledger.queue_stamp(on, "S", "y", "[model-picker] y ran on z")
+    procs = [subprocess.Popen([sys.executable, "-I", str(HOOK), "prompt", str(ROOT)], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True, env={**os.environ, **on}) for _ in range(8)]
+    outs = [p.communicate(json.dumps({"session_id": "S"}))[0] for p in procs]
+    results.append(check("8 racing turns: stamp delivered exactly once", sum("y ran on z" in o for o in outs) == 1))
+    # Another session's queued stamp is never taken by this session.
+    ledger.queue_stamp(on, "OTHER", "w", "[model-picker] w ran on q")
+    results.append(check("queue: other session's stamp untouched", hookrun("prompt", {"session_id": "S"}, on) is None
+                         and ledger.take_stamps(on, "OTHER") == ["[model-picker] w ran on q"]))
+    # Bookkeeping failure: if the queue can't be rewritten, nothing is shown (never re-shown on every prompt).
+    ledger.queue_stamp(on, "S", "v", "[model-picker] v ran on u")
+    qdir = Path(on["MODEL_PICKER_STATE_DIR"])
+    os.chmod(qdir, 0o500)
+    try:
+        blocked = ledger.take_stamps(on, "S")
+    finally:
+        os.chmod(qdir, 0o700)
+    capst = fresh_state()
+    for i in range(700):
+        ledger.queue_stamp(capst, f"Z{i}", "a", "t")
+    results.append(check("queue capped at QUEUE_MAX_RECORDS", len(ledger._queue_read(capst)) <= ledger.QUEUE_MAX_RECORDS))
+    ledger.take_stamps(capst, "Z699")
+    results.append(check("queue drops delivered records", all(r.get("session") != "Z699" for r in ledger._queue_read(capst))))
+    results.append(check("queue write failure: nothing delivered, stamp kept for later",
+                         blocked == [] and ledger.take_stamps(on, "S") == ["[model-picker] v ran on u"]))
+    results.append(check("prompt hook errors are silent", subprocess.run(
+        [sys.executable, "-I", str(HOOK), "prompt", str(ROOT)], input="not json", capture_output=True, text=True,
+        env={**os.environ, **on}).stdout == ""))
+
+# read(): rotated files older than `since` are skipped by name.
+st = fresh_state()
+sdir = Path(st["MODEL_PICKER_STATE_DIR"])
+sdir.mkdir(parents=True, exist_ok=True)
+old_ms = int((time.time() - 3 * 86400) * 1000)
+(sdir / f"log.{old_ms}.jsonl").write_text(json.dumps({"ts": time.time() - 3 * 86400 - 10, "kind": "decision"}) + "\n")
+results.append(check("read: old rotated file skipped by its name",
+                     all(r.get("kind") != "decision" for r in ledger.read(st, time.time() - 86400))))
+tf = sdir / "tail.txt"
+tf.write_text("aaaa\nbbbb\ncccc\n")
+results += [
+    check("tail: window starting exactly at a line keeps it", ledger._tail_lines(tf, 10) == ["bbbb", "cccc"]),
+    check("tail: window starting mid-line drops the partial", ledger._tail_lines(tf, 8) == ["bbb", "cccc"][1:]),
+]
+big = sdir / "log.jsonl"
+with open(big, "w") as fh:
+    for i in range(38000):
+        fh.write(json.dumps({"ts": time.time() - 100, "kind": "decision", "outcome": "explicit", "i": i}) + "\n")
+t0 = time.monotonic()
+hookrun("prompt", {"session_id": "S"}, {**st, "MODEL_PICKER_STAMP": "1"})
+dt = time.monotonic() - t0
+results.append(check(f"prompt hook on a ~5MB ledger stays fast ({dt*1000:.0f} ms incl. interpreter start)", dt < 0.35))
+
+
+# --- local guard: `local` must be earned (both review rounds' examples) ------------------
+LV = {"tier": "local", "effort": "low", "reason": "r", "source": "openai-decisions:x (0.90)", "confidence": 0.9}
+TOOL_WORK = [  # (description, prompt): tool work; checked below: never `local` on launch
+    ("Label vendor-dependent keys pending", "Add a pending label to the two keys in SKILL.md and open a PR"),
+    ("Tidy config", "edit config.yaml and commit the change"),
+    ("Docs", "update the README"), ("Bug", "fix the bug in auth"), ("Logs", "look at the logs"),
+    ("Diff", "check the diff"), ("Tests", "Run pytest and report failures"), ("PR", "Review my PR #12"),
+    ("Cleanup", "Delete the temp folder"), ("Debug", "Debug the failing test"), ("Test", "Add a test for login"),
+    ("TODOs", "Find all TODOs in the codebase"), ("Files", "List the files in the repo"),
+    ("Migrate", "execute the migration"), ("Sync", "pull the latest changes"), ("API", "curl the endpoint"),
+    ("Save", "Write the results to a file"), ("Rename", "Rename the variable foo to bar across the project"),
+    ("Summarize text", "Summarize this:\n" + "word " * 120 + "\nthen git commit the changes and open a PR"),
+    ("Notes", "Summarize the meeting notes"),  # nothing pasted: ask_local can't see them
+]
+TEXT_WORK = [  # pasted-text work; never `local` on launch, but `local` via the skill/route path
+    ("Summarize this email", "Summarize this email in 3 bullets:\n\nHi team, see the link and page 3.5 e.g. and/or notes."),
+    ("Summarize", "Summarize the 3.5 results: revenue up 3.5%, churn flat, NPS 41 (see page 2)."),
+    ("Extract names", "Extract the names from the paragraph below: Bob and/or Alice met Carol in Paris."),
+    ("Translate", "Translate to French: hello, e.g. world"),
+    ("Translate", "Translate: see config.yaml for details"),
+    ("Summarize log", "Summarize this log: Traceback (most recent call last): File main.py line 3 KeyError 'x'"),
+    ("Classify", "Classify the sentiment of this review: The battery died after two days."),
+]
+ALWAYS_LOCAL = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_OLLAMA_MODEL": "qwen2.5:7b-instruct",
+                "MODEL_PICKER_ROUTER_CMD": f"{sys.executable} -c \"print('{{\\\"tier\\\": \\\"local\\\", "
+                                           f"\\\"effort\\\": \\\"low\\\", \\\"confidence\\\": 0.9}}')\""}
+probe = mp.decide({"description": "Translate", "prompt": "Translate to French: hello"}, ALWAYS_LOCAL)
+launch_local = [p for d, p in TOOL_WORK + TEXT_WORK
+                if mp.decide({"description": d, "prompt": p}, ALWAYS_LOCAL, for_launch=True)["tier"] == "local"]
+results += [
+    check("fake router really answers local (skill path keeps a confident local)", probe["tier"] == "local"),
+    check(f"agent launches never get local, even when the router says so ({len(TOOL_WORK + TEXT_WORK)} cases)",
+          not launch_local),
+    check("skill path: pasted-text tasks keep a confident local",
+          all(mp.decide({"description": d, "prompt": p}, ALWAYS_LOCAL)["tier"] == "local" for d, p in TEXT_WORK)),
+    check("launch path: router not even offered local",
+          "local" not in mp.decide({"description": "d", "prompt": "p"}, {**ALWAYS_LOCAL}, for_launch=True)["tier"]),
+    check("skill path: shaky local call falls back with honest metadata",
+          (lambda r: r["tier"] != "local" and r["source"].startswith("heuristic (local vetoed") and r["confidence"] is None)(
+              mp.guard_local({**LV, "confidence": 0.6}, {"description": "Summarize", "prompt": "Summarize: x"}, {}))),
+    check("local guard: non-local recs untouched", mp.guard_local({**LV, "tier": "sonnet"}, {"prompt": "x"}, {})["tier"] == "sonnet"),
+]
+
+wf = subprocess.run([sys.executable, "-I", str(HOOK), "pretool", str(ROOT)],
+                    input=json.dumps({"tool_name": "Workflow", "tool_input": {"script": 'agent("a")'}}),
+                    capture_output=True, text=True, env={**os.environ, **OL, **fresh_state()}).stdout
+results.append(check("workflow advice never routes an agent() step to local",
+                     "not as an agent() step" in wf and "use the local model" not in wf))
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

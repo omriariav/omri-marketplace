@@ -132,7 +132,7 @@ Asking a model which model it is gives unreliable answers, and behind a gateway 
 
 - **Foreground subagents:** when the `Agent` call returns, a line like this is shown to you and added to Claude's context, and Claude is told to name that model when it reports the result:
   `[model-picker] web-fetch ran on claude-haiku-5-5 · 13K tokens · ~$0.001 (~$0.055 on opus)`
-- **Background subagents:** their `Agent` call returns at launch, so they are stamped when they finish (SubagentStop), to you only: Claude is told to point to `/model-picker:report` rather than guess their model. Each subagent is stamped once.
+- **Background subagents:** their `Agent` call returns at launch, so the stamp is queued when they finish (SubagentStop) and delivered on the session's next turn (UserPromptSubmit), which also fires when the agent's result notification arrives. Claude sees it next to the agent's report and names the model; you see it too. Queued stamps sit in `pending-stamps.jsonl` (24 h) and are delivered exactly once to their own session; a resumed agent's newer stamp is delivered again. Stamps don't carry over after `/clear`.
 - **`ask_local` answers** end with `[model-picker] answered by ollama:<model> · N in / M out tokens · $0 · Xs`.
 - **Replies (opt-in):** `MODEL_PICKER_STAMP_REPLIES=1` asks Claude to end every reply with its model id, taken from its system prompt. Off by default because it adds a line to every reply.
 
@@ -142,13 +142,13 @@ Asking a model which model it is gives unreliable answers, and behind a gateway 
 
 The plugin ships a small stdlib MCP server (`mcp/local_server.py`) with two tools: `ask_local(prompt, system?, max_tokens?, model?)` and `list_local_models()`. Set `MODEL_PICKER_OLLAMA_MODEL` (for example `qwen2.5:7b-instruct`) and:
 
-- the `local` tier turns on, and model-picker recommends calling `ask_local` directly, instead of launching an agent, for tool-free text work (summarize, classify, extract, translate, rephrase text you pass in);
+- the `local` tier turns on: the session rules tell Claude to consider calling `ask_local` directly, instead of launching an agent, for tool-free text work on text it already has (summarize, classify, extract, translate, rephrase), and `/model-picker:model-picker` can recommend it. Agent launches themselves are never recommended `local` (the agent is already being launched with tools), so the launch hook can't misroute tool work to a model that has none;
 - each call is logged to the ledger (model, token counts, seconds; never the prompt or answer) and shows up in `/model-picker:report` with what it would have cost at Haiku prices.
 
 Without a configured model the tools still list but return a clear error naming the installed models; with Ollama stopped they return "not reachable" instead of failing. `MODEL_PICKER_OLLAMA=0` hides them. Small local models are fine for simple transformation and weak at reasoning or long structured writing, so check what they return.
 
 ### Other routes
 
-Claude Code sends every request to one Anthropic-format endpoint, so beyond `ask_local` a local model is reached either through a gateway that routes by model name (set `ANTHROPIC_BASE_URL` to the gateway and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to the local model's name, so `model: haiku` runs locally) or through an MCP tool that wraps the local server. Set `MODEL_PICKER_LOCAL_HINT` to describe whichever you use. The plugin then recommends `local` only for pure text work that needs no tools or files (summarize, classify, extract, translate given text); search and file work stay on Haiku, since local models are weak at tool use.
+Claude Code sends every request to one Anthropic-format endpoint, so beyond `ask_local` a local model is reached either through a gateway that routes by model name (set `ANTHROPIC_BASE_URL` to the gateway and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to the local model's name, so `model: haiku` runs locally) or through an MCP tool that wraps the local server. Set `MODEL_PICKER_LOCAL_HINT` to describe whichever you use. The session rules and `/model-picker:model-picker` then offer `local` for pure text work on text already in hand (summarize, classify, extract, translate); agent launches and workflow steps are never routed to it, since a local model has no tools.
 
 Tests: `python3 plugins/model-picker/tests/test_model_picker.py`. Requires `python3` (stdlib only); hooks exit silently without it.

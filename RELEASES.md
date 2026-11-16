@@ -1,5 +1,16 @@
 # Releases
 
+## model-picker v0.4.4 (2026-11-16)
+
+Fix: stamps for background agents never reached anyone. Claude Code runs most agents in the background, and their stamp was only a SubagentStop `systemMessage`, which Claude never receives and the user didn't see.
+
+- Background stamps are now queued when the agent finishes and delivered on the session's next turn through a new UserPromptSubmit hook, which also fires when the agent's result notification arrives. Claude gets the stamp next to the agent's report, with a rule to name that model.
+- Queued stamps live in a small `pending-stamps.jsonl` (kept 24 h), read in full under a lock: each is delivered exactly once to its own session (8 racing turns tested), a resumed agent's newer stamp is delivered again, and a failed bookkeeping write delivers nothing rather than repeating on every prompt. With `MODEL_PICKER_LOG=0` the stamp falls back to a plain user-visible line. Off unless `MODEL_PICKER_STAMP=1`. Stamps don't carry over after `/clear` or into a new session.
+- Agent launches are never recommended `local`. By the time the launch hook runs, Claude is already launching a tool-using agent, and guessing "call ask_local instead" from a one-line description sent tool work to a model with no tools (found in a real session: Jev picked `local` at 0.60 for what was a code-and-git task; three rounds of text-matching rules couldn't make that guess safe). The local tier is offered where the choice is still open: the session rules ("before launching an agent, consider ask_local for pasted text") and `/model-picker:model-picker`, where a `local` pick below 0.75 confidence falls back to a Claude tier.
+- `ledger.read()` skips rotated files older than the requested window by their name; a tail-read edge case no longer drops a complete record.
+- Smoke-tested three times in real headless sessions: a background Haiku agent's stamp was quoted verbatim by Claude when its result arrived.
+- Tests: 190 (incl. 27 launch prompts that must never get `local` even when the router answers `local`).
+
 ## model-picker v0.4.3 (2026-11-16)
 
 Fix: `/model-picker:report` output rendered as one run-together paragraph in Markdown views. The summary is now a bullet list with a bold title, blank lines around the table, and the not-credited breakdown nested under the credited saving. Tests: 162.

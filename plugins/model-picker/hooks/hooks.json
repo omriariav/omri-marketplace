@@ -46,6 +46,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" prompt",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

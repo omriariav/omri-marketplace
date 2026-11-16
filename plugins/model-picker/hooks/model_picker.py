@@ -332,14 +332,37 @@ def fit_to_available(rec, cfg):
     return {**rec, "tier": target, "effort": effort, "reason": f"{rec['reason']} ({note})", "capped_from": want}
 
 
-def decide(inp, cfg, use_router=True):
-    """Recommendation dict: tier, effort, reason, source, limited to the available tiers."""
-    return fit_to_available(_decide(inp, cfg, use_router), cfg)
+LOCAL_MIN_CONFIDENCE = 0.75  # a wrong "local" call costs the most: the local model can't use tools at all
+def guard_local(rec, inp, cfg):
+    """Don't trust a shaky `local` call: below LOCAL_MIN_CONFIDENCE fall back to the best non-local tier.
+    (Agent launches never get `local` at all; see decide(for_launch=True).)"""
+    if rec.get("tier") != "local":
+        return rec
+    if not (isinstance(rec.get("confidence"), (int, float)) and rec["confidence"] < LOCAL_MIN_CONFIDENCE):
+        return rec
+    text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt")).lower()[:2000]
+    tier, why = recommend(text, str(inp.get("subagent_type") or ""), local=False)
+    note = f"local confidence {rec['confidence']:.2f} too low"
+    return {**rec, "tier": tier, "effort": "medium", "reason": f"{why} (not local: {note})",
+            "source": f"heuristic (local vetoed: {note})", "confidence": None,
+            "unsure": why == UNSURE_REASON, "local_vetoed": True}
 
 
-def _decide(inp, cfg, use_router=True):
+def decide(inp, cfg, use_router=True, for_launch=False):
+    """Recommendation dict: tier, effort, reason, source, limited to the available tiers.
+
+    for_launch: the call is an Agent/teammate launch that is already happening. `local` (call ask_local
+    instead of launching an agent) can't apply there, and guessing it from a one-line description sends
+    tool work to a model that has no tools; so launches only ever get Claude tiers. The local tier is
+    offered where the choice is still open: the session rules and the /model-picker skill.
+    """
+    rec = _decide(inp, cfg, use_router, allow_local=not for_launch)
+    return fit_to_available(guard_local(rec, inp, cfg), cfg)
+
+
+def _decide(inp, cfg, use_router=True, allow_local=True):
     """Router first (if configured), heuristic fallback; may name a tier that is not available."""
-    local = local_enabled(cfg)
+    local = allow_local and local_enabled(cfg)
     agent_type = str(inp.get("subagent_type") or "")
     text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name"))
     tier, why = recommend(text, agent_type, local)
@@ -387,7 +410,8 @@ def _route(router, name, inp, cfg, local):
             if not key:
                 raise ValueError("no API key")
             rcfg["_api_key"] = key
-        return router(task_text(inp, cfg), available_tiers(cfg), rcfg)
+        tiers = [t for t in available_tiers(cfg) if local or t != "local"]
+        return router(task_text(inp, cfg), tiers, rcfg)
     except Exception as exc:  # router trouble never blocks a launch
         return exc
 
@@ -463,7 +487,7 @@ def handle_agent(payload, mode, cfg):
     chosen_unavailable = bool(model) and bool(tier_of(model)) and tier_of(model) not in available_tiers(cfg)
     # No router round trip for a launch that is about to be redirected anyway.
     rec = decide(inp, cfg, use_router=not chosen_unavailable and (
-        not model or _enabled(cfg, "MODEL_PICKER_ROUTER_ON_EXPLICIT", default=False)))
+        not model or _enabled(cfg, "MODEL_PICKER_ROUTER_ON_EXPLICIT", default=False)), for_launch=True)
     session_model = ledger.last_model(payload.get("transcript_path"))
     outcome = ("denied" if mode == "enforce" and (not model or chosen_unavailable)
                else "explicit" if model else "missing")
@@ -526,8 +550,17 @@ def handle_subagent_stop(payload, cfg):
     # Foreground agents are stamped at PostToolUse (where Claude also sees it). Everything else
     # (background, or a meta with no requestShape) is stamped here, once, to the user.
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and meta.get("requestShape") != "foreground":
-        print(json.dumps({"systemMessage": ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)}))
+        line = ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)
+        if not ledger.logging_enabled(cfg):
+            # Delivery needs the ledger; without it, the user-facing line is the best we can do.
+            print(json.dumps({"systemMessage": line}))
+            return
         ledger.append(cfg, {"kind": "stamp", "agent_id": payload.get("agent_id"), "tool_use_id": meta.get("toolUseId")})
+        # A SubagentStop systemMessage reaches neither Claude nor (reliably) the user, so queue the stamp:
+        # the session's next turn (UserPromptSubmit, which also fires when the agent's result notification
+        # arrives) delivers it next to the agent's report. `pid` makes each pending stamp uniquely deliverable.
+        if not ledger.queue_stamp(cfg, payload.get("session_id"), payload.get("agent_id"), line):
+            print(json.dumps({"systemMessage": line}))  # couldn't queue: at least show it
     elif _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
         tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
         vs = f" vs ~${totals['baseline_cost']:.3f} on {baseline}" if baseline and totals["saving"] else ""
@@ -560,6 +593,23 @@ def handle_posttool(payload, cfg):
         out["systemMessage"] = line
         ledger.append(cfg, {"kind": "stamp", "tool_use_id": payload.get("tool_use_id")})
     print(json.dumps(out))
+
+
+def handle_prompt(payload, cfg):
+    """UserPromptSubmit: deliver stamps of background agents that finished since the last turn.
+    Reads only the small stamp queue, never the whole ledger, so it stays fast on every prompt."""
+    if not _enabled(cfg, "MODEL_PICKER_STAMP", default=False) or not ledger.logging_enabled(cfg):
+        return
+    session = payload.get("session_id")
+    if not session:
+        return
+    lines = ledger.take_stamps(cfg, session)
+    if not lines:
+        return
+    context = ("Background agents finished since your last turn. Their actual models, from the transcripts:\n"
+               + "\n".join(lines) + "\nWhen you report what one of them produced, name its model.")
+    print(json.dumps({"systemMessage": "\n".join(lines),
+                      "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
 
 
 def agent_calls(script):
@@ -603,7 +653,9 @@ def handle_workflow(payload, mode, cfg):
     msg = (f"model-picker: {missing} of {len(calls)} agent() calls in this workflow set no `model`. "
            f"Pass {{model: ...}} using the available tiers: {advice}.")
     if local_enabled(cfg):
-        msg += f" For tool-free text steps, use the local model: {local_hint(cfg)}."
+        # A workflow agent() step is a tool-using agent: never route it to the local model. Plain text
+        # transformation belongs outside the workflow (ask_local from the main session), if anywhere.
+        msg += " Text-only transformation of text you already have can be done with ask_local before or after the workflow, not as an agent() step."
     if mode == "enforce":
         emit("deny", msg + " Add the model options and re-run.")
     else:
@@ -625,7 +677,8 @@ def handle_session(root, cfg):
     if tiers_warning:
         context += f"\nmodel-picker warning: {tiers_warning}"
     if local_enabled(cfg):
-        context += ("\nLocal tier enabled: for pure text work that needs no tools or files (summarize, classify, "
+        context += ("\nLocal tier enabled: before launching an agent, consider whether the task is pure text work on text "
+                    "you already have (summarize, classify, "
                     f"extract, translate text you paste into the prompt itself), use the local model: {local_hint(cfg)}. "
                     "It cannot open files, URLs, PRs or tickets. Check its output: "
                     "small local models are fine for simple transformation, weak at anything else.")
@@ -637,8 +690,9 @@ def handle_session(root, cfg):
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
         context += ("\nModel stamps are on: foreground subagent results and ask_local answers carry a "
                     "`[model-picker] ... ran on <model>` line taken from the transcript; name that model when you "
-                    "report what they produced. Background agents are stamped to the user only when they finish: "
-                    "if asked which model a background agent used, point to /model-picker:report rather than guess.")
+                    "report what they produced. Background agents are stamped when they finish: the stamp arrives with your "
+                    "next turn (usually alongside the agent's result); name that model when you report it, and never guess "
+                    "a model that has no stamp (point to /model-picker:report instead).")
     if _enabled(cfg, "MODEL_PICKER_STAMP_REPLIES", default=False):
         context += ("\nEnd every reply with one line naming the model you are running on, e.g. `— claude-opus-5-5`, "
                     "using the model id stated in your system prompt.")
@@ -680,6 +734,9 @@ def main():
         if payload.get("tool_name") in ("Agent", "Task"):
             handle_posttool(payload, cfg)
         return
+    if event == "prompt":
+        handle_prompt(payload, cfg)
+        return
     tool = payload.get("tool_name")
     if tool in ("Agent", "Task"):
         handle_agent(payload, mode, cfg)
@@ -691,4 +748,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:  # never block a launch, but never fail silently either
-        print(json.dumps({"systemMessage": f"model-picker: hook error ({type(exc).__name__}: {exc}); launch not checked."}))
+        if len(sys.argv) > 1 and sys.argv[1] == "prompt":
+            pass  # a stamp-delivery hiccup must not put a "launch not checked" line on every prompt
+        else:
+            print(json.dumps({"systemMessage": f"model-picker: hook error ({type(exc).__name__}: {exc}); "
+                                               "launch not checked."}))

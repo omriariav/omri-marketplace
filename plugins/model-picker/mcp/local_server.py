@@ -89,7 +89,7 @@ def ask_local(cfg, args):
         raise ValueError(f"no local model configured: set MODEL_PICKER_OLLAMA_MODEL (installed: {names})")
     messages = ([{"role": "system", "content": str(args["system"])}] if args.get("system") else [])
     messages.append({"role": "user", "content": prompt})
-    max_tokens = int(args.get("max_tokens") or 1024)
+    max_tokens = min(max(int(args.get("max_tokens") or 1024), 1), 8192)
     timeout = float(cfg.get("MODEL_PICKER_OLLAMA_TIMEOUT") or 120)
     started = time.monotonic()
     record = {"kind": "local", "model": f"ollama:{model}"}
@@ -112,6 +112,8 @@ def ask_local(cfg, args):
 
 
 def call_tool(cfg, name, args):
+    if args is not None and not isinstance(args, dict):
+        raise ValueError("`arguments` must be an object")
     if name == "ask_local":
         return ask_local(cfg, args or {})
     if name == "list_local_models":
@@ -126,6 +128,8 @@ def handle(msg, cfg):
     method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
     if mid is None:
         return None
+    if not isinstance(params, dict):
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "params must be an object"}}
     enabled = str(cfg.get("MODEL_PICKER_OLLAMA", "1")).strip().lower() not in ("0", "false", "off", "no")
     if method == "initialize":
         result = {"protocolVersion": params.get("protocolVersion") or "2025-06-18",
@@ -141,6 +145,14 @@ def handle(msg, cfg):
         try:
             text = call_tool(cfg, params.get("name"), params.get("arguments"))
             result = {"content": [{"type": "text", "text": text}], "isError": False}
+        except urllib.error.HTTPError as exc:  # Ollama is up but refused: wrong model, OOM, ...
+            try:
+                detail = json.loads(exc.read().decode() or "{}").get("error") or exc.reason
+            except (OSError, ValueError, AttributeError):
+                detail = exc.reason
+            hint = " Pull it with `ollama pull <model>` or check MODEL_PICKER_OLLAMA_MODEL." if exc.code == 404 else ""
+            result = {"content": [{"type": "text", "text": f"Ollama returned HTTP {exc.code}: {detail}.{hint}"}],
+                      "isError": True}
         except urllib.error.URLError as exc:
             result = {"content": [{"type": "text", "text": f"Ollama not reachable at {_url(cfg)} ({exc.reason}). "
                                                           "Start it with `ollama serve`."}], "isError": True}
@@ -162,7 +174,12 @@ def main():
         except ValueError:
             reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
         else:
-            reply = handle(msg, cfg) if isinstance(msg, dict) else None
+            try:
+                reply = handle(msg, cfg) if isinstance(msg, dict) else None
+            except Exception as exc:  # never let one bad request kill the server
+                mid = msg.get("id") if isinstance(msg, dict) else None
+                reply = None if mid is None else {"jsonrpc": "2.0", "id": mid,
+                                                  "error": {"code": -32603, "message": f"internal error: {exc}"}}
         if reply is not None:
             sys.stdout.write(json.dumps(reply) + "\n")
             sys.stdout.flush()

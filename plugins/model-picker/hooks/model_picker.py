@@ -79,7 +79,10 @@ EDIT_RE = re.compile(
 LOCAL_RE = re.compile(r"\b(summari[sz]e|classify|categori[sz]e|extract|translate|rephrase|sentiment)\b")
 TOOL_RE = re.compile(r"\b(find|search|grep|locate|list|where is|which files?|logs?|test output|fetch|scan|explore|"
                      r"run|open|read the|in the (repo|codebase)|files?|code|module|function|class|parser|repo|"
-                     r"release|branch|commit|tag|api|tests?|schema|database|rewrite|refactor|update|create|delete)\b")
+                     r"release|branch|commit|tag|api|tests?|schema|database|rewrite|refactor|update|create|delete|"
+                     r"readme|pr|pull request|issue|diff|ticket|docs?|document|page|site|url|link|"
+                     r"spreadsheet|sheet|slack|thread|channel|email|inbox)\b"
+                     r"|https?://|\w/\w|\b[\w-]+\.[a-z0-9]{1,5}\b")  # URLs, paths, file names
 
 REASONS = {
     "local": "pure text work that needs no tools or files",
@@ -425,9 +428,11 @@ def handle_subagent_stop(payload, cfg):
         **{k: totals[k] for k in ("messages", "input", "output", "cache_read", "cache_write", "cost",
                                   "baseline_cost", "saving", "local", "unpriced")},
     })
-    background = meta.get("requestShape") == "background"
-    if _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and background:
+    # Foreground agents are stamped at PostToolUse (where Claude also sees it). Everything else
+    # (background, or a meta with no requestShape) is stamped here, once, to the user.
+    if _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and meta.get("requestShape") != "foreground":
         print(json.dumps({"systemMessage": ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)}))
+        ledger.append(cfg, {"kind": "stamp", "agent_id": payload.get("agent_id"), "tool_use_id": meta.get("toolUseId")})
     elif _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
         tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
         vs = f" vs ~${totals['baseline_cost']:.3f} on {baseline}" if baseline and totals["saving"] else ""
@@ -442,6 +447,8 @@ def handle_posttool(payload, cfg):
     path, meta = ledger.find_subagent(payload.get("transcript_path"), payload.get("tool_use_id"))
     if not path or meta.get("requestShape") == "background":
         return  # background agents are stamped at SubagentStop, once they have actually run
+    if meta.get("requestShape") != "foreground" and meta.get("finished") is not True:
+        return  # unknown shape and not finished: likely a launch-time return, let SubagentStop stamp it
     messages = ledger.transcript_usage(path)
     if not messages:
         return
@@ -451,8 +458,13 @@ def handle_posttool(payload, cfg):
     totals = ledger.summarize_usage(messages, baseline, ledger.price_table(cfg))
     model = max(totals["models"], key=totals["models"].get)
     line = ledger.stamp_text(meta.get("agentType"), model, totals, baseline)
-    print(json.dumps({"systemMessage": line,
-                      "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": line}}))
+    out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": line}}
+    already = any(r.get("kind") == "stamp" and r.get("tool_use_id") == payload.get("tool_use_id")
+                  for r in ledger.read(cfg, time.time() - 86400))
+    if not already:  # the user already saw it if SubagentStop stamped first; Claude still gets it
+        out["systemMessage"] = line
+        ledger.append(cfg, {"kind": "stamp", "tool_use_id": payload.get("tool_use_id")})
+    print(json.dumps(out))
 
 
 def agent_calls(script):
@@ -513,11 +525,14 @@ def handle_session(root, cfg):
     context = m.group(0)
     if local_hint(cfg):
         context += ("\nLocal tier enabled: for pure text work that needs no tools or files (summarize, classify, "
-                    f"extract, translate given text), use the local model: {local_hint(cfg)}. Check its output: "
+                    f"extract, translate text you paste into the prompt itself), use the local model: {local_hint(cfg)}. "
+                    "It cannot open files, URLs, PRs or tickets. Check its output: "
                     "small local models are fine for simple transformation, weak at anything else.")
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
-        context += ("\nModel stamps are on: subagent results carry a `[model-picker] ... ran on <model>` line taken "
-                    "from the transcript. When you report what a subagent or ask_local produced, name that model.")
+        context += ("\nModel stamps are on: foreground subagent results and ask_local answers carry a "
+                    "`[model-picker] ... ran on <model>` line taken from the transcript; name that model when you "
+                    "report what they produced. Background agents are stamped to the user only when they finish: "
+                    "if asked which model a background agent used, point to /model-picker:report rather than guess.")
     if _enabled(cfg, "MODEL_PICKER_STAMP_REPLIES", default=False):
         context += ("\nEnd every reply with one line naming the model you are running on, e.g. `— claude-opus-5-5`, "
                     "using the model id stated in your system prompt.")

@@ -8,7 +8,9 @@ Model stamps and a bundled local-model tool.
 - `MODEL_PICKER_STAMP_REPLIES=1` (opt-in) asks Claude to end every reply with its model id.
 - New bundled MCP server with `ask_local` and `list_local_models`, backed by Ollama (stdlib only). Setting `MODEL_PICKER_OLLAMA_MODEL` turns on the `local` tier, so tool-free text work goes to a $0 local model instead of a subagent. Answers carry a stamp; calls are logged (no prompt or answer text) and reported with their Haiku-price equivalent.
 - Clear errors when no model is configured (lists installed models) or Ollama is down; `MODEL_PICKER_OLLAMA=0` hides the tools.
-- Tests: 105 (from 85), including a JSON-RPC session against a mock Ollama, stamp placement for foreground and background agents, and session-rule injection.
+- The local tier is never recommended for work that names a file, path, URL, PR, ticket, doc or page: `ask_local` only sees text pasted into its prompt.
+- Robust MCP server: malformed requests get JSON-RPC errors instead of killing it, and Ollama HTTP errors (e.g. a model not pulled) are reported as such, not as "not reachable".
+- Tests: 118 (from 85), including a JSON-RPC session against a mock Ollama, malformed requests, HTTP 404s, stamp placement for foreground, background and unknown-shape agents, and session-rule injection.
 
 ## model-picker v0.3.0 (2026-11-16)
 

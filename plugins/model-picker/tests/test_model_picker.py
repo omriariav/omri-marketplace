@@ -97,7 +97,7 @@ results += [
     check("local: needs files -> not local", mp.recommend("summarize the log files", local=True)[0] == "haiku"),
     check("local: disabled -> haiku", mp.recommend("summarize this paragraph")[0] == "haiku"),
     check("local: hint in deny reason",
-          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify this ticket text"),
+          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify the sentiment of this sentence"),
                                                  "enforce", LOCAL))),
 ]
 
@@ -496,6 +496,67 @@ with tempfile.TemporaryDirectory() as d:
         check("session: local tier rule injected", "ask_local" in c and "Local tier enabled" in c),
         check("session: rules off by default", "Model stamps" not in
               (hook("session", {}, {})["hookSpecificOutput"]["additionalContext"])),
+    ]
+
+# --- v0.4 review regressions --------------------------------------------------------
+results += [
+    check("local veto: file name", mp.recommend("summarize README.md", local=True)[0] != "local"),
+    check("local veto: URL", mp.recommend("summarize the PR https://github.com/x/y/pull/1", local=True)[0] != "local"),
+    check("local veto: path", mp.recommend("summarize src/app notes", local=True)[0] != "local"),
+    check("local veto: doc/ticket words", mp.recommend("summarize the design doc", local=True)[0] != "local"),
+    check("local still ok for pasted text", mp.recommend("translate this sentence into Hebrew", local=True)[0] == "local"),
+]
+
+err_srv = HTTPServer(("127.0.0.1", 0), type("E", (BaseHTTPRequestHandler,), {
+    "log_message": lambda self, *a: None,
+    "do_POST": lambda self: (self.rfile.read(int(self.headers["Content-Length"])), self.send_response(404),
+                             self.send_header("Content-Type", "application/json"), self.end_headers(),
+                             self.wfile.write(b'{"error":"model \'nope\' not found"}'))}))
+threading.Thread(target=err_srv.serve_forever, daemon=True).start()
+bad = mcp([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": [1]},
+           {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ask_local", "arguments": "oops"}},
+           {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "ask_local", "arguments": {"prompt": "x", "max_tokens": -5}}},
+           {"jsonrpc": "2.0", "id": 4, "method": "ping"}],
+          {"MODEL_PICKER_OLLAMA_URL": f"http://127.0.0.1:{err_srv.server_port}",
+           "MODEL_PICKER_OLLAMA_MODEL": "nope", **fresh_state()})
+by = {r.get("id"): r for r in bad}
+err_srv.shutdown()
+results += [
+    check("mcp: non-object params -> -32602, server survives", by[1]["error"]["code"] == -32602 and 4 in by),
+    check("mcp: non-object arguments -> isError", by[2]["result"]["isError"] and "must be an object" in
+          by[2]["result"]["content"][0]["text"]),
+    check("mcp: HTTP 404 reported as such, not 'not reachable'",
+          "HTTP 404" in by[3]["result"]["content"][0]["text"] and "not found" in by[3]["result"]["content"][0]["text"]
+          and "not reachable" not in by[3]["result"]["content"][0]["text"]),
+    check("mcp: ping still answered after bad requests", by[4]["result"] == {}),
+]
+
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sub_dir = Path(d) / "sess" / "subagents"
+    write_transcript(sub_dir / "agent-un.jsonl", [amsg("u1", "claude-haiku-5-5", inp=100, out=20)])
+    (sub_dir / "agent-un.meta.json").write_text(json.dumps({"agentType": "x", "toolUseId": "toolu_un"}))
+    on = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+
+    def hook2(event, payload):
+        r = subprocess.run([sys.executable, "-I", str(HOOK), event, str(ROOT)], input=json.dumps(payload),
+                           capture_output=True, text=True, env={**os.environ, **on})
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    pt_unfinished = hook2("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_un", "transcript_path": str(sess)})
+    stop = hook2("subagentstop", {"agent_id": "un", "transcript_path": str(sess)})
+    meta = json.loads((sub_dir / "agent-un.meta.json").read_text())
+    (sub_dir / "agent-un.meta.json").write_text(json.dumps({**meta, "finished": True}))
+    pt_after = hook2("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_un", "transcript_path": str(sess)})
+    results += [
+        check("stamp: unknown shape, unfinished -> not stamped at PostToolUse", pt_unfinished is None),
+        check("stamp: unknown shape -> stamped once at SubagentStop", stop and "ran on claude-haiku-5-5" in stop["systemMessage"]),
+        check("stamp: later PostToolUse gives Claude the stamp without repeating it to the user",
+              pt_after and "additionalContext" in pt_after["hookSpecificOutput"] and "systemMessage" not in pt_after),
+        check("stamp: missing meta never crashes PostToolUse",
+              hook2("posttool", {"tool_name": "Agent", "tool_use_id": "nope", "transcript_path": str(sess)}) is None),
     ]
 
 print(f"\n{sum(results)}/{len(results)} passed")

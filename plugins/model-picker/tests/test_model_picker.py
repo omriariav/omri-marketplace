@@ -842,6 +842,12 @@ with tempfile.TemporaryDirectory() as d:
         blocked = ledger.take_stamps(on, "S")
     finally:
         os.chmod(qdir, 0o700)
+    capst = fresh_state()
+    for i in range(700):
+        ledger.queue_stamp(capst, f"Z{i}", "a", "t")
+    results.append(check("queue capped at QUEUE_MAX_RECORDS", len(ledger._queue_read(capst)) <= ledger.QUEUE_MAX_RECORDS))
+    ledger.take_stamps(capst, "Z699")
+    results.append(check("queue drops delivered records", all(r.get("session") != "Z699" for r in ledger._queue_read(capst))))
     results.append(check("queue write failure: nothing delivered, stamp kept for later",
                          blocked == [] and ledger.take_stamps(on, "S") == ["[model-picker] v ran on u"]))
     results.append(check("prompt hook errors are silent", subprocess.run(
@@ -877,6 +883,17 @@ results += [
     check("local veto: code/git work in the prompt is never local",
           mp.guard_local(lv, {"description": "Label vendor-dependent keys pending",
                               "prompt": "Edit SKILL.md and the config, then open a PR with git"}, {})["tier"] != "local"),
+    check("local kept: pasted email text",
+          mp.guard_local(lv, {"description": "Summarize this email", "prompt": "Summarize this email in 3 bullets:\n\nHi team, see the link and page 3.5 e.g. and/or notes"}, {})["tier"] == "local"),
+    check("local kept: translation with e.g.", mp.guard_local(lv, {"description": "Translate",
+          "prompt": "Translate to French: hello, e.g. world"}, {})["tier"] == "local"),
+    check("local veto: code path in instructions",
+          mp.guard_local(lv, {"description": "Tidy", "prompt": "Update hooks/model_picker.py to rename x"}, {})["tier"] != "local"),
+    check("local veto: tool verb only counts in the instruction head",
+          mp.guard_local(lv, {"description": "Summarize text", "prompt": "Summarize this:\n" + "x " * 300 + " then git push"}, {})["tier"] == "local"),
+    check("local veto: metadata reset (no stale router source/confidence)",
+          (lambda r: r["source"].startswith("heuristic (local vetoed") and r["confidence"] is None and r["effort"] == "medium")(
+              mp.guard_local(lv, {"description": "Edit the config", "prompt": "edit config.yaml and commit"}, {}))),
     check("local veto: unsure local call falls back",
           mp.guard_local({**lv, "confidence": 0.60}, {"description": "Label keys", "prompt": "label these"}, {})["tier"] != "local"),
     check("local kept: confident, pasted-text-only task",

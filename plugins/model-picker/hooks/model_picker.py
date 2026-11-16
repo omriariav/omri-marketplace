@@ -333,25 +333,40 @@ def fit_to_available(rec, cfg):
 
 
 LOCAL_MIN_CONFIDENCE = 0.75  # a wrong "local" call costs the most: the local model can't use tools at all
+# Tool-use intent in the *instructions* (not in pasted content): verbs that need files, git, a shell or the web,
+# and code-file paths. Ordinary words like "email", "page" or "link" don't count: they appear in text to summarize.
+AGENT_ACTION_RE = re.compile(
+    r"\b(edit|modify|commit|push|merge|rebase|open (a |the )?(pr|pull request)|pull request|git|"
+    r"run (the )?(tests?|command|script|suite)|grep|search (the |this )?(repo|codebase|files?|directory)|"
+    r"(read|open|load|scan) (the |this |each )?(file|files|repo|directory|folder)|"
+    r"create (a |the )?(file|branch|pr|directory)|apply (the |a )?(patch|fix|change)|patch|refactor|implement|"
+    r"install|deploy|browse|fetch (the |this )?(url|page|site)|navigate to)\b"
+    r"|(^|[\s(`'\"])[\w./-]+\.(py|ts|tsx|js|jsx|md|json|ya?ml|sh|go|rb|java|toml|sql|txt|csv|ipynb)\b",
+    re.I)
+INSTRUCTION_CHARS = 400  # instructions come first; anything after is usually the material to work on
 
 
 def guard_local(rec, inp, cfg):
     """Never send tool or code work to the local model.
 
     The router only sees a one-line description, so it can read "label the keys" as text work. The full
-    prompt stays on this machine; if it (or the description) mentions files, code, git, PRs, editing or
-    tools, or the router's local call was not confident, fall back to the best non-local tier.
+    prompt stays on this machine. Its instruction part (description + first INSTRUCTION_CHARS of the
+    prompt) is checked for tool-use verbs and code-file paths; pasted material after that is ignored.
+    A local call below LOCAL_MIN_CONFIDENCE is also not trusted.
     """
     if rec.get("tier") != "local":
         return rec
-    text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name")).lower()
-    needs_tools = bool(TOOL_RE.search(text) or EDIT_RE.search(text))
+    head = f"{inp.get('description') or inp.get('name') or ''} {str(inp.get('prompt') or '')[:INSTRUCTION_CHARS]}"
+    needs_tools = bool(AGENT_ACTION_RE.search(head))
     unsure = isinstance(rec.get("confidence"), (int, float)) and rec["confidence"] < LOCAL_MIN_CONFIDENCE
     if not (needs_tools or unsure):
         return rec
-    tier, why = recommend(text, str(inp.get("subagent_type") or ""), local=False)
-    note = "the task needs tools or files" if needs_tools else f"local confidence {rec['confidence']:.2f} too low"
-    return {**rec, "tier": tier, "reason": f"{why} (not local: {note})", "local_vetoed": True}
+    tier, why = recommend(head.lower(), str(inp.get("subagent_type") or ""), local=False)
+    note = "the instructions need tools or files" if needs_tools else f"local confidence {rec['confidence']:.2f} too low"
+    # The router chose local, not this tier: don't keep its effort, confidence or source on a tier it never picked.
+    return {**rec, "tier": tier, "effort": "medium", "reason": f"{why} (not local: {note})",
+            "source": f"heuristic (local vetoed: {note})", "confidence": None,
+            "unsure": why == UNSURE_REASON, "local_vetoed": True}
 
 
 def decide(inp, cfg, use_router=True):

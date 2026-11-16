@@ -121,6 +121,8 @@ def read(cfg, since=0.0, tail_bytes=None):
 # Kept apart from log.jsonl so the per-prompt hook reads a tiny file in full (no tail window, no
 # rotation edge) and so delivery bookkeeping can fail loudly instead of being swallowed.
 QUEUE_MAX_AGE = 86400
+QUEUE_MAX_RECORDS = 500
+QUEUE_LOCK_WAIT = 1.0  # seconds; a stuck holder must never stall every prompt
 
 
 def _queue_path(cfg):
@@ -131,8 +133,16 @@ def _queue_lock(cfg):
     d = state_dir(cfg)
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(d / ".queue.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    return fd
+    deadline = time.monotonic() + QUEUE_LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() > deadline:
+                os.close(fd)
+                raise OSError("stamp queue busy")
+            time.sleep(0.02)
 
 
 def _queue_read(cfg):
@@ -154,11 +164,20 @@ def _queue_read(cfg):
 def _queue_write(cfg, records):
     """Atomic rewrite; raises on failure (callers must not deliver if bookkeeping failed)."""
     path = _queue_path(cfg)
+    # Delivered stamps are done: keep only undelivered ones, newest QUEUE_MAX_RECORDS.
+    records = [r for r in records if not r.get("delivered")][-QUEUE_MAX_RECORDS:]
     tmp = path.with_name(f".pending-stamps.{os.getpid()}.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in records)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in records)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def queue_stamp(cfg, session, agent_id, text):

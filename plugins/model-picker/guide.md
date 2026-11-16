@@ -8,6 +8,7 @@ Pick the starting model by task:
 - sonnet (Sonnet 5.5): well-scoped coding (bug fix, feature iteration, spec-driven), repeated agent tasks (investigation, review, drafting), docs/slides/spreadsheets, interactive chat.
 - opus (Opus 5.5): everyday engineering and debugging, multi-PR features, migrations and performance work even with a clear spec, computer use / vision loops, complex financial or large-source documents. Default when unsure.
 - fable (Fable 5.2): major refactors and migrations, architecture planning, leading many subagents, long unattended runs, deep research, scientific or quantitative analysis, or when opus at high effort still falls short.
+When a task fits more than one row, pick the row for its hardest part: slides rendered and checked by eye are a vision loop (opus), not just slides (sonnet). Going stronger than the table for a concrete reason, or because the user set a rule, is fine; say why.
 
 Rules:
 1. Always pass an explicit `model` when launching an Agent, teammate, or workflow agent(). Never rely on inheriting the session model for side work.

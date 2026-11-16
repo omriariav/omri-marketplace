@@ -6,6 +6,8 @@ Stdlib only (urllib), so the hook keeps zero dependencies.
 """
 
 import json
+import os
+import signal
 import subprocess
 import urllib.request
 
@@ -106,14 +108,32 @@ def google_decisions(task, tiers, cfg):
                    f"google-decisions:{model}")
 
 
+def run_shell(cmd, timeout, stdin=None):
+    """Run a shell command with a hard timeout that also kills its children (`a; b`, pipes), so a slow
+    command never outlives the hook. Returns stdout; raises on timeout or a non-zero exit."""
+    with subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          text=True, start_new_session=True) as proc:
+        try:
+            out, _ = proc.communicate(stdin, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, AttributeError):  # AttributeError: no process groups (Windows)
+                proc.kill()
+            proc.wait()
+            raise
+    if proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    return out
+
+
 def command(task, tiers, cfg):
     """Any executable: JSON {task, tiers, efforts} on stdin -> JSON {tier, effort, confidence} on stdout.
     Use it for providers without a built-in adapter, or to keep private gateway logic out of the plugin."""
     cmd = cfg.get("MODEL_PICKER_ROUTER_CMD")
     if not cmd:
         raise ValueError("MODEL_PICKER_ROUTER_CMD is not set")
-    out = subprocess.run(cmd, shell=True, input=json.dumps({"task": task, "tiers": tiers, "efforts": EFFORTS}),
-                         capture_output=True, text=True, timeout=cfg["_timeout"], check=True).stdout
+    out = run_shell(cmd, cfg["_timeout"], json.dumps({"task": task, "tiers": tiers, "efforts": EFFORTS}))
     data = json.loads(out)
     if data.get("tier") not in tiers:
         raise ValueError(f"command returned tier {data.get('tier')!r}")

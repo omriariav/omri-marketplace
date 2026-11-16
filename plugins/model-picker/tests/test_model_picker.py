@@ -97,7 +97,7 @@ results += [
     check("local: needs files -> not local", mp.recommend("summarize the log files", local=True)[0] == "haiku"),
     check("local: disabled -> haiku", mp.recommend("summarize this paragraph")[0] == "haiku"),
     check("local: hint in deny reason",
-          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify this ticket text"),
+          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify the sentiment of this sentence"),
                                                  "enforce", LOCAL))),
 ]
 
@@ -133,6 +133,9 @@ class Mock(BaseHTTPRequestHandler):
         if self.path == "/v1/decisions":
             out = {"answers": [{"type": "choice", "name": "tier", "choice": "fable", "confidence": conf},
                                {"type": "choice", "name": "effort", "choice": "high", "confidence": 0.8}]}
+        elif self.path == "/api/chat":
+            out = {"message": {"role": "assistant", "content": "Negative"}, "prompt_eval_count": 61,
+                   "eval_count": 2, "done_reason": "stop"}
         elif self.path == "/v1beta/decisions":
             out = {"answers": {"tier": {"type": "choice", "choice": "sonnet", "confidence": conf},
                                "effort": {"type": "choice", "choice": "low", "confidence": 0.7}}}
@@ -147,6 +150,15 @@ class Mock(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _get(self):
+    data = json.dumps({"models": [{"name": "qwen2.5:7b-instruct"}, {"name": "llama3.2-vision:latest"}]}).encode()
+    self.send_response(200)
+    self.send_header("Content-Type", "application/json")
+    self.end_headers()
+    self.wfile.write(data)
+
+
+Mock.do_GET = _get
 srv = HTTPServer(("127.0.0.1", 0), Mock)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 URL = f"http://127.0.0.1:{srv.server_port}"
@@ -206,8 +218,6 @@ results.append(check("router hard deadline -> heuristic, fast",
 SEEN.clear()
 run(agent(description="d", prompt="p"), "advise", {**OA, "OPENAI_API_KEY": "", "MODEL_PICKER_ROUTER_API_KEY_ENV": "none"})
 results.append(check("keyless gateway: no auth header", SEEN and "authorization" not in SEEN[-1]["headers"]))
-srv.shutdown()
-
 # --- v0.3 ledger: decisions, usage, pricing, report ------------------------------
 import ledger  # noqa: E402
 
@@ -391,6 +401,179 @@ with tempfile.TemporaryDirectory() as d:
     u = [r for r in ledger.read(st3) if r.get("kind") == "usage"][-1]
     results.append(check("subagentstop: launch-time session model + attribution",
                          u.get("session_model") == "claude-opus-5-5" and u.get("attribution") == "model-picker"))
+
+# --- v0.4: local tier via the bundled MCP server ----------------------------------
+SERVER = ROOT / "mcp" / "local_server.py"
+
+
+def mcp(lines, env):
+    proc = subprocess.run([sys.executable, "-I", str(SERVER)], input="\n".join(json.dumps(x) for x in lines) + "\n",
+                          capture_output=True, text=True, env={**os.environ, **env}, timeout=30)
+    return [json.loads(x) for x in proc.stdout.splitlines() if x.strip()]
+
+
+OL = {"MODEL_PICKER_OLLAMA_URL": URL, "MODEL_PICKER_OLLAMA_MODEL": "qwen2.5:7b-instruct"}
+st = fresh_state()
+out = mcp([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+           {"jsonrpc": "2.0", "method": "notifications/initialized"},
+           {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+           {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "ask_local", "arguments": {"prompt": "SECRET-TEXT classify"}}},
+           {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "list_local_models"}},
+           {"jsonrpc": "2.0", "id": 5, "method": "nope"}], {**OL, **st})
+by = {r.get("id"): r for r in out}
+ans = by[3]["result"]["content"][0]["text"] if 3 in by else ""
+results += [
+    check("mcp: initialize + no reply to notification", by[1]["result"]["serverInfo"]["name"] == "model-picker-local"
+          and len(out) == 5),
+    check("mcp: tools listed", [t["name"] for t in by[2]["result"]["tools"]] == ["ask_local", "list_local_models"]),
+    check("mcp: ask_local answer is stamped",
+          ans.startswith("Negative") and "[model-picker] answered by ollama:qwen2.5:7b-instruct" in ans),
+    check("mcp: configured model marked", "(configured)" in by[4]["result"]["content"][0]["text"]),
+    check("mcp: unknown method error", by[5]["error"]["code"] == -32601),
+]
+loc = [r for r in ledger.read(st) if r.get("kind") == "local"]
+results += [
+    check("mcp: call logged without text", len(loc) == 1 and loc[0]["input"] == 61
+          and "SECRET-TEXT" not in Path(st["MODEL_PICKER_STATE_DIR"], "log.jsonl").read_text()
+          and "Negative" not in Path(st["MODEL_PICKER_STATE_DIR"], "log.jsonl").read_text()),
+    check("report: local calls section", "Local model (ask_local): 1 call(s)" in ledger.format_report(ledger.report(st, "all"))),
+]
+nomodel = mcp([{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "ask_local", "arguments": {"prompt": "x"}}}],
+              {"MODEL_PICKER_OLLAMA_URL": URL, **fresh_state()})
+results.append(check("mcp: unconfigured model -> helpful error listing installed models",
+                     nomodel[0]["result"]["isError"] and "qwen2.5:7b-instruct" in nomodel[0]["result"]["content"][0]["text"]))
+down = mcp([{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "ask_local", "arguments": {"prompt": "x"}}}],
+           {**OL, "MODEL_PICKER_OLLAMA_URL": "http://127.0.0.1:9", **fresh_state()})
+results.append(check("mcp: Ollama down -> isError, not a crash",
+                     down[0]["result"]["isError"] and "not reachable" in down[0]["result"]["content"][0]["text"]))
+off = mcp([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}], {**OL, "MODEL_PICKER_OLLAMA": "0"})
+results.append(check("mcp: MODEL_PICKER_OLLAMA=0 hides tools", off[0]["result"]["tools"] == []))
+results.append(check("local tier on via OLLAMA_MODEL", mp.local_hint(OL) and "ask_local" in mp.local_hint(OL)
+                     and mp.decide({"description": "summarize this paragraph", "prompt": "summarize this paragraph"},
+                                   OL)["tier"] == "local"))
+srv.shutdown()
+
+# --- v0.4: model stamps -------------------------------------------------------------
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sub_dir = Path(d) / "sess" / "subagents"
+    for aid, shape, tid in (("fg", "foreground", "toolu_fg"), ("bg", "background", "toolu_bg")):
+        write_transcript(sub_dir / f"agent-{aid}.jsonl", [amsg(f"{aid}1", "claude-haiku-5-5", inp=1000, out=200)])
+        (sub_dir / f"agent-{aid}.meta.json").write_text(json.dumps(
+            {"agentType": "model-picker:scout", "toolUseId": tid, "requestShape": shape}))
+    on = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+
+    def hook(event, payload, env):
+        r = subprocess.run([sys.executable, "-I", str(HOOK), event, str(ROOT)], input=json.dumps(payload),
+                           capture_output=True, text=True, env={**os.environ, **env})
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    fg = hook("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_fg", "transcript_path": str(sess)}, on)
+    results += [
+        check("stamp: foreground result stamped for Claude and user",
+              fg and "ran on claude-haiku-5-5" in fg["hookSpecificOutput"]["additionalContext"]
+              and fg["systemMessage"] == fg["hookSpecificOutput"]["additionalContext"] and "on opus" in fg["systemMessage"]),
+        check("stamp: background skipped at PostToolUse",
+              hook("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_bg", "transcript_path": str(sess)}, on) is None),
+        check("stamp: off by default",
+              hook("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_fg", "transcript_path": str(sess)},
+                   fresh_state()) is None),
+    ]
+    bg = hook("subagentstop", {"agent_id": "bg", "transcript_path": str(sess)}, on)
+    fgstop = hook("subagentstop", {"agent_id": "fg", "transcript_path": str(sess)}, on)
+    results += [
+        check("stamp: background stamped at SubagentStop", bg and "ran on claude-haiku-5-5" in bg["systemMessage"]),
+        check("stamp: foreground not double-stamped at SubagentStop", fgstop is None),
+    ]
+    ctx = hook("session", {}, {"MODEL_PICKER_STAMP": "1", "MODEL_PICKER_STAMP_REPLIES": "1", **OL})
+    c = ctx["hookSpecificOutput"]["additionalContext"] if ctx else ""
+    results += [
+        check("session: stamp rule injected", "Model stamps are on" in c),
+        check("session: reply tag rule injected", "End every reply with one line naming the model" in c),
+        check("session: local tier rule injected", "ask_local" in c and "Local tier enabled" in c),
+        check("session: rules off by default", "Model stamps" not in
+              (hook("session", {}, {})["hookSpecificOutput"]["additionalContext"])),
+    ]
+
+# --- v0.4 review regressions --------------------------------------------------------
+results += [
+    check("local veto: file name", mp.recommend("summarize README.md", local=True)[0] != "local"),
+    check("local veto: URL", mp.recommend("summarize the PR https://github.com/x/y/pull/1", local=True)[0] != "local"),
+    check("local veto: path", mp.recommend("summarize src/app notes", local=True)[0] != "local"),
+    check("local veto: doc/ticket words", mp.recommend("summarize the design doc", local=True)[0] != "local"),
+    check("local still ok for pasted text", mp.recommend("translate this sentence into Hebrew", local=True)[0] == "local"),
+]
+
+err_srv = HTTPServer(("127.0.0.1", 0), type("E", (BaseHTTPRequestHandler,), {
+    "log_message": lambda self, *a: None,
+    "do_POST": lambda self: (self.rfile.read(int(self.headers["Content-Length"])), self.send_response(404),
+                             self.send_header("Content-Type", "application/json"), self.end_headers(),
+                             self.wfile.write(b'{"error":"model \'nope\' not found"}'))}))
+threading.Thread(target=err_srv.serve_forever, daemon=True).start()
+bad = mcp([{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": [1]},
+           {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ask_local", "arguments": "oops"}},
+           {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "ask_local", "arguments": {"prompt": "x", "max_tokens": -5}}},
+           {"jsonrpc": "2.0", "id": 4, "method": "ping"}],
+          {"MODEL_PICKER_OLLAMA_URL": f"http://127.0.0.1:{err_srv.server_port}",
+           "MODEL_PICKER_OLLAMA_MODEL": "nope", **fresh_state()})
+by = {r.get("id"): r for r in bad}
+err_srv.shutdown()
+results += [
+    check("mcp: non-object params -> -32602, server survives", by[1]["error"]["code"] == -32602 and 4 in by),
+    check("mcp: non-object arguments -> isError", by[2]["result"]["isError"] and "must be an object" in
+          by[2]["result"]["content"][0]["text"]),
+    check("mcp: HTTP 404 reported as such, not 'not reachable'",
+          "HTTP 404" in by[3]["result"]["content"][0]["text"] and "not found" in by[3]["result"]["content"][0]["text"]
+          and "not reachable" not in by[3]["result"]["content"][0]["text"]),
+    check("mcp: ping still answered after bad requests", by[4]["result"] == {}),
+]
+
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sub_dir = Path(d) / "sess" / "subagents"
+    write_transcript(sub_dir / "agent-un.jsonl", [amsg("u1", "claude-haiku-5-5", inp=100, out=20)])
+    (sub_dir / "agent-un.meta.json").write_text(json.dumps({"agentType": "x", "toolUseId": "toolu_un"}))
+    on = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+
+    def hook2(event, payload):
+        r = subprocess.run([sys.executable, "-I", str(HOOK), event, str(ROOT)], input=json.dumps(payload),
+                           capture_output=True, text=True, env={**os.environ, **on})
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    pt_unfinished = hook2("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_un", "transcript_path": str(sess)})
+    stop = hook2("subagentstop", {"agent_id": "un", "transcript_path": str(sess)})
+    meta = json.loads((sub_dir / "agent-un.meta.json").read_text())
+    (sub_dir / "agent-un.meta.json").write_text(json.dumps({**meta, "finished": True}))
+    pt_after = hook2("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_un", "transcript_path": str(sess)})
+    results += [
+        check("stamp: unknown shape, unfinished -> not stamped at PostToolUse", pt_unfinished is None),
+        check("stamp: unknown shape -> stamped once at SubagentStop", stop and "ran on claude-haiku-5-5" in stop["systemMessage"]),
+        check("stamp: later PostToolUse gives Claude the stamp without repeating it to the user",
+              pt_after and "additionalContext" in pt_after["hookSpecificOutput"] and "systemMessage" not in pt_after),
+        check("stamp: missing meta never crashes PostToolUse",
+              hook2("posttool", {"tool_name": "Agent", "tool_use_id": "nope", "transcript_path": str(sess)}) is None),
+    ]
+
+# --- real-session finding: fallback guesses must not judge explicit choices ----------
+results += [
+    check("read verbs -> haiku", mp.recommend("report the first line of README.md")[0] == "haiku"),
+    check("no signal -> opus but flagged unsure", mp.recommend("think about this")[1] == mp.UNSURE_REASON),
+]
+st = fresh_state()
+note = run({"session_id": "s", "tool_use_id": "u1", "cwd": "/nonexistent", "tool_name": "Agent",
+            "tool_input": {"description": "Ponder", "prompt": "think about this", "model": "haiku"}}, "advise", st)
+d = [r for r in ledger.read(st) if r.get("kind") == "decision"][-1]
+results += [
+    check("unsure: no upward mismatch note on an explicit haiku launch", note is None),
+    check("unsure: followed left unknown", d.get("followed") is None and d.get("unsure") is True),
+    check("unsure: attribution 'unjudged', not 'explicit'", ledger.attribute(d) == "unjudged"),
+    check("unsure: excluded from follow-rate denominator", ledger.report(st, "all")["compared"] == 0),
+]
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

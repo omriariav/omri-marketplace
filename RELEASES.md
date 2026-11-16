@@ -1,5 +1,19 @@
 # Releases
 
+## model-picker v0.4.0 (2026-11-16)
+
+Model stamps and a bundled local-model tool.
+
+- `MODEL_PICKER_STAMP=1`: each subagent result is stamped with the model that actually answered, read from its transcript (not self-reported), plus tokens and cost, e.g. `[model-picker] web-fetch ran on claude-haiku-5-5 · 13K tokens · ~$0.001 (~$0.055 on opus)`. Foreground agents are stamped when the `Agent` call returns (new PostToolUse hook, visible to you and to Claude); background agents when they finish. Never twice.
+- `MODEL_PICKER_STAMP_REPLIES=1` (opt-in) asks Claude to end every reply with its model id.
+- New bundled MCP server with `ask_local` and `list_local_models`, backed by Ollama (stdlib only). Setting `MODEL_PICKER_OLLAMA_MODEL` turns on the `local` tier, so tool-free text work goes to a $0 local model instead of a subagent. Answers carry a stamp; calls are logged (no prompt or answer text) and reported with their Haiku-price equivalent.
+- Clear errors when no model is configured (lists installed models) or Ollama is down; `MODEL_PICKER_OLLAMA=0` hides the tools.
+- The local tier is never recommended for work that names a file, path, URL, PR, ticket, doc or page: `ask_local` only sees text pasted into its prompt.
+- Robust MCP server: malformed requests get JSON-RPC errors instead of killing it, and Ollama HTTP errors (e.g. a model not pulled) are reported as such, not as "not reachable".
+- When the recommendation is only the "opus when unsure" fallback, it no longer judges an explicit model: no upward nudge, no "not followed", and the saving is listed as unjudged rather than credited or blamed. Plain reading verbs (read, first line, look up, check whether) now count as Haiku work.
+- Verified in real headless Claude Code sessions: `ask_local` registers as `mcp__plugin_model-picker_local__ask_local`, and a foreground Agent launch produced the decision, usage, and stamp records, with Claude naming the stamped model.
+- Tests: 124 (from 85), including a JSON-RPC session against a mock Ollama, malformed requests, HTTP 404s, stamp placement for foreground, background and unknown-shape agents, and session-rule injection.
+
 ## model-picker v0.3.0 (2026-11-16)
 
 Visibility: what model-picker decided, which models ran, and what that saved.

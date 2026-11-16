@@ -1,7 +1,7 @@
 {
   "name": "model-picker",
-  "version": "0.3.0",
-  "description": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort rules at session start, checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model, and can delegate the choice to a decisions API (OpenAI, Google, any LiteLLM gateway, or a custom command) with an optional local-model tier, and keeps a local ledger of decisions, subagent token usage, cost, and estimated savings with a /model-picker:report view.",
+  "version": "0.4.0",
+  "description": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort rules at session start, checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model, and can delegate the choice to a decisions API (OpenAI, Google, any LiteLLM gateway, or a custom command) with an optional local-model tier, and keeps a local ledger of decisions, subagent token usage, cost, and estimated savings with a /model-picker:report view. Stamps subagent results with the model that actually ran, and ships an Ollama MCP tool (ask_local) for a $0 local tier.",
   "author": {
     "name": "Omri Ariav",
     "email": "omri.ariav@gmail.com"
@@ -21,14 +21,16 @@
     "fable"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Model Picker",
     "shortDescription": "Pick the right Claude model and effort for each task and agent.",
-    "longDescription": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort rules at session start, checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model, and can delegate the choice to a decisions API (OpenAI, Google, any LiteLLM gateway, or a custom command) with an optional local-model tier, and keeps a local ledger of decisions, subagent token usage, cost, and estimated savings with a /model-picker:report view.",
+    "longDescription": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort rules at session start, checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model, and can delegate the choice to a decisions API (OpenAI, Google, any LiteLLM gateway, or a custom command) with an optional local-model tier, and keeps a local ledger of decisions, subagent token usage, cost, and estimated savings with a /model-picker:report view. Stamps subagent results with the model that actually ran, and ships an Ollama MCP tool (ask_local) for a $0 local tier.",
     "developerName": "Omri Ariav",
     "category": "Utilities",
     "capabilities": [
-      "Skills"
+      "Skills",
+      "MCP Servers"
     ],
     "websiteURL": "https://github.com/omriariav/omri-marketplace/tree/main/plugins/model-picker",
     "defaultPrompt": [

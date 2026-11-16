@@ -356,7 +356,7 @@ def _floors(cfg):
     """[(compiled pattern, label, tier)] from MODEL_PICKER_FLOORS; bad entries are skipped."""
     try:
         raw = _json_obj(cfg.get("MODEL_PICKER_FLOORS"))
-    except ValueError:
+    except (ValueError, TypeError):
         return []
     out = []
     for pat, tier in (raw.items() if isinstance(raw, dict) else []):
@@ -376,19 +376,22 @@ def _floors(cfg):
 def apply_floors(rec, inp, cfg):
     """Raise the recommendation to the user's own minimum tier for matching tasks (MODEL_PICKER_FLOORS).
     A floor is the user's explicit rule, so the result counts as a confident recommendation."""
-    text = f"{inp.get('description') or inp.get('name') or ''} {inp.get('subagent_type') or ''}"
+    # Bounded input: patterns are the user's own regexes and run as written.
+    text = f"{inp.get('description') or inp.get('name') or ''} {inp.get('subagent_type') or ''}"[:300]
     best = None
     for rx, label, tier in _floors(cfg):
         if rx.search(text) and (best is None or CLAUDE_TIERS.index(tier) > CLAUDE_TIERS.index(best[1])):
             best = (label, tier)
-    if not best or (rec["tier"] in CLAUDE_TIERS and CLAUDE_TIERS.index(rec["tier"]) >= CLAUDE_TIERS.index(best[1])):
+    if not best:
         return rec
     label, tier = best
+    if rec["tier"] in CLAUDE_TIERS and CLAUDE_TIERS.index(rec["tier"]) >= CLAUDE_TIERS.index(tier):
+        return rec  # already at or above the user's minimum: a floor never lowers
     return {**rec, "tier": tier, "reason": f"your rule: \"{label}\" tasks get at least {tier} (MODEL_PICKER_FLOORS)",
             "source": f"{rec['source']} + floor", "unsure": False, "floor": label, "floored_from": rec["tier"]}
 
 
-def decide(inp, cfg, use_router=True, for_launch=False, deadline=None):
+def decide(inp, cfg, use_router=True, for_launch=False):
     """Recommendation dict: tier, effort, reason, source, limited to the available tiers.
 
     for_launch: the call is an Agent/teammate launch that is already happening. `local` (call ask_local
@@ -396,11 +399,11 @@ def decide(inp, cfg, use_router=True, for_launch=False, deadline=None):
     tool work to a model that has no tools; so launches only ever get Claude tiers. The local tier is
     offered where the choice is still open: the session rules and the /model-picker skill.
     """
-    rec = _decide(inp, cfg, use_router, allow_local=not for_launch, deadline=deadline)
+    rec = _decide(inp, cfg, use_router, allow_local=not for_launch)
     return fit_to_available(apply_floors(guard_local(rec, inp, cfg), inp, cfg), cfg)
 
 
-def _decide(inp, cfg, use_router=True, allow_local=True, deadline=None):
+def _decide(inp, cfg, use_router=True, allow_local=True):
     """Router first (if configured), heuristic fallback; may name a tier that is not available."""
     local = allow_local and local_enabled(cfg)
     agent_type = str(inp.get("subagent_type") or "")
@@ -416,7 +419,7 @@ def _decide(inp, cfg, use_router=True, allow_local=True, deadline=None):
     worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, local)), daemon=True)
     started = time.monotonic()
     worker.start()
-    worker.join(deadline or ROUTER_DEADLINE)
+    worker.join(ROUTER_DEADLINE)
     fallback["router_ms"] = int((time.monotonic() - started) * 1000)
     res = box.get("res")
     if res is None:
@@ -480,7 +483,7 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
     if rec:
         entry.update({"rec_tier": rec["tier"], "rec_effort": rec["effort"], "source": rec["source"],
                       "confidence": rec.get("confidence"), "router_ms": rec.get("router_ms"),
-                      "unsure": bool(rec.get("unsure")),
+                      "unsure": bool(rec.get("unsure")), "floor": rec.get("floor"),
                       # A fallback guess can't judge an explicit choice: leave "followed" unknown.
                       "followed": None if (not chosen_tier or rec.get("unsure")) else
                       (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))})
@@ -651,9 +654,12 @@ def prompt_route(payload, cfg):
     prompt = str(payload.get("prompt") or "").strip()
     if not router or not prompt or prompt[0] in "/<!" or len(prompt.split()) < 3:
         return None
-    inp = {"description": _short(prompt, 200), "prompt": prompt, "subagent_type": "main-session"}
+    # Only the first 200 characters, whatever MODEL_PICKER_ROUTER_INPUT says (that setting is for launches).
+    inp = {"description": _short(prompt, 200), "subagent_type": "main-session"}
+    # Router subprocesses (command router, key command) must finish inside the deadline, not be orphaned.
+    rcfg = {**cfg, "MODEL_PICKER_ROUTER_TIMEOUT": min(_num(cfg, "MODEL_PICKER_ROUTER_TIMEOUT", 3), PROMPT_ROUTE_DEADLINE - 0.5)}
     box = {}
-    worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, False)), daemon=True)
+    worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, rcfg, False)), daemon=True)
     started = time.monotonic()
     worker.start()
     worker.join(PROMPT_ROUTE_DEADLINE)

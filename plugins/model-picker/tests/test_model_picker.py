@@ -1052,6 +1052,23 @@ results += [
     check("prompt route: shows the router's raw pick, not floors",
           "→ sonnet" in (prompt_hook("review PR 55 for bugs please", {**ON, **FL, **FAKE_ROUTER("sonnet", 0.4)}) or {}).get("systemMessage", "")),
 ]
+capture = Path(pst["MODEL_PICKER_STATE_DIR"]) / "router-saw.json"
+spy = Path(pst["MODEL_PICKER_STATE_DIR"]) / "spy.py"
+spy.write_text("import sys, json\nopen(%r, 'w').write(sys.stdin.read())\nprint(json.dumps({'tier': 'haiku', 'effort': 'low', 'confidence': 0.9}))\n" % str(capture))
+prompt_hook("please look at this: " + "word " * 600 + "TAIL-MARKER", {**ON, "MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_INPUT": "full",
+                                                                  "MODEL_PICKER_ROUTER_CMD": f"{sys.executable} {spy}"})
+saw = capture.read_text() if capture.exists() else ""
+results.append(check("prompt route: only the 200-char head leaves the machine, even with ROUTER_INPUT=full",
+                     bool(saw) and "TAIL-MARKER" not in saw and len(json.loads(saw)["task"]) < 300))
+results += [
+    check("floor: a list/number in the config is ignored, not a hook error",
+          mp.decide({"description": "Review PR", "prompt": "p"}, {"MODEL_PICKER_FLOORS": [{"review": "opus"}]})["tier"] == "sonnet"
+          and mp.decide({"description": "Review PR", "prompt": "p"}, {"MODEL_PICKER_FLOORS": 5})["tier"] == "sonnet"),
+    check("floor: savings on floored launches go to the user's rule, not model-picker",
+          ledger.attribute({"outcome": "explicit", "followed": True, "floor": "review", "chosen_tier": "opus"}) == "rule"
+          and ledger.attribute({"outcome": "explicit", "followed": True, "chosen_tier": "haiku"}) == "model-picker"),
+    check("floor: the decision record keeps which rule applied", dec.get("floor") == "review"),
+]
 plog = [r for r in ledger.read(pst) if r.get("kind") == "prompt"]
 prep = ledger.report(pst, "all")
 results += [

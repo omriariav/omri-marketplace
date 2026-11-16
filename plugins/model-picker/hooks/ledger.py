@@ -380,6 +380,7 @@ def attribute(decision):
     """Why a subagent ran on its model, for crediting savings honestly.
 
     model-picker  explicit model that matched the recommendation, not already set by the agent definition
+    rule          matched a recommendation that the user's own MODEL_PICKER_FLOORS rule raised
     definition    the agent's own definition set that model (saving would have happened anyway)
     explicit      explicit model that differed from the recommendation
     unjudged      explicit model, but the recommendation was only a fallback guess
@@ -395,7 +396,9 @@ def attribute(decision):
     if outcome == "explicit":
         if decision.get("followed") is None:
             return "unjudged"  # explicit model, but no confident recommendation to compare against
-        return "model-picker" if decision.get("followed") else "explicit"
+        if decision.get("followed"):
+            return "rule" if decision.get("floor") else "model-picker"
+        return "explicit"
     if outcome in ("missing", "denied"):
         return "inherited"
     return "unknown"
@@ -619,6 +622,7 @@ def format_report(r):
                          f"{_tok(row['output'])} | {_tok(row['cache_read'])} | ${row['cost']:.2f} | "
                          f"${row['baseline_cost']:.2f} | ${row['saving']:.2f} |")
         labels = {"model-picker": "followed model-picker's recommendation",
+                  "rule": "followed your own MODEL_PICKER_FLOORS rule",
                   "definition": "model set by the agent's own definition (would have happened anyway)",
                   "explicit": "explicit model that differed from the recommendation",
                   "unjudged": "explicit model with no confident recommendation to compare against",
@@ -630,7 +634,7 @@ def format_report(r):
                   f"({_pct(r['saving'], r['baseline_cost'])}).",
                   f"- **Credited to model-picker: ${r.get('credited_saving', 0):.2f}** "
                   f"({attr.get('model-picker', {}).get('agents', 0)} agent(s) that followed its recommendation)."]
-        for key in ("definition", "explicit", "unjudged", "inherited", "unknown"):
+        for key in ("rule", "definition", "explicit", "unjudged", "inherited", "unknown"):
             if key in attr:
                 lines.append(f"  - Not credited, {labels[key]}: {attr[key]['agents']} agent(s), "
                              f"${attr[key]['saving']:.2f}")
@@ -649,7 +653,7 @@ def format_report(r):
 
 # --- HTML report -------------------------------------------------------------------
 
-_ATTR_LABELS = {"model-picker": "Followed model-picker", "definition": "Agent definition's own model",
+_ATTR_LABELS = {"model-picker": "Followed model-picker", "rule": "Your own rule (floors)", "definition": "Agent definition's own model",
                 "explicit": "Explicit, differed from recommendation", "unjudged": "Explicit, no confident recommendation",
                 "inherited": "Inherited the session model", "unknown": "No launch record"}
 _TIER_ORDER = ("local", "haiku", "sonnet", "opus", "fable")

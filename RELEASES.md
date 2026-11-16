@@ -7,9 +7,11 @@ New plugin: applies Anthropic's [Which Claude model should you build with?](http
 - SessionStart hook injects model/effort rules from `guide.md` (model by task, effort before model, fan-out limits, switch at natural breaks).
 - PreToolUse hook on `Agent`/`Task` flags launches without a `model` and models two or more tiers off the task. Skips `fork` and agents whose definition pins `model`.
 - PreToolUse hook on `Workflow` flags `agent()` calls without a `model`.
-- `MODEL_PICKER_MODE`: `advise` (default), `enforce`, `auto`, `off`. `MODEL_PICKER_INJECT=0` disables injection.
+- `MODEL_PICKER_MODE`: `advise` (default), `enforce`, `off`. `MODEL_PICKER_INJECT=0` disables injection.
 - `/model-picker:model-picker <task>` gives a per-request recommendation; with no argument it loads the rules (Codex/Grok/Cursor fallback).
 - `model-picker:scout`: Haiku read-only agent for search and log reading.
+- Agents whose definition pins `model` are found through `installed_plugins.json`, org-synced plugins, and `$CLAUDE_PROJECT_DIR/.claude/agents`, matched by frontmatter `name`.
+- Regression tests in `plugins/model-picker/tests/`.
 
 ## copy v2.4.1 (2026-11-15)
 

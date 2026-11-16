@@ -334,7 +334,7 @@ Applies Anthropic's [Which Claude model should you build with?](https://claude.d
 | `/model-picker:model-picker` | Load the rules manually (Codex, Grok, Cursor) |
 | `model-picker:scout` agent | Haiku read-only scout for search, logs, and test output |
 
-Set `MODEL_PICKER_MODE` in `settings.json` `env`: `advise` (default, note only), `enforce` (deny launches without a model), `auto` (fill in the recommended model), or `off`. `MODEL_PICKER_INJECT=0` skips the session-start injection. Requires `python3`; hooks exit silently without it.
+Set `MODEL_PICKER_MODE` in `settings.json` `env`: `advise` (default, note only), `enforce` (deny launches without a model), or `off`. `MODEL_PICKER_INJECT=0` skips the session-start injection. Requires `python3`; hooks exit silently without it.
 
 ## Other Commands
 

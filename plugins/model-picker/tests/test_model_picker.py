@@ -1069,6 +1069,16 @@ results += [
           and ledger.attribute({"outcome": "explicit", "followed": True, "chosen_tier": "haiku"}) == "model-picker"),
     check("floor: the decision record keeps which rule applied", dec.get("floor") == "review"),
 ]
+import time as _time
+t0 = _time.monotonic()
+results += [
+    check("floor: agent-type floors still apply to long descriptions",
+          mp.decide({"description": "x " * 400, "prompt": "p", "subagent_type": "docs-writer"},
+                    {"MODEL_PICKER_FLOORS": json.dumps({"docs-writer": "fable"})})["tier"] == "fable"),
+    check("router command: timeout kills the whole process group",
+          _raises(lambda: routers.run_shell("sleep 5; echo late", 0.3)) and _time.monotonic() - t0 < 2
+          and subprocess.run(["pgrep", "-f", "sleep 5; echo late"], capture_output=True).returncode != 0),
+]
 plog = [r for r in ledger.read(pst) if r.get("kind") == "prompt"]
 prep = ledger.report(pst, "all")
 results += [

@@ -45,7 +45,6 @@ Also: model_picker.py report [today|24h|7d|30d|all] [--json] [--html [--out PATH
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -377,7 +376,7 @@ def apply_floors(rec, inp, cfg):
     """Raise the recommendation to the user's own minimum tier for matching tasks (MODEL_PICKER_FLOORS).
     A floor is the user's explicit rule, so the result counts as a confident recommendation."""
     # Bounded input: patterns are the user's own regexes and run as written.
-    text = f"{inp.get('description') or inp.get('name') or ''} {inp.get('subagent_type') or ''}"[:300]
+    text = f"{str(inp.get('description') or inp.get('name') or '')[:300]} {str(inp.get('subagent_type') or '')[:100]}"
     best = None
     for rx, label, tier in _floors(cfg):
         if rx.search(text) and (best is None or CLAUDE_TIERS.index(tier) > CLAUDE_TIERS.index(best[1])):
@@ -448,8 +447,7 @@ def _route(router, name, inp, cfg, local):
         elif name != "command":
             key = os.environ.get(key_env, "")
             if not key and cfg.get("MODEL_PICKER_ROUTER_API_KEY_CMD"):
-                key = subprocess.run(cfg["MODEL_PICKER_ROUTER_API_KEY_CMD"], shell=True, capture_output=True,
-                                     text=True, timeout=min(rcfg["_timeout"], 2), check=True).stdout.strip()
+                key = routers.run_shell(cfg["MODEL_PICKER_ROUTER_API_KEY_CMD"], min(rcfg["_timeout"], 2)).strip()
             if not key:
                 raise ValueError("no API key")
             rcfg["_api_key"] = key

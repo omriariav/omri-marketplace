@@ -43,7 +43,9 @@ Two things about that call matter:
 - **Pass it on stdin with the quoted `'TASK'` delimiter**, never as a shell argument, so quotes, `$`,
   and backticks in the description are not expanded by the shell.
 
-It prints JSON with `tier`, `effort`, `reason`, and `source`. Treat it as a strong prior, not a
+It prints JSON with `tier`, `effort`, `reason`, and `source`. It only ever returns tiers this
+environment can launch (`MODEL_PICKER_TIERS`); if a tier was swapped for an available one, the reason
+says so, and you should not recommend the missing tier yourself either. Treat it as a strong prior, not a
 verdict: override it when the guide clearly disagrees, and say why. If the command fails, decide
 from the guide alone and say so in `Source`.
 

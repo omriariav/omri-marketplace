@@ -31,6 +31,8 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
   MODEL_PICKER_STAMP_REPLIES     0 (default) | 1   ask Claude to end every reply with its model id
   MODEL_PICKER_OLLAMA_MODEL      enables the local tier through the bundled `ask_local` MCP tool
   MODEL_PICKER_OLLAMA_URL        Ollama base URL (default http://localhost:11434)
+  MODEL_PICKER_TIERS             tiers this environment can launch, e.g. "haiku,sonnet,opus" when
+                                 Fable isn't enabled; others are never recommended (default: all)
 
 Also: model_picker.py report [today|24h|7d|30d|all] [--json]
 """
@@ -269,8 +271,56 @@ def task_text(inp, cfg):
 ROUTER_DEADLINE = 7.0  # seconds; stays under the 10 s hook timeout
 
 
+CLAUDE_TIERS = ["haiku", "sonnet", "opus", "fable"]
+EFFORT_ORDER = ["low", "medium", "high"]
+
+
+def available_tiers(cfg):
+    """Tiers this environment can actually launch, in TIERS order."""
+    local = bool(local_hint(cfg))
+    raw = cfg.get("MODEL_PICKER_TIERS")
+    if raw:
+        wanted = {t.strip().lower() for t in (raw if isinstance(raw, list) else str(raw).split(",")) if t.strip()}
+        tiers = [t for t in TIERS if t in wanted and (t != "local" or local)]
+        if any(t in CLAUDE_TIERS for t in tiers):
+            return tiers
+    return [t for t in TIERS if local or t != "local"]
+
+
+def fit_to_available(rec, cfg):
+    """Move a recommendation to the nearest available tier.
+
+    Going down (e.g. Fable not enabled) raises effort to high, the guide's own advice: change
+    effort before changing models. Going up (a cheap tier is disabled) keeps the effort.
+    """
+    tiers = available_tiers(cfg)
+    if rec["tier"] in tiers:
+        return rec
+    want = rec["tier"]
+    if want == "local":
+        target = next((t for t in CLAUDE_TIERS if t in tiers), tiers[-1])
+        note = "local tier not available here; cheapest available tier instead"
+        effort = rec["effort"]
+    else:
+        lower = [t for t in CLAUDE_TIERS[:CLAUDE_TIERS.index(want)] if t in tiers]
+        if lower:
+            target = lower[-1]
+            effort = "high"
+            note = f"{want} is not available here; {target} at high effort instead"
+        else:
+            target = next(t for t in CLAUDE_TIERS if t in tiers)
+            effort = rec["effort"]
+            note = f"{want} is not available here; nearest available tier instead"
+    return {**rec, "tier": target, "effort": effort, "reason": f"{rec['reason']} ({note})", "capped_from": want}
+
+
 def decide(inp, cfg, use_router=True):
-    """Recommendation dict: tier, effort, reason, source. Router first (if configured), heuristic fallback."""
+    """Recommendation dict: tier, effort, reason, source, limited to the available tiers."""
+    return fit_to_available(_decide(inp, cfg, use_router), cfg)
+
+
+def _decide(inp, cfg, use_router=True):
+    """Router first (if configured), heuristic fallback; may name a tier that is not available."""
     local = bool(local_hint(cfg))
     agent_type = str(inp.get("subagent_type") or "")
     text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name"))
@@ -319,8 +369,7 @@ def _route(router, name, inp, cfg, local):
             if not key:
                 raise ValueError("no API key")
             rcfg["_api_key"] = key
-        tiers = [t for t in TIERS if local or t != "local"]
-        return router(task_text(inp, cfg), tiers, rcfg)
+        return router(task_text(inp, cfg), available_tiers(cfg), rcfg)
     except Exception as exc:  # router trouble never blocks a launch
         return exc
 
@@ -390,6 +439,10 @@ def handle_agent(payload, mode, cfg):
     note = verbose_note(cfg, label, model, rec)
     if model:
         chosen = tier_of(model)
+        if chosen and chosen not in available_tiers(cfg):
+            emit(context=f"model-picker: `{label}` was launched on {chosen}, which is not available in this "
+                         f"environment (MODEL_PICKER_TIERS). Use {describe(rec, cfg)} instead.", system=note)
+            return
         if chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
             emit(context=f"model-picker: `{label}` launched on {chosen}, but the task reads as "
                          f"{describe(rec, cfg)}. Prefer that for similar launches unless you have a specific reason.",
@@ -533,6 +586,11 @@ def handle_session(root, cfg):
                     f"extract, translate text you paste into the prompt itself), use the local model: {local_hint(cfg)}. "
                     "It cannot open files, URLs, PRs or tickets. Check its output: "
                     "small local models are fine for simple transformation, weak at anything else.")
+    missing = [t for t in CLAUDE_TIERS if t not in available_tiers(cfg)]
+    if missing:
+        context += (f"\nNot available in this environment: {', '.join(missing)}. Never launch an agent on those; "
+                    "for work the rules assign to them, use the nearest available tier, raising effort when going down "
+                    "(Fable-level work: opus at high effort).")
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
         context += ("\nModel stamps are on: foreground subagent results and ask_local answers carry a "
                     "`[model-picker] ... ran on <model>` line taken from the transcript; name that model when you "

@@ -575,5 +575,51 @@ results += [
     check("unsure: excluded from follow-rate denominator", ledger.report(st, "all")["compared"] == 0),
 ]
 
+# --- v0.4.1: MODEL_PICKER_TIERS --------------------------------------------------
+NOFABLE = {"MODEL_PICKER_TIERS": "haiku,sonnet,opus"}
+big = {"description": "Migrate", "prompt": "migrate the entire codebase from v1 to v2"}
+r_cap = mp.decide(big, NOFABLE)
+results += [
+    check("tiers: default is all Claude tiers", mp.available_tiers({}) == ["haiku", "sonnet", "opus", "fable"]),
+    check("tiers: parsed and ordered", mp.available_tiers({"MODEL_PICKER_TIERS": " opus, haiku ,bogus"}) == ["haiku", "opus"]),
+    check("tiers: junk-only list falls back to all", mp.available_tiers({"MODEL_PICKER_TIERS": "gpt"}) ==
+          ["haiku", "sonnet", "opus", "fable"]),
+    check("tiers: local listed but not configured is dropped", "local" not in mp.available_tiers(
+        {"MODEL_PICKER_TIERS": "local,haiku"})),
+    check("tiers: fable-level work -> opus at high effort",
+          r_cap["tier"] == "opus" and r_cap["effort"] == "high" and r_cap["capped_from"] == "fable"
+          and "not available" in r_cap["reason"]),
+    check("tiers: available recommendation untouched", "capped_from" not in mp.decide(big, {})),
+    check("tiers: haiku disabled -> next tier up, effort kept",
+          mp.decide({"description": "find logs"}, {"MODEL_PICKER_TIERS": "sonnet,opus"})["tier"] == "sonnet"),
+    check("tiers: local excluded -> haiku", mp.decide({"description": "summarize this paragraph"},
+                                                       {**OL, "MODEL_PICKER_TIERS": "haiku,sonnet,opus"})["tier"] == "haiku"),
+]
+note = run(agent(description="Big job", prompt="p", model="fable"), "advise", {**NOFABLE, **fresh_state()})
+results.append(check("tiers: explicit launch on an unavailable tier gets a note",
+                     note and "not available in this environment" in note["hookSpecificOutput"]["additionalContext"]))
+ctx = subprocess.run([sys.executable, "-I", str(HOOK), "session", str(ROOT)], input="{}", capture_output=True,
+                     text=True, env={**os.environ, **NOFABLE}).stdout
+results.append(check("tiers: session rules name the missing tier",
+                     "Not available in this environment: fable" in ctx and "opus at high effort" in ctx))
+route_out = subprocess.run([sys.executable, "-I", str(HOOK), "route"], input="migrate the entire codebase to v2",
+                           capture_output=True, text=True, env={**os.environ, **NOFABLE}).stdout
+results.append(check("tiers: route CLI respects the list", '"tier": "opus"' in route_out))
+
+# The decisions API is only offered available tiers.
+cap_srv = HTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=cap_srv.serve_forever, daemon=True).start()
+SEEN.clear()
+r_router = mp.decide({"description": "d"}, {"MODEL_PICKER_ROUTER": "openai-decisions",
+                                             "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{cap_srv.server_port}",
+                                             "MODEL_PICKER_ROUTER_API_KEY_ENV": "none", **NOFABLE})
+cap_srv.shutdown()
+offered = [c["value"] for c in SEEN[-1]["body"]["questions"][0]["choices"]] if SEEN else []
+results += [
+    check("tiers: router offered only available tiers", offered == ["haiku", "sonnet", "opus"]),
+    # The mock always answers fable; a gateway that ignores the choices still gets capped.
+    check("tiers: router answer outside the list is capped", r_router["tier"] in ("opus", "haiku", "sonnet")),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

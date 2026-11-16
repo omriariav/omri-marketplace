@@ -65,8 +65,9 @@ OPUS_RE = re.compile(
     r"\b(migrate|debug|debugging|root[- ]cause|optimi[sz]e|performance (issue|regression|problem|work)|"
     r"financial model|computer use|security review|design the (system|architecture))\b")
 HAIKU_RE = re.compile(
-    r"\b(find|search|grep|locate|list|where is|which files?|read the (logs?|output)|logs?|test output|"
-    r"summari[sz]e|classify|categori[sz]e|tag|label|extract|triage|fetch|scan|count|inventory|explore)\b")
+    r"\b(find|search|grep|locate|list|where is|which files?|read|look up|lookup|first line|show me|print|"
+    r"check (if|whether)|logs?|test output|summari[sz]e|classify|categori[sz]e|tag|label|extract|triage|"
+    r"fetch|scan|count|inventory|explore)\b")
 SONNET_RE = re.compile(
     r"\b(fix|bug|implement|add (a|an|the)|write (tests?|code|docs?|the docs)|feature|review|draft|document|"
     r"slides?|spreadsheet|investigate|refactor)\b")
@@ -84,6 +85,7 @@ TOOL_RE = re.compile(r"\b(find|search|grep|locate|list|where is|which files?|log
                      r"spreadsheet|sheet|slack|thread|channel|email|inbox)\b"
                      r"|https?://|\w/\w|\b[\w-]+\.[a-z0-9]{1,5}\b")  # URLs, paths, file names
 
+UNSURE_REASON = "no clear signal in the task text; opus is the guide's default when unsure"
 REASONS = {
     "local": "pure text work that needs no tools or files",
     "haiku": "read/search/summarize side work that is cheap to verify",
@@ -114,6 +116,7 @@ def recommend(text, agent_type="", local=False):
         tier = "sonnet"
     else:
         tier = "opus"
+        return tier, UNSURE_REASON
     return tier, REASONS[tier]
 
 
@@ -273,7 +276,7 @@ def decide(inp, cfg, use_router=True):
     text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name"))
     tier, why = recommend(text, agent_type, local)
     fallback = {"tier": tier, "effort": "medium", "reason": why, "source": "heuristic",
-                "confidence": None, "router_ms": None}
+                "confidence": None, "router_ms": None, "unsure": why == UNSURE_REASON}
     name = str(cfg.get("MODEL_PICKER_ROUTER") or "heuristic").lower()
     router = routers.ROUTERS.get(name)
     if not use_router or not router or agent_type.lower().split(":")[-1] in (READ_ONLY_TYPES | PLANNING_TYPES):
@@ -294,7 +297,7 @@ def decide(inp, cfg, use_router=True):
     else:
         return {"tier": res["tier"], "effort": res["effort"], "reason": routers.TIER_CRITERIA[res["tier"]],
                 "source": f"{res['source']} ({res['confidence']:.2f})", "confidence": res["confidence"],
-                "router_ms": fallback["router_ms"]}
+                "router_ms": fallback["router_ms"], "unsure": False}
     return fallback
 
 
@@ -346,8 +349,10 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
     if rec:
         entry.update({"rec_tier": rec["tier"], "rec_effort": rec["effort"], "source": rec["source"],
                       "confidence": rec.get("confidence"), "router_ms": rec.get("router_ms"),
-                      "followed": (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))
-                      if chosen_tier else None})
+                      "unsure": bool(rec.get("unsure")),
+                      # A fallback guess can't judge an explicit choice: leave "followed" unknown.
+                      "followed": None if (not chosen_tier or rec.get("unsure")) else
+                      (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))})
     ledger.append(cfg, entry)
 
 
@@ -385,7 +390,7 @@ def handle_agent(payload, mode, cfg):
     note = verbose_note(cfg, label, model, rec)
     if model:
         chosen = tier_of(model)
-        if chosen and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
+        if chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
             emit(context=f"model-picker: `{label}` launched on {chosen}, but the task reads as "
                          f"{describe(rec, cfg)}. Prefer that for similar launches unless you have a specific reason.",
                  system=note)

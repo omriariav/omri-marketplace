@@ -559,5 +559,21 @@ with tempfile.TemporaryDirectory() as d:
               hook2("posttool", {"tool_name": "Agent", "tool_use_id": "nope", "transcript_path": str(sess)}) is None),
     ]
 
+# --- real-session finding: fallback guesses must not judge explicit choices ----------
+results += [
+    check("read verbs -> haiku", mp.recommend("report the first line of README.md")[0] == "haiku"),
+    check("no signal -> opus but flagged unsure", mp.recommend("think about this")[1] == mp.UNSURE_REASON),
+]
+st = fresh_state()
+note = run({"session_id": "s", "tool_use_id": "u1", "cwd": "/nonexistent", "tool_name": "Agent",
+            "tool_input": {"description": "Ponder", "prompt": "think about this", "model": "haiku"}}, "advise", st)
+d = [r for r in ledger.read(st) if r.get("kind") == "decision"][-1]
+results += [
+    check("unsure: no upward mismatch note on an explicit haiku launch", note is None),
+    check("unsure: followed left unknown", d.get("followed") is None and d.get("unsure") is True),
+    check("unsure: attribution 'unjudged', not 'explicit'", ledger.attribute(d) == "unjudged"),
+    check("unsure: excluded from follow-rate denominator", ledger.report(st, "all")["compared"] == 0),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

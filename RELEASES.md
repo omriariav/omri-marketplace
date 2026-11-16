@@ -10,7 +10,9 @@ Model stamps and a bundled local-model tool.
 - Clear errors when no model is configured (lists installed models) or Ollama is down; `MODEL_PICKER_OLLAMA=0` hides the tools.
 - The local tier is never recommended for work that names a file, path, URL, PR, ticket, doc or page: `ask_local` only sees text pasted into its prompt.
 - Robust MCP server: malformed requests get JSON-RPC errors instead of killing it, and Ollama HTTP errors (e.g. a model not pulled) are reported as such, not as "not reachable".
-- Tests: 118 (from 85), including a JSON-RPC session against a mock Ollama, malformed requests, HTTP 404s, stamp placement for foreground, background and unknown-shape agents, and session-rule injection.
+- When the recommendation is only the "opus when unsure" fallback, it no longer judges an explicit model: no upward nudge, no "not followed", and the saving is listed as unjudged rather than credited or blamed. Plain reading verbs (read, first line, look up, check whether) now count as Haiku work.
+- Verified in real headless Claude Code sessions: `ask_local` registers as `mcp__plugin_model-picker_local__ask_local`, and a foreground Agent launch produced the decision, usage, and stamp records, with Claude naming the stamped model.
+- Tests: 124 (from 85), including a JSON-RPC session against a mock Ollama, malformed requests, HTTP 404s, stamp placement for foreground, background and unknown-shape agents, and session-rule injection.
 
 ## model-picker v0.3.0 (2026-11-16)
 

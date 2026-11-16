@@ -250,6 +250,7 @@ def attribute(decision):
     model-picker  explicit model that matched the recommendation, not already set by the agent definition
     definition    the agent's own definition set that model (saving would have happened anyway)
     explicit      explicit model that differed from the recommendation
+    unjudged      explicit model, but the recommendation was only a fallback guess
     inherited     no model: ran on the session model (no saving)
     unknown       no launch record (hooks inactive at launch, or a non-Agent launch)
     """
@@ -260,6 +261,8 @@ def attribute(decision):
     if outcome == "pinned" or (pinned_tier and pinned_tier == decision.get("chosen_tier")):
         return "definition"
     if outcome == "explicit":
+        if decision.get("followed") is None:
+            return "unjudged"  # explicit model, but no confident recommendation to compare against
         return "model-picker" if decision.get("followed") else "explicit"
     if outcome in ("missing", "denied"):
         return "inherited"
@@ -461,11 +464,12 @@ def format_report(r):
         labels = {"model-picker": "followed model-picker's recommendation",
                   "definition": "model set by the agent's own definition (would have happened anyway)",
                   "explicit": "explicit model that differed from the recommendation",
+                  "unjudged": "explicit model with no confident recommendation to compare against",
                   "inherited": "inherited the session model", "unknown": "no launch record"}
         attr = r.get("saving_by_attribution") or {}
         lines.append(f"Credited to model-picker: ${r.get('credited_saving', 0):.2f} "
                      f"({attr.get('model-picker', {}).get('agents', 0)} agent(s) that followed its recommendation).")
-        for key in ("definition", "explicit", "inherited", "unknown"):
+        for key in ("definition", "explicit", "unjudged", "inherited", "unknown"):
             if key in attr:
                 lines.append(f"  not credited — {labels[key]}: {attr[key]['agents']} agent(s), "
                              f"${attr[key]['saving']:.2f}")

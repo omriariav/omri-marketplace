@@ -54,6 +54,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
 | `MODEL_PICKER_OLLAMA_TIMEOUT` | Seconds per `ask_local` call | `120` |
 | `MODEL_PICKER_OLLAMA` | `0` hides the `ask_local` tools | `1` |
+| `MODEL_PICKER_TIERS` | Tiers this environment can launch, e.g. `haiku,sonnet,opus` where Fable isn't enabled. Others are never recommended or offered to the router; work meant for a missing higher tier goes to the next tier down at high effort | all |
 
 API keys are read from the environment or `API_KEY_CMD`, never from the config file.
 

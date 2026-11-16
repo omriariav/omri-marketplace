@@ -1,5 +1,14 @@
 # Releases
 
+## model-picker v0.4.1 (2026-11-16)
+
+Respect the models an environment can actually launch.
+
+- New `MODEL_PICKER_TIERS` (e.g. `haiku,sonnet,opus`) for setups where a tier isn't enabled, such as Claude Code accounts without Fable. Missing tiers are never recommended, never offered to the decisions API, and the session rules name them.
+- Work meant for a missing higher tier goes to the next tier down at high effort (Fable-level work: Opus at high effort), following the guide's "change effort before changing models"; a missing cheaper tier moves up and keeps its effort.
+- An explicit launch on an unavailable tier gets a note with the available alternative instead of a silent failure.
+- Default unchanged: all tiers. Tests: 137.
+
 ## model-picker v0.4.0 (2026-11-16)
 
 Model stamps and a bundled local-model tool.

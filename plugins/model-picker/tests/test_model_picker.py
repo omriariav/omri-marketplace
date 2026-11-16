@@ -658,5 +658,38 @@ with tempfile.TemporaryDirectory() as proj:
                          pin and "pinned to fable" in pin["hookSpecificOutput"]["additionalContext"]
                          and 'model: "opus"' in pin["hookSpecificOutput"]["additionalContext"]))
 
+# --- v0.4.2 pre-merge review ---------------------------------------------------------
+results += [
+    check("prereview: session text describes step-up rule",
+          "next stronger available tier at the same effort" in session_ctx({"MODEL_PICKER_TIERS": "haiku,opus"})),
+    check("prereview: 'local' inside a model name is not the local tier", mp.tier_of("my-local-llama") is None),
+]
+st = fresh_state()
+run(agent(description="Big job", prompt="p", model="fable"), "enforce", {**NOFABLE, **st})
+run(agent(description="Big job", prompt="p", model="opus"), "enforce", {**NOFABLE, **st})
+rep = ledger.report(st, "all")
+results.append(check("prereview: enforce deny + retry on an unavailable model counts once",
+                     rep["launches"] == 1 and rep["denied"] == 1))
+
+# --- ROUTER_ON_EXPLICIT --------------------------------------------------------------
+oe_srv = HTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=oe_srv.serve_forever, daemon=True).start()
+RT = {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{oe_srv.server_port}",
+      "MODEL_PICKER_ROUTER_API_KEY_ENV": "none"}
+SEEN.clear()
+st = fresh_state()
+run(agent(description="Look around", prompt="p", model="haiku"), "advise", {**RT, **st})
+off_calls = len(SEEN)
+run(agent(description="Look around", prompt="p", model="fable"), "advise", {**RT, **st, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"})
+on_calls = len(SEEN) - off_calls
+oe_srv.shutdown()
+d = [r for r in ledger.read(st) if r.get("kind") == "decision"]
+results += [
+    check("on_explicit off: explicit launch never calls the router", off_calls == 0),
+    check("on_explicit on: explicit launch is judged by the router",
+          on_calls == 1 and str(d[-1].get("source", "")).startswith("openai-decisions")),
+    check("on_explicit on: router verdict sets followed (mock says fable)", d[-1].get("followed") is True),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

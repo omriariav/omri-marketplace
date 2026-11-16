@@ -23,6 +23,7 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
   MODEL_PICKER_ROUTER_INPUT      description (default) | brief | full: what task text leaves the machine
   MODEL_PICKER_ROUTER_TIMEOUT    seconds (default 3)
   MODEL_PICKER_ROUTER_MIN_CONFIDENCE  below this the heuristic decides (default 0.5)
+  MODEL_PICKER_ROUTER_ON_EXPLICIT  0 (default) | 1   also ask the router about launches that set a model
   MODEL_PICKER_LOG               1 (default) | 0   local decision/usage ledger (see ledger.py)
   MODEL_PICKER_STATE_DIR         where the ledger lives (default ~/.config/model-picker)
   MODEL_PICKER_VERBOSE           0 (default) | 1   one-line note per launch and per finished subagent
@@ -188,8 +189,10 @@ def pinned_model(agent_type, cwd):
 
 
 def tier_of(model):
+    """Claude tier named in a model id/alias. "local" is never a launchable `model` value, so a
+    name that merely contains "local" (e.g. my-local-llama) is not treated as the local tier."""
     model = (model or "").lower()
-    for tier in TIERS:
+    for tier in CLAUDE_TIERS:
         if tier in model:
             return tier
     return None
@@ -442,9 +445,12 @@ def handle_agent(payload, mode, cfg):
     model = inp.get("model")
     pinned = pinned_model(agent_type, payload.get("cwd"))
     if pinned and not model:
-        log_decision(cfg, payload, inp, "pinned", chosen=pinned, pinned=pinned)
         pinned_tier = tier_of(pinned)
-        if pinned_tier and pinned_tier not in available_tiers(cfg):
+        unavailable = bool(pinned_tier) and pinned_tier not in available_tiers(cfg)
+        # A denied launch never ran: log it as "denied" so the retry isn't counted twice.
+        log_decision(cfg, payload, inp, "denied" if unavailable and mode == "enforce" else "pinned",
+                     chosen=pinned, pinned=pinned)
+        if unavailable:
             alt = fit_to_available({"tier": pinned_tier, "effort": "medium", "reason": "pinned by the agent definition"},
                                    cfg)
             msg = (f"model-picker: `{label}` is pinned to {pinned} in its definition, which is not available in "
@@ -452,10 +458,13 @@ def handle_agent(payload, mode, cfg):
             emit("deny", msg) if mode == "enforce" else emit(context=msg)
         return  # the agent definition already pins a model
 
-    # An explicit model only needs a mismatch check: keep it local and instant (no router call).
-    rec = decide(inp, cfg, use_router=not model)
+    # An explicit model is judged by the keyword heuristic (instant) unless MODEL_PICKER_ROUTER_ON_EXPLICIT
+    # asks the router to judge it too: ~0.7s per launch, but every launch gets a real verdict.
+    rec = decide(inp, cfg, use_router=not model or _enabled(cfg, "MODEL_PICKER_ROUTER_ON_EXPLICIT", default=False))
     session_model = ledger.last_model(payload.get("transcript_path"))
-    outcome = "explicit" if model else ("denied" if mode == "enforce" else "missing")
+    chosen_unavailable = bool(model) and bool(tier_of(model)) and tier_of(model) not in available_tiers(cfg)
+    outcome = ("denied" if mode == "enforce" and (not model or chosen_unavailable)
+               else "explicit" if model else "missing")
     log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,
                  pinned=pinned)
     note = verbose_note(cfg, label, model, rec)
@@ -621,8 +630,8 @@ def handle_session(root, cfg):
     missing = [t for t in CLAUDE_TIERS if t not in available_tiers(cfg)]
     if missing:
         context += (f"\nNot available in this environment: {', '.join(missing)}. Never launch an agent on those; "
-                    "for work the rules assign to them, use the nearest available tier, raising effort when going down "
-                    "(Fable-level work: opus at high effort).")
+                    "for work the rules assign to them, use the next stronger available tier at the same effort; step down "
+                    "only when nothing stronger exists, raising effort to high (Fable-level work: opus at high effort).")
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
         context += ("\nModel stamps are on: foreground subagent results and ask_local answers carry a "
                     "`[model-picker] ... ran on <model>` line taken from the transcript; name that model when you "

@@ -621,5 +621,42 @@ results += [
     check("tiers: router answer outside the list is capped", r_router["tier"] in ("opus", "haiku", "sonnet")),
 ]
 
+# --- v0.4.2: post-merge review of v0.4.1 ----------------------------------------------
+def session_ctx(env):
+    out = subprocess.run([sys.executable, "-I", str(HOOK), "session", str(ROOT)], input="{}", capture_output=True,
+                         text=True, env={**os.environ, **env}).stdout
+    return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out.strip() else ""
+
+
+results += [
+    check("review: local excluded by tiers -> not advertised at session start",
+          "Local tier enabled" not in session_ctx({**OL, "MODEL_PICKER_TIERS": "opus"})),
+    check("review: local included -> advertised", "Local tier enabled" in session_ctx({**OL, "MODEL_PICKER_TIERS": "local,opus"})),
+    check("review: non-string tier items don't crash", mp.available_tiers({"MODEL_PICKER_TIERS": [1, "opus"]}) == ["opus"]),
+    check("review: typo warns instead of silently allowing everything",
+          "names no Claude tier" in session_ctx({"MODEL_PICKER_TIERS": "opuss"})),
+    check("review: missing middle tier steps UP keeping effort",
+          (lambda r: r["tier"] == "opus" and r["effort"] == "medium")(
+              mp.fit_to_available({"tier": "sonnet", "effort": "medium", "reason": "x"}, {"MODEL_PICKER_TIERS": "haiku,opus"}))),
+    check("review: missing top tier still steps DOWN at high",
+          (lambda r: r["tier"] == "opus" and r["effort"] == "high")(
+              mp.fit_to_available({"tier": "fable", "effort": "medium", "reason": "x"}, {"MODEL_PICKER_TIERS": "haiku,sonnet,opus"}))),
+]
+wf = subprocess.run([sys.executable, "-I", str(HOOK), "pretool", str(ROOT)],
+                    input=json.dumps({"tool_name": "Workflow", "tool_input": {"script": 'agent("a")'}}),
+                    capture_output=True, text=True, env={**os.environ, **NOFABLE, **fresh_state()}).stdout
+results.append(check("review: workflow advice lists only available tiers", "'opus'" in wf and "'fable'" not in wf))
+den = run(agent(description="Big job", prompt="p", model="fable"), "enforce", {**NOFABLE, **fresh_state()})
+results.append(check("review: enforce denies an explicit unavailable model",
+                     den and den["hookSpecificOutput"].get("permissionDecision") == "deny"))
+with tempfile.TemporaryDirectory() as proj:
+    adir = Path(proj) / ".claude/agents"
+    adir.mkdir(parents=True)
+    (adir / "fab.md").write_text("---\nname: fab\nmodel: fable\n---\nbody\n")
+    pin = run(agent(subagent_type="fab", prompt="p"), "advise", {**NOFABLE, "CLAUDE_PROJECT_DIR": proj, **fresh_state()})
+    results.append(check("review: agent pinned to an unavailable tier gets a note",
+                         pin and "pinned to fable" in pin["hookSpecificOutput"]["additionalContext"]
+                         and 'model: "opus"' in pin["hookSpecificOutput"]["additionalContext"]))
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

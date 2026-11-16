@@ -18,11 +18,23 @@ Claude Code loads these rules at session start through the plugin hook; other ag
 
 ## Recommend (argument is a task)
 
-Using the guide, answer in this exact shape and nothing else:
+First run the router (it uses the configured decision API, or the keyword heuristic):
+
+```bash
+python3 <this skill's directory>/../../hooks/model_picker.py route "<the task, one or two sentences>"
+```
+
+It prints JSON with `tier`, `effort`, `reason`, and `source`. Treat it as a strong prior, not a
+verdict: override it only when the guide clearly disagrees, and say so in `Why`. If the command
+fails, decide from the guide alone. A `local` tier means use the local model the way the
+session-start note or `MODEL_PICKER_LOCAL_HINT` describes.
+
+Answer in this exact shape and nothing else:
 
 ```
-Model:  <haiku|sonnet|opus|fable>  (Haiku 5.5 / Sonnet 5.5 / Opus 5.5 / Fable 5.2)
+Model:  <local|haiku|sonnet|opus|fable>  (local / Haiku 5.5 / Sonnet 5.5 / Opus 5.5 / Fable 5.2)
 Effort: <low|medium|high>
+Source: <router source from the JSON, or "guide">
 Why:    <one line tied to the task>
 Split:  <only if delegation helps: which parts go to which model; otherwise omit>
 ```

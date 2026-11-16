@@ -76,5 +76,95 @@ results += [
           "1 of 2" in json.dumps(run(wf('agent("a", {label:"x"}); agent("b", {model: "haiku"})')))),
 ]
 
+# --- local tier --------------------------------------------------------------
+LOCAL = {"MODEL_PICKER_LOCAL_HINT": "model: haiku (gateway maps haiku to a local model)"}
+results += [
+    check("local: pure text -> local", mp.recommend("summarize this paragraph", local=True)[0] == "local"),
+    check("local: needs files -> not local", mp.recommend("summarize the log files", local=True)[0] == "haiku"),
+    check("local: disabled -> haiku", mp.recommend("summarize this paragraph")[0] == "haiku"),
+    check("local: hint in deny reason",
+          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify this ticket text"),
+                                                 "enforce", LOCAL))),
+]
+
+# --- external routers (mock server) -------------------------------------------
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+
+SEEN = []
+
+
+class Mock(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        SEEN.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
+        conf = 0.2 if "UNSURE" in json.dumps(body) else 0.9
+        if self.path == "/v1/decisions":
+            out = {"answers": [{"type": "choice", "name": "tier", "choice": "fable", "confidence": conf},
+                               {"type": "choice", "name": "effort", "choice": "high", "confidence": 0.8}]}
+        elif self.path == "/v1beta/decisions":
+            out = {"answers": {"tier": {"type": "choice", "choice": "sonnet", "confidence": conf},
+                               "effort": {"type": "choice", "choice": "low", "confidence": 0.7}}}
+        else:
+            self.send_response(500)
+            self.end_headers()
+            return
+        data = json.dumps(out).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(data)
+
+
+srv = HTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+URL = f"http://127.0.0.1:{srv.server_port}"
+OA = {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": URL, "OPENAI_API_KEY": "k",
+      "MODEL_PICKER_ROUTER_HEADERS": '{"x-service": "test"}', "MODEL_PICKER_ROUTER_METADATA": '{"tags": ["t"]}'}
+
+SEEN.clear()
+out = json.dumps(run(agent(description="Look around", prompt="SECRET-PROMPT find things"), "advise", OA))
+req = SEEN[-1] if SEEN else {}
+results += [
+    check("openai router: recommendation used", "`fable`, effort high" in out and "openai-decisions" in out),
+    check("openai router: headers/metadata/auth sent",
+          req.get("headers", {}).get("x-service") == "test" and req["body"].get("metadata") == {"tags": ["t"]}
+          and req["headers"].get("authorization") == "Bearer k"),
+    check("openai router: prompt not sent by default", "SECRET-PROMPT" not in json.dumps(req.get("body"))),
+]
+SEEN.clear()
+run(agent(description="Look around", prompt="SECRET-PROMPT"), "advise", {**OA, "MODEL_PICKER_ROUTER_INPUT": "brief"})
+results.append(check("openai router: brief sends prompt head", "SECRET-PROMPT" in json.dumps(SEEN[-1]["body"])))
+results.append(check("openai router: low confidence -> heuristic",
+                     "unsure" in json.dumps(run(agent(description="UNSURE task", prompt="find x"), "advise", OA))))
+results.append(check("router down -> heuristic, launch not blocked",
+                     "router error" in json.dumps(run(agent(description="d", prompt="find x"), "advise",
+                                                      {**OA, "MODEL_PICKER_ROUTER_URL": "http://127.0.0.1:9"}))))
+results.append(check("read-only types skip the router",
+                     "heuristic" in json.dumps(run(agent(subagent_type="Explore", description="d"), "advise", OA))))
+GG = {"MODEL_PICKER_ROUTER": "google-decisions", "MODEL_PICKER_ROUTER_URL": URL, "GEMINI_API_KEY": "g"}
+SEEN.clear()
+out = json.dumps(run(agent(description="d", prompt="p"), "advise", GG))
+results.append(check("google router: answer + api key header",
+                     "`sonnet`, effort low" in out and SEEN[-1]["headers"].get("x-goog-api-key") == "g"))
+CMD = {"MODEL_PICKER_ROUTER": "command",
+       "MODEL_PICKER_ROUTER_CMD": f"{sys.executable} -c \"import json,sys; d=json.load(sys.stdin); "
+                                  f"print(json.dumps({{'tier': d['tiers'][0], 'effort': 'low', 'confidence': 1}}))\""}
+results.append(check("command router", "`haiku`, effort low" in json.dumps(run(agent(description="d"), "advise", CMD))))
+with tempfile.TemporaryDirectory() as d:
+    cfgf = Path(d) / "config.json"
+    cfgf.write_text(json.dumps({k: v for k, v in GG.items() if k.startswith("MODEL_PICKER_")}
+                               | {"MODEL_PICKER_MODE": "enforce"}))
+    # API keys come from the environment only, never from the config file.
+    out = run(agent(description="d", prompt="p"), env={"MODEL_PICKER_CONFIG": str(cfgf), "GEMINI_API_KEY": "g"})
+    # run() always sets MODEL_PICKER_MODE=advise in env, which must win over the file.
+    results.append(check("config file read; env overrides file",
+                         out and "google-decisions" in json.dumps(out)
+                         and "permissionDecision" not in out["hookSpecificOutput"]))
+srv.shutdown()
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

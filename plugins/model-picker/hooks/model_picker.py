@@ -699,6 +699,20 @@ def handle_session(root, cfg):
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
 
 
+def _open_in_browser(uri):
+    """Open uri in a GUI browser and say whether it worked. On Linux/BSD without a display, Python's
+    webbrowser falls back to console browsers (lynx, w3m) that would take over the terminal, so skip it."""
+    headless = sys.platform not in ("darwin", "win32") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if not headless:
+        try:
+            import webbrowser
+            if webbrowser.open(uri):
+                return "Opened in the browser."
+        except Exception:
+            pass
+    return "Could not open a browser here; open the file link above."
+
+
 def main():
     event = sys.argv[1]
     cfg = load_config()
@@ -708,20 +722,29 @@ def main():
         return
     if event == "report":
         args = sys.argv[2:]
-        out_arg = args[args.index("--out") + 1] if "--out" in args[:-1] else None
-        period = next((a for a in args if not a.startswith("-") and a != out_arg), "7d")
+        out_at = args.index("--out") + 1 if "--out" in args else None
+        if out_at is not None and (out_at >= len(args) or args[out_at].startswith("-")):
+            print("model-picker report: --out needs a file path", file=sys.stderr)
+            sys.exit(2)
+        out_arg = args[out_at] if out_at is not None else None
+        period = next((a for i, a in enumerate(args) if not a.startswith("-") and i != out_at), "7d")
         try:
             data = ledger.report(cfg, period)
         except ValueError as exc:
             print(f"model-picker report: {exc}", file=sys.stderr)
             sys.exit(2)
-        print(json.dumps(data, indent=2) if "--json" in args else ledger.format_report(data))
+        as_json = "--json" in args
+        print(json.dumps(data, indent=2) if as_json else ledger.format_report(data))
         if "--html" in args:
-            path = ledger.write_html(cfg, data, out_arg)
-            print(f"\nHTML report: {path.resolve().as_uri()}")
+            note = sys.stderr if as_json else sys.stdout  # keep --json output parseable
+            try:
+                path = ledger.write_html(cfg, data, out_arg).resolve()
+            except OSError as exc:
+                print(f"model-picker report: could not write the HTML report: {exc}", file=sys.stderr)
+                sys.exit(2)
+            print(f"\nHTML report: {path.as_uri()}", file=note)
             if "--open" in args:
-                import webbrowser
-                webbrowser.open(path.resolve().as_uri())
+                print(_open_in_browser(path.as_uri()), file=note)
         return
     root = sys.argv[2]
     raw = sys.stdin.read()

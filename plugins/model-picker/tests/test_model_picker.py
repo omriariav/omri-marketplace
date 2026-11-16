@@ -31,6 +31,14 @@ def agent(**inp):
     return {"tool_name": "Agent", "tool_input": inp, "cwd": "/nonexistent"}
 
 
+def _parses(text):
+    try:
+        json.loads(text)
+        return True
+    except ValueError:
+        return False
+
+
 def _raises(fn):
     try:
         fn()
@@ -356,6 +364,28 @@ with tempfile.TemporaryDirectory() as d:
               and "model-picker report (all)" in cli),
         check("html: --out value is not taken as the period", "unknown period" not in cli),
     ]
+    os.chmod(out_html, 0o644)
+    def rep_cli(*a, extra_env=None):
+        return subprocess.run([sys.executable, "-I", str(HOOK), "report", *a], capture_output=True, text=True,
+                              env={**os.environ, **st, **(extra_env or {})}, cwd=st["MODEL_PICKER_STATE_DIR"])
+    jh = rep_cli("all", "--json", "--html", "--out", str(out_html))
+    same = rep_cli("all", "--html", "--out", "all", extra_env=None)
+    no_path = rep_cli("all", "--html", "--out")
+    to_dir = rep_cli("all", "--html", "--out", str(out_html.parent))
+    head = rep_cli("all", "--html", "--open", "--out", str(out_html),
+                   extra_env={"DISPLAY": "", "WAYLAND_DISPLAY": ""}) if sys.platform not in ("darwin", "win32") else None
+    results += [
+        check("html: rewrite resets an existing file to 0600", (out_html.stat().st_mode & 0o777) == 0o600),
+        check("html: --json --html keeps stdout valid JSON (link on stderr)",
+              _parses(jh.stdout) and "HTML report:" in jh.stderr),
+        check("html: period and --out path parsed by position", "model-picker report (all)" in same.stdout
+              and (Path(st["MODEL_PICKER_STATE_DIR"]) / "all").exists()),
+        check("html: --out without a path is an error", no_path.returncode == 2 and "needs a file path" in no_path.stderr),
+        check("html: --out to a directory gives a report error, not a hook error",
+              to_dir.returncode == 2 and "could not write the HTML report" in to_dir.stderr and "hook error" not in to_dir.stdout),
+    ]
+    if head is not None:
+        results.append(check("html: --open without a display says so instead of opening", "Could not open" in head.stdout))
     big = Path(st["MODEL_PICKER_STATE_DIR"]) / "log.jsonl"
     big.write_text("x" * (ledger.ROTATE_BYTES + 1))
     ledger.append(st, {"kind": "decision", "outcome": "skipped"})

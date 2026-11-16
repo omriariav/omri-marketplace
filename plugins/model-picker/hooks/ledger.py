@@ -16,6 +16,7 @@ import fcntl
 import html
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -744,10 +745,23 @@ def format_html(r, generated=None):
 
 
 def write_html(cfg, r, path=None):
-    """Write the HTML report (default: <state dir>/report.html, owner-only) and return its path."""
+    """Write the HTML report (default: <state dir>/report.html) and return its path.
+
+    Written to an owner-only temp file and renamed over the target, so the result is 0600 even when
+    a wider-mode file was there before, and a symlink at the target is replaced, never followed."""
     target = Path(path).expanduser() if path else state_dir(cfg) / "report.html"
+    if target.is_dir():
+        raise IsADirectoryError(f"{target} is a directory; pass a file path")
     target.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(format_html(r))
+    fd, tmp = tempfile.mkstemp(prefix=".report.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(format_html(r))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return target

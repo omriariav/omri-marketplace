@@ -22,9 +22,9 @@ Run (the path is relative to the directory that contains this SKILL.md):
 python3 ../../hooks/model_picker.py report <period> --html --open
 ```
 
-Show the output as-is; it is already a short summary plus a Markdown table. Its last line is the
-`HTML report:` file link; keep it, and say the page was opened in the browser. Leave out `--open`
-only if the user asked for text only, or in a session with no display (CI, a remote container). Then add at most two
+Show the output as-is; it is already a short summary plus a Markdown table. It ends with the
+`HTML report:` file link and one line saying whether the page opened in the browser; keep both and
+don't claim it opened if that line says it could not. Leave out `--open` if the user asked for text only. Then add at most two
 lines of your own:
 
 1. The saving to quote is **Credited to model-picker**, not the total difference. The total also

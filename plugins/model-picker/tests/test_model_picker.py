@@ -1,6 +1,7 @@
 """Run: python3 -I plugins/model-picker/tests/test_model_picker.py"""
 
 import json
+import re
 import os
 import subprocess
 import sys
@@ -336,6 +337,24 @@ with tempfile.TemporaryDirectory() as d:
             env={**os.environ, **st}).stdout),
         check("report: empty ledger message", "No launches logged" in ledger.format_report(ledger.report(fresh_state()))),
         check("report: bad period rejected", _raises(lambda: ledger.since_epoch("weekly"))),
+    ]
+    page = ledger.format_html(rep)
+    evil = ledger.format_html({**rep, "launch_tiers": {"<script>x</script>": 1, "haiku": 2},
+                               "recommended_tiers": {"haiku": 1, "local": 1}})
+    out_html = Path(st["MODEL_PICKER_STATE_DIR"]) / "out dir" / "r.html"
+    cli = subprocess.run([sys.executable, "-I", str(HOOK), "report", "--html", "--out", str(out_html), "all"],
+                         capture_output=True, text=True, env={**os.environ, **st}).stdout
+    results += [
+        check("html: credited saving and model table", "Credited to model-picker" in page and "<td>haiku</td>" in page),
+        check("html: self-contained, no external requests", not re.search(r"(src|href)=|https?://|@import", page)),
+        check("html: ledger strings are escaped", "<script>" not in evil and "&lt;script&gt;" in evil),
+        check("html: each tier listed once, in tier order",
+              evil.count("<div class=lab>haiku</div>") == 1 and evil.index(">local<") < evil.index(">haiku<")),
+        check("html: empty ledger page", "No launches logged" in ledger.format_html(ledger.report(fresh_state()))),
+        check("html: CLI --out writes an owner-only file and prints its link",
+              out_html.exists() and (out_html.stat().st_mode & 0o777) == 0o600 and "HTML report: file://" in cli
+              and "model-picker report (all)" in cli),
+        check("html: --out value is not taken as the period", "unknown period" not in cli),
     ]
     big = Path(st["MODEL_PICKER_STATE_DIR"]) / "log.jsonl"
     big.write_text("x" * (ledger.ROTATE_BYTES + 1))

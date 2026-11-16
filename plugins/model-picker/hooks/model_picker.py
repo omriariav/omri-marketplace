@@ -35,7 +35,7 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
   MODEL_PICKER_TIERS             tiers this environment can launch, e.g. "haiku,sonnet,opus" when
                                  Fable isn't enabled; others are never recommended (default: all)
 
-Also: model_picker.py report [today|24h|7d|30d|all] [--json]
+Also: model_picker.py report [today|24h|7d|30d|all] [--json] [--html [--out PATH] [--open]]
 """
 
 import json
@@ -708,13 +708,20 @@ def main():
         return
     if event == "report":
         args = sys.argv[2:]
-        period = next((a for a in args if not a.startswith("-")), "7d")
+        out_arg = args[args.index("--out") + 1] if "--out" in args[:-1] else None
+        period = next((a for a in args if not a.startswith("-") and a != out_arg), "7d")
         try:
             data = ledger.report(cfg, period)
         except ValueError as exc:
             print(f"model-picker report: {exc}", file=sys.stderr)
             sys.exit(2)
         print(json.dumps(data, indent=2) if "--json" in args else ledger.format_report(data))
+        if "--html" in args:
+            path = ledger.write_html(cfg, data, out_arg)
+            print(f"\nHTML report: {path.resolve().as_uri()}")
+            if "--open" in args:
+                import webbrowser
+                webbrowser.open(path.resolve().as_uri())
         return
     root = sys.argv[2]
     raw = sys.stdin.read()

@@ -1,5 +1,15 @@
 # Releases
 
+## model-picker v0.4.0 (2026-11-16)
+
+Model stamps and a bundled local-model tool.
+
+- `MODEL_PICKER_STAMP=1`: each subagent result is stamped with the model that actually answered, read from its transcript (not self-reported), plus tokens and cost, e.g. `[model-picker] web-fetch ran on claude-haiku-5-5 · 13K tokens · ~$0.001 (~$0.055 on opus)`. Foreground agents are stamped when the `Agent` call returns (new PostToolUse hook, visible to you and to Claude); background agents when they finish. Never twice.
+- `MODEL_PICKER_STAMP_REPLIES=1` (opt-in) asks Claude to end every reply with its model id.
+- New bundled MCP server with `ask_local` and `list_local_models`, backed by Ollama (stdlib only). Setting `MODEL_PICKER_OLLAMA_MODEL` turns on the `local` tier, so tool-free text work goes to a $0 local model instead of a subagent. Answers carry a stamp; calls are logged (no prompt or answer text) and reported with their Haiku-price equivalent.
+- Clear errors when no model is configured (lists installed models) or Ollama is down; `MODEL_PICKER_OLLAMA=0` hides the tools.
+- Tests: 105 (from 85), including a JSON-RPC session against a mock Ollama, stamp placement for foreground and background agents, and session-rule injection.
+
 ## model-picker v0.3.0 (2026-11-16)
 
 Visibility: what model-picker decided, which models ran, and what that saved.

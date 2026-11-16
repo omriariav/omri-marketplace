@@ -199,6 +199,37 @@ def subagent_meta(transcript_path):
         return {}
 
 
+def find_subagent(parent_transcript, tool_use_id):
+    """(transcript_path, meta) of the subagent launched by `tool_use_id`, or (None, {})."""
+    if not parent_transcript or not tool_use_id:
+        return None, {}
+    folder = Path(parent_transcript).with_suffix("") / "subagents"
+    try:
+        metas = sorted(folder.glob("agent-*.meta.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None, {}
+    for meta_path in metas[:200]:
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if meta.get("toolUseId") == tool_use_id:
+            transcript = meta_path.with_name(meta_path.name[:-len(".meta.json")] + ".jsonl")
+            return (str(transcript) if transcript.exists() else None), meta
+    return None, {}
+
+
+def stamp_text(agent_type, model, totals, baseline_tier):
+    """One-line ground-truth stamp: which model actually answered, tokens, cost."""
+    tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
+    size = f"{tokens / 1e6:.2f}M" if tokens >= 1e6 else f"{tokens / 1e3:.0f}K" if tokens >= 1e3 else str(tokens)
+    cost = "$0 (local)" if totals.get("local") else f"~${totals['cost']:.3f}"
+    vs = ""
+    if baseline_tier and totals["baseline_cost"] and totals["saving"] > 0:
+        vs = f" (~${totals['baseline_cost']:.3f} on {baseline_tier})"
+    return f"[model-picker] {agent_type or 'subagent'} ran on {model} · {size} tokens · {cost}{vs}"
+
+
 def subagent_transcript(payload):
     """Locate the finished subagent's transcript from a SubagentStop payload."""
     path = payload.get("agent_transcript_path")
@@ -324,6 +355,7 @@ def report(cfg, period="7d", now=None):
         if r.get("kind") == "usage":
             last_use[r.get("agent_id") or id(r)] = r
     use = list(last_use.values())
+    local_calls = [r for r in recs if r.get("kind") == "local"]
     checked = [d for d in dec if d.get("outcome") in ("explicit", "missing")]
     explicit = [d for d in checked if d["outcome"] == "explicit"]
     compared = [d for d in explicit if d.get("followed") is not None]
@@ -376,6 +408,11 @@ def report(cfg, period="7d", now=None):
                                   for k, v in by_attr.items()},
         "credited_saving": round(by_attr.get("model-picker", {}).get("saving", 0.0), 4),
         "local_agents": sum(1 for u in use if u.get("local")),
+        "local_calls": len(local_calls),
+        "local_input": sum(r.get("input") or 0 for r in local_calls),
+        "local_output": sum(r.get("output") or 0 for r in local_calls),
+        "local_errors": sum(1 for r in local_calls if r.get("error")),
+        "local_haiku_equiv": round(sum(r.get("haiku_equiv") or 0 for r in local_calls), 4),
     }
 
 
@@ -397,7 +434,7 @@ def _tok(n):
 
 def format_report(r):
     lines = [f"model-picker report ({r['period']})", ""]
-    if not r["launches"] and not r["subagents"]:
+    if not r["launches"] and not r["subagents"] and not r.get("local_calls"):
         return "\n".join(lines + ["No launches logged yet. The ledger fills as agents launch "
                                   "(MODEL_PICKER_LOG must not be 0)."])
     tiers = ", ".join(f"{k} {v}" for k, v in sorted(r["launch_tiers"].items(), key=lambda kv: -kv[1]))
@@ -435,4 +472,9 @@ def format_report(r):
         if r["local_agents"]:
             lines.append(f"{r['local_agents']} subagent(s) ran on a local model, counted at $0.")
         lines.append("Estimate: same tokens at list prices; a larger model may have used fewer tokens.")
+    if r.get("local_calls"):
+        ok = r["local_calls"] - r["local_errors"]
+        lines += ["", f"Local model (ask_local): {ok} call(s), {_tok(r['local_input'])} in / "
+                      f"{_tok(r['local_output'])} out tokens, $0; ~${r['local_haiku_equiv']:.3f} at Haiku prices"
+                      + (f"; {r['local_errors']} failed" if r["local_errors"] else "") + "."]
     return "\n".join(lines)

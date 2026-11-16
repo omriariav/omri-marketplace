@@ -27,6 +27,10 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
   MODEL_PICKER_STATE_DIR         where the ledger lives (default ~/.config/model-picker)
   MODEL_PICKER_VERBOSE           0 (default) | 1   one-line note per launch and per finished subagent
   MODEL_PICKER_PRICES            JSON price overrides per tier ($/M tokens)
+  MODEL_PICKER_STAMP             0 (default) | 1   stamp each subagent result with the model that actually ran
+  MODEL_PICKER_STAMP_REPLIES     0 (default) | 1   ask Claude to end every reply with its model id
+  MODEL_PICKER_OLLAMA_MODEL      enables the local tier through the bundled `ask_local` MCP tool
+  MODEL_PICKER_OLLAMA_URL        Ollama base URL (default http://localhost:11434)
 
 Also: model_picker.py report [today|24h|7d|30d|all] [--json]
 """
@@ -198,6 +202,19 @@ def emit(decision=None, reason=None, context=None, system=None):
         print(json.dumps(body))
 
 
+ASK_LOCAL_TOOL = "mcp__plugin_model-picker_local__ask_local"
+
+
+def local_hint(cfg):
+    """How Claude reaches the local model, or None when the local tier is off."""
+    if cfg.get("MODEL_PICKER_LOCAL_HINT"):
+        return str(cfg["MODEL_PICKER_LOCAL_HINT"])
+    if cfg.get("MODEL_PICKER_OLLAMA_MODEL"):
+        return (f"call the `{ASK_LOCAL_TOOL}` tool directly instead of launching an agent "
+                f"(Ollama {cfg['MODEL_PICKER_OLLAMA_MODEL']}, $0; text in, text out, no tools or files)")
+    return None
+
+
 def load_config():
     path = Path(os.environ.get("MODEL_PICKER_CONFIG") or Path.home() / ".config/model-picker/config.json")
     cfg = {}
@@ -248,7 +265,7 @@ ROUTER_DEADLINE = 7.0  # seconds; stays under the 10 s hook timeout
 
 def decide(inp, cfg, use_router=True):
     """Recommendation dict: tier, effort, reason, source. Router first (if configured), heuristic fallback."""
-    local = bool(cfg.get("MODEL_PICKER_LOCAL_HINT"))
+    local = bool(local_hint(cfg))
     agent_type = str(inp.get("subagent_type") or "")
     text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name"))
     tier, why = recommend(text, agent_type, local)
@@ -305,7 +322,7 @@ def _route(router, name, inp, cfg, local):
 def describe(rec, cfg):
     target = f"`{rec['tier']}`"
     if rec["tier"] == "local":
-        target += f" ({cfg.get('MODEL_PICKER_LOCAL_HINT')})"
+        target += f" ({local_hint(cfg)})"
     return f"{target}, effort {rec['effort']}: {rec['reason']} [via {rec['source']}]"
 
 
@@ -408,11 +425,34 @@ def handle_subagent_stop(payload, cfg):
         **{k: totals[k] for k in ("messages", "input", "output", "cache_read", "cache_write", "cost",
                                   "baseline_cost", "saving", "local", "unpriced")},
     })
-    if _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
+    background = meta.get("requestShape") == "background"
+    if _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and background:
+        print(json.dumps({"systemMessage": ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)}))
+    elif _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
         tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
         vs = f" vs ~${totals['baseline_cost']:.3f} on {baseline}" if baseline and totals["saving"] else ""
         print(json.dumps({"systemMessage": f"model-picker: {meta.get('agentType') or 'subagent'} on {main_model} "
                                             f"used {tokens:,} tokens, ~${totals['cost']:.3f}{vs}"}))
+
+
+def handle_posttool(payload, cfg):
+    """Stamp a finished foreground subagent's result with the model that actually ran."""
+    if not _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
+        return
+    path, meta = ledger.find_subagent(payload.get("transcript_path"), payload.get("tool_use_id"))
+    if not path or meta.get("requestShape") == "background":
+        return  # background agents are stamped at SubagentStop, once they have actually run
+    messages = ledger.transcript_usage(path)
+    if not messages:
+        return
+    launch = ledger.find_decision(cfg, payload.get("tool_use_id")) or {}
+    session_model = launch.get("session_model") or ledger.last_model(payload.get("transcript_path"))
+    baseline = ledger.tier_of(session_model)
+    totals = ledger.summarize_usage(messages, baseline, ledger.price_table(cfg))
+    model = max(totals["models"], key=totals["models"].get)
+    line = ledger.stamp_text(meta.get("agentType"), model, totals, baseline)
+    print(json.dumps({"systemMessage": line,
+                      "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": line}}))
 
 
 def agent_calls(script):
@@ -452,8 +492,8 @@ def handle_workflow(payload, mode, cfg):
     msg = (f"model-picker: {missing} of {len(calls)} agent() calls in this workflow set no `model`. "
            "Pass {model: 'haiku'} for search/read/summarize steps, 'sonnet' for scoped edits or review, "
            "'opus' for judgment, 'fable' only for the lead on major work.")
-    if cfg.get("MODEL_PICKER_LOCAL_HINT"):
-        msg += f" For tool-free text steps, use the local model: {cfg['MODEL_PICKER_LOCAL_HINT']}."
+    if local_hint(cfg):
+        msg += f" For tool-free text steps, use the local model: {local_hint(cfg)}."
     if mode == "enforce":
         emit("deny", msg + " Add the model options and re-run.")
     else:
@@ -471,9 +511,16 @@ def handle_session(root, cfg):
     if not m:
         return
     context = m.group(0)
-    if cfg.get("MODEL_PICKER_LOCAL_HINT"):
+    if local_hint(cfg):
         context += ("\nLocal tier enabled: for pure text work that needs no tools or files (summarize, classify, "
-                    f"extract, translate given text), use the local model: {cfg['MODEL_PICKER_LOCAL_HINT']}.")
+                    f"extract, translate given text), use the local model: {local_hint(cfg)}. Check its output: "
+                    "small local models are fine for simple transformation, weak at anything else.")
+    if _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
+        context += ("\nModel stamps are on: subagent results carry a `[model-picker] ... ran on <model>` line taken "
+                    "from the transcript. When you report what a subagent or ask_local produced, name that model.")
+    if _enabled(cfg, "MODEL_PICKER_STAMP_REPLIES", default=False):
+        context += ("\nEnd every reply with one line naming the model you are running on, e.g. `— claude-opus-5-5`, "
+                    "using the model id stated in your system prompt.")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
 
 
@@ -507,6 +554,10 @@ def main():
     payload = json.loads(raw or "{}")
     if event == "subagentstop":
         handle_subagent_stop(payload, cfg)
+        return
+    if event == "posttool":
+        if payload.get("tool_name") in ("Agent", "Task"):
+            handle_posttool(payload, cfg)
         return
     tool = payload.get("tool_name")
     if tool in ("Agent", "Task"):

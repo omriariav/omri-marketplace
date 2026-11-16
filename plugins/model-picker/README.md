@@ -2,6 +2,13 @@
 
 Applies Anthropic's [Which Claude model should you build with?](https://claude.dev/blog/which-claude-model-should-you-build-with/) guidance (Nov 2026) to every session and every agent launch. Optionally hands the choice to a decisions API and adds a local-model tier.
 
+## Install
+
+```bash
+claude plugin marketplace add omriariav/omri-marketplace
+claude plugin install model-picker@omri-marketplace
+```
+
 ## What it does
 
 | Component | Behavior |
@@ -13,6 +20,8 @@ Applies Anthropic's [Which Claude model should you build with?](https://claude.d
 | `hooks/model_picker.py route "<task>"` | CLI: prints the recommendation as JSON. |
 | `model-picker:scout` agent | Haiku read-only scout for search, logs, and test output. |
 | SubagentStop hook | Records each finished subagent's tokens, model, cost, and the cost at the session model. |
+| PostToolUse hook on `Agent` | With `MODEL_PICKER_STAMP=1`, stamps each subagent result with the model that actually ran, its tokens, and cost. |
+| `ask_local` MCP tool | Runs tool-free text work on a local Ollama model at $0, stamped and logged. |
 | `/model-picker:report [period]` | Launches, model mix, follow rate, router stats, spend by model, estimated saving. |
 
 ## Settings
@@ -39,6 +48,12 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_STATE_DIR` | Where the ledger lives | `~/.config/model-picker` |
 | `MODEL_PICKER_VERBOSE` | `1` shows a one-line note per launch and per finished subagent | `0` |
 | `MODEL_PICKER_PRICES` | JSON price overrides per tier, $ per million tokens | built-in list prices |
+| `MODEL_PICKER_STAMP` | `1` stamps subagent results with the model that actually ran | `0` |
+| `MODEL_PICKER_STAMP_REPLIES` | `1` asks Claude to end every reply with its model id | `0` |
+| `MODEL_PICKER_OLLAMA_MODEL` | Ollama model for `ask_local`; also turns on the `local` tier | unset |
+| `MODEL_PICKER_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
+| `MODEL_PICKER_OLLAMA_TIMEOUT` | Seconds per `ask_local` call | `120` |
+| `MODEL_PICKER_OLLAMA` | `0` hides the `ask_local` tools | `1` |
 
 API keys are read from the environment or `API_KEY_CMD`, never from the config file.
 
@@ -109,8 +124,29 @@ model-picker: model-picker:scout on haiku → recommends haiku/medium (jev-lates
 model-picker: model-picker:scout on claude-haiku-5-5 used 247,607 tokens, ~$0.009 vs ~$0.337 on opus
 ```
 
+## Model stamps
+
+Asking a model which model it is gives unreliable answers, and behind a gateway it is simply wrong. With `MODEL_PICKER_STAMP=1`, the model name comes from the transcript instead: the API response records exactly which model answered.
+
+- **Foreground subagents:** when the `Agent` call returns, a line like this is shown to you and added to Claude's context, and Claude is told to name that model when it reports the result:
+  `[model-picker] web-fetch ran on claude-haiku-5-5 · 13K tokens · ~$0.001 (~$0.055 on opus)`
+- **Background subagents:** their `Agent` call returns at launch, so they are stamped when they finish (SubagentStop). Each subagent is stamped exactly once.
+- **`ask_local` answers** end with `[model-picker] answered by ollama:<model> · N in / M out tokens · $0 · Xs`.
+- **Replies (opt-in):** `MODEL_PICKER_STAMP_REPLIES=1` asks Claude to end every reply with its model id, taken from its system prompt. Off by default because it adds a line to every reply.
+
 ## Local models
 
-Claude Code sends every request to one Anthropic-format endpoint, so a local model is reached either through a gateway that routes by model name (set `ANTHROPIC_BASE_URL` to the gateway and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to the local model's name, so `model: haiku` runs locally) or through an MCP tool that wraps the local server. Set `MODEL_PICKER_LOCAL_HINT` to describe whichever you use. The plugin then recommends `local` only for pure text work that needs no tools or files (summarize, classify, extract, translate given text); search and file work stay on Haiku, since local models are weak at tool use.
+### Bundled Ollama tool (`ask_local`)
+
+The plugin ships a small stdlib MCP server (`mcp/local_server.py`) with two tools: `ask_local(prompt, system?, max_tokens?, model?)` and `list_local_models()`. Set `MODEL_PICKER_OLLAMA_MODEL` (for example `qwen2.5:7b-instruct`) and:
+
+- the `local` tier turns on, and model-picker recommends calling `ask_local` directly, instead of launching an agent, for tool-free text work (summarize, classify, extract, translate, rephrase text you pass in);
+- each call is logged to the ledger (model, token counts, seconds; never the prompt or answer) and shows up in `/model-picker:report` with what it would have cost at Haiku prices.
+
+Without a configured model the tools still list but return a clear error naming the installed models; with Ollama stopped they return "not reachable" instead of failing. `MODEL_PICKER_OLLAMA=0` hides them. Small local models are fine for simple transformation and weak at reasoning or long structured writing, so check what they return.
+
+### Other routes
+
+Claude Code sends every request to one Anthropic-format endpoint, so beyond `ask_local` a local model is reached either through a gateway that routes by model name (set `ANTHROPIC_BASE_URL` to the gateway and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to the local model's name, so `model: haiku` runs locally) or through an MCP tool that wraps the local server. Set `MODEL_PICKER_LOCAL_HINT` to describe whichever you use. The plugin then recommends `local` only for pure text work that needs no tools or files (summarize, classify, extract, translate given text); search and file work stay on Haiku, since local models are weak at tool use.
 
 Tests: `python3 plugins/model-picker/tests/test_model_picker.py`. Requires `python3` (stdlib only); hooks exit silently without it.

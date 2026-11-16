@@ -1,5 +1,5 @@
 {
-  "description": "model-picker: injects model-selection rules at SessionStart, checks Agent/Workflow launches for an explicit, task-appropriate model, and records decisions and subagent usage in a local ledger.",
+  "description": "model-picker: injects model-selection rules at SessionStart, checks Agent/Workflow launches for an explicit, task-appropriate model, and records decisions and subagent usage in a local ledger, and stamps subagent results with the model that actually ran.",
   "hooks": {
     "SessionStart": [
       {
@@ -30,6 +30,18 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" subagentstop",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" posttool",
             "timeout": 10
           }
         ]

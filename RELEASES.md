@@ -1,5 +1,14 @@
 # Releases
 
+## model-picker v0.4.4 (2026-11-16)
+
+Fix: stamps for background agents never reached anyone. Claude Code runs most agents in the background, and their stamp was only a SubagentStop `systemMessage`, which Claude never receives and the user didn't see.
+
+- Background stamps are now queued when the agent finishes and delivered on the session's next turn through a new UserPromptSubmit hook, which also fires when the agent's result notification arrives. Claude gets the stamp next to the agent's report, with a rule to name that model.
+- Delivered once per session; a resumed agent's newer stamp is delivered again. Off unless `MODEL_PICKER_STAMP=1`.
+- Smoke-tested in a real headless session: a background Haiku agent's stamp was quoted verbatim by Claude when its result arrived.
+- Tests: 168.
+
 ## model-picker v0.4.3 (2026-11-16)
 
 Fix: `/model-picker:report` output rendered as one run-together paragraph in Markdown views. The summary is now a bullet list with a bold title, blank lines around the table, and the not-credited breakdown nested under the credited saving. Tests: 162.

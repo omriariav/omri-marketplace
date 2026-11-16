@@ -39,6 +39,7 @@ def _raises(fn):
 
 
 def check(name, cond):
+    cond = bool(cond)
     print(("ok   " if cond else "FAIL ") + name)
     return cond
 
@@ -485,7 +486,9 @@ with tempfile.TemporaryDirectory() as d:
     bg = hook("subagentstop", {"agent_id": "bg", "transcript_path": str(sess)}, on)
     fgstop = hook("subagentstop", {"agent_id": "fg", "transcript_path": str(sess)}, on)
     results += [
-        check("stamp: background stamped at SubagentStop", bg and "ran on claude-haiku-5-5" in bg["systemMessage"]),
+        check("stamp: background stamp queued at SubagentStop for the next turn",
+              any(r.get("kind") == "pending_stamp" and "ran on claude-haiku-5-5" in r.get("text", "")
+                  for r in ledger.read(on))),
         check("stamp: foreground not double-stamped at SubagentStop", fgstop is None),
     ]
     ctx = hook("session", {}, {"MODEL_PICKER_STAMP": "1", "MODEL_PICKER_STAMP_REPLIES": "1", **OL})
@@ -552,7 +555,8 @@ with tempfile.TemporaryDirectory() as d:
     pt_after = hook2("posttool", {"tool_name": "Agent", "tool_use_id": "toolu_un", "transcript_path": str(sess)})
     results += [
         check("stamp: unknown shape, unfinished -> not stamped at PostToolUse", pt_unfinished is None),
-        check("stamp: unknown shape -> stamped once at SubagentStop", stop and "ran on claude-haiku-5-5" in stop["systemMessage"]),
+        check("stamp: unknown shape -> stamp queued once at SubagentStop",
+              sum(1 for r in ledger.read(on) if r.get("kind") == "pending_stamp") == 1),
         check("stamp: later PostToolUse gives Claude the stamp without repeating it to the user",
               pt_after and "additionalContext" in pt_after["hookSpecificOutput"] and "systemMessage" not in pt_after),
         check("stamp: missing meta never crashes PostToolUse",
@@ -757,6 +761,44 @@ results += [
     check("report markdown: attribution nested under the credited bullet",
           any(ln.startswith("  - Not credited") for ln in md)),
 ]
+
+# --- v0.4.4: background stamps delivered on the next turn ------------------------------
+def hookrun(event, payload, env):
+    r = subprocess.run([sys.executable, "-I", str(HOOK), event, str(ROOT)], input=json.dumps(payload),
+                       capture_output=True, text=True, env={**os.environ, **env})
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sd = Path(d) / "sess" / "subagents"
+    write_transcript(sd / "agent-bg1.jsonl", [amsg("b1", "claude-haiku-5-5", inp=1000, out=50)])
+    (sd / "agent-bg1.meta.json").write_text(json.dumps({"agentType": "scout", "toolUseId": "t_bg1",
+                                                        "requestShape": "background"}))
+    on = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+    hookrun("subagentstop", {"session_id": "S1", "agent_id": "bg1", "transcript_path": str(sess)}, on)
+    other = hookrun("prompt", {"session_id": "S2"}, on)
+    first = hookrun("prompt", {"session_id": "S1"}, on)
+    again = hookrun("prompt", {"session_id": "S1"}, on)
+    ctx = (first or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+    results += [
+        check("bg stamp: not delivered to another session", other is None),
+        check("bg stamp: delivered to Claude on the next turn",
+              "ran on claude-haiku-5-5" in ctx and "name its model" in ctx and first.get("systemMessage")),
+        check("bg stamp: delivered once", again is None),
+    ]
+    # Resumed agent stops again with more work: the newer stamp is delivered once more.
+    write_transcript(sd / "agent-bg1.jsonl", [amsg("b1", "claude-haiku-5-5", inp=1000, out=50),
+                                              amsg("b2", "claude-haiku-5-5", inp=5000, out=500)])
+    time.sleep(0.01)
+    hookrun("subagentstop", {"session_id": "S1", "agent_id": "bg1", "transcript_path": str(sess)}, on)
+    resumed = hookrun("prompt", {"session_id": "S1"}, on)
+    results.append(check("bg stamp: resumed agent's newer stamp delivered",
+                         resumed and "ran on claude-haiku-5-5" in resumed["hookSpecificOutput"]["additionalContext"]))
+    results.append(check("bg stamp: off when STAMP is off", hookrun("prompt", {"session_id": "S1"}, fresh_state()) is None))
+    sess_ctx = hookrun("session", {}, {"MODEL_PICKER_STAMP": "1"})["hookSpecificOutput"]["additionalContext"]
+    results.append(check("session rules describe next-turn delivery", "arrives with your next turn" in sess_ctx))
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

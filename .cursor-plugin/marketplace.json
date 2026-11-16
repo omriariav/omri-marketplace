@@ -178,7 +178,7 @@
       "name": "model-picker",
       "source": "plugins/model-picker",
       "description": "Picks the right Claude model per Anthropic's Nov 2026 guidance: injects model/effort rules at session start, checks Agent/team/Workflow launches for an explicit task-appropriate model, and gives per-request recommendations.",
-      "version": "0.4.3",
+      "version": "0.4.4",
       "author": {
         "name": "Omri Ariav",
         "email": "omri.ariav@gmail.com"

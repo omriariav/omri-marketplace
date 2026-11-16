@@ -526,8 +526,13 @@ def handle_subagent_stop(payload, cfg):
     # Foreground agents are stamped at PostToolUse (where Claude also sees it). Everything else
     # (background, or a meta with no requestShape) is stamped here, once, to the user.
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and meta.get("requestShape") != "foreground":
-        print(json.dumps({"systemMessage": ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)}))
+        line = ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)
         ledger.append(cfg, {"kind": "stamp", "agent_id": payload.get("agent_id"), "tool_use_id": meta.get("toolUseId")})
+        # A SubagentStop systemMessage reaches neither Claude nor (reliably) the user, so queue the stamp:
+        # the session's next turn (UserPromptSubmit, which also fires when the agent's result notification
+        # arrives) delivers it next to the agent's report.
+        ledger.append(cfg, {"kind": "pending_stamp", "session": payload.get("session_id"),
+                            "agent_id": payload.get("agent_id"), "text": line})
     elif _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
         tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
         vs = f" vs ~${totals['baseline_cost']:.3f} on {baseline}" if baseline and totals["saving"] else ""
@@ -560,6 +565,35 @@ def handle_posttool(payload, cfg):
         out["systemMessage"] = line
         ledger.append(cfg, {"kind": "stamp", "tool_use_id": payload.get("tool_use_id")})
     print(json.dumps(out))
+
+
+def handle_prompt(payload, cfg):
+    """UserPromptSubmit: deliver stamps of background agents that finished since the last turn."""
+    if not _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
+        return
+    session = payload.get("session_id")
+    if not session:
+        return
+    recent = ledger.read(cfg, time.time() - 86400)
+    pending = {}
+    for r in recent:  # a resumed agent stops more than once: keep only its latest stamp
+        if r.get("kind") == "pending_stamp" and r.get("session") == session and r.get("text"):
+            pending[r.get("agent_id")] = r
+    # Re-deliver a resumed agent's newer stamp; skip ones already delivered at or after their time.
+    last_delivery = {}
+    for r in recent:
+        if r.get("kind") == "stamp_delivered" and r.get("session") == session:
+            last_delivery[r.get("agent_id")] = r.get("ts", 0)
+    fresh = [r for a, r in pending.items() if r.get("ts", 0) > last_delivery.get(a, -1)]
+    if not fresh:
+        return
+    for r in fresh:
+        ledger.append(cfg, {"kind": "stamp_delivered", "session": session, "agent_id": r.get("agent_id")})
+    lines = [r["text"] for r in fresh]
+    context = ("Background agents finished since your last turn. Their actual models, from the transcripts:\n"
+               + "\n".join(lines) + "\nWhen you report what one of them produced, name its model.")
+    print(json.dumps({"systemMessage": "\n".join(lines),
+                      "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
 
 
 def agent_calls(script):
@@ -637,8 +671,9 @@ def handle_session(root, cfg):
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
         context += ("\nModel stamps are on: foreground subagent results and ask_local answers carry a "
                     "`[model-picker] ... ran on <model>` line taken from the transcript; name that model when you "
-                    "report what they produced. Background agents are stamped to the user only when they finish: "
-                    "if asked which model a background agent used, point to /model-picker:report rather than guess.")
+                    "report what they produced. Background agents are stamped when they finish: the stamp arrives with your "
+                    "next turn (usually alongside the agent's result); name that model when you report it, and never guess "
+                    "a model that has no stamp (point to /model-picker:report instead).")
     if _enabled(cfg, "MODEL_PICKER_STAMP_REPLIES", default=False):
         context += ("\nEnd every reply with one line naming the model you are running on, e.g. `— claude-opus-5-5`, "
                     "using the model id stated in your system prompt.")
@@ -679,6 +714,9 @@ def main():
     if event == "posttool":
         if payload.get("tool_name") in ("Agent", "Task"):
             handle_posttool(payload, cfg)
+        return
+    if event == "prompt":
+        handle_prompt(payload, cfg)
         return
     tool = payload.get("tool_name")
     if tool in ("Agent", "Task"):

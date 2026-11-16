@@ -21,8 +21,13 @@ Claude Code loads these rules at session start through the plugin hook; other ag
 First run the router (it uses the configured decision API, or the keyword heuristic):
 
 ```bash
-python3 <this skill's directory>/../../hooks/model_picker.py route "<the task, one or two sentences>"
+python3 <this skill's directory>/../../hooks/model_picker.py route <<'TASK'
+<the task, one or two sentences>
+TASK
 ```
+
+Always pass the task on stdin with the quoted `'TASK'` delimiter, never as a shell argument, so quotes,
+`$`, and backticks in the task are not expanded.
 
 It prints JSON with `tier`, `effort`, `reason`, and `source`. Treat it as a strong prior, not a
 verdict: override it only when the guide clearly disagrees, and say so in `Why`. If the command

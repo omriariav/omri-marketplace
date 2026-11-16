@@ -36,9 +36,23 @@ def _post(url, body, headers, timeout):
         return json.loads(resp.read().decode())
 
 
+def _confidence(answer, choice):
+    """Answer confidence; else the chosen option's probability; else 1.0 (the provider gave no score)."""
+    if isinstance(answer.get("confidence"), (int, float)):
+        return float(answer["confidence"])
+    probs = answer.get("probabilities")
+    if isinstance(probs, dict) and isinstance(probs.get(choice), (int, float)):
+        return float(probs[choice])
+    if isinstance(probs, list):
+        for p in probs:
+            if isinstance(p, dict) and p.get("value") == choice and isinstance(p.get("probability"), (int, float)):
+                return float(p["probability"])
+    return 1.0
+
+
 def _result(tier, tier_conf, effort, source):
     return {"tier": tier, "effort": effort if effort in EFFORTS else "medium",
-            "confidence": float(tier_conf or 0), "source": source}
+            "confidence": float(tier_conf), "source": source}
 
 
 def openai_decisions(task, tiers, cfg):
@@ -63,7 +77,7 @@ def openai_decisions(task, tiers, cfg):
     tier = answers.get("tier", {})
     if tier.get("type") != "choice" or tier.get("choice") not in tiers:
         raise ValueError(f"no usable tier answer ({tier.get('type')})")
-    return _result(tier["choice"], tier.get("confidence"), answers.get("effort", {}).get("choice"),
+    return _result(tier["choice"], _confidence(tier, tier["choice"]), answers.get("effort", {}).get("choice"),
                    f"openai-decisions:{model}")
 
 
@@ -86,7 +100,7 @@ def google_decisions(task, tiers, cfg):
     tier = answers.get("tier") or {}
     if tier.get("choice") not in tiers:
         raise ValueError("no usable tier answer")
-    return _result(tier["choice"], tier.get("confidence"), (answers.get("effort") or {}).get("choice"),
+    return _result(tier["choice"], _confidence(tier, tier["choice"]), (answers.get("effort") or {}).get("choice"),
                    f"google-decisions:{model}")
 
 
@@ -101,7 +115,7 @@ def command(task, tiers, cfg):
     data = json.loads(out)
     if data.get("tier") not in tiers:
         raise ValueError(f"command returned tier {data.get('tier')!r}")
-    return _result(data["tier"], data.get("confidence", 1.0), data.get("effort"), "command")
+    return _result(data["tier"], _confidence(data, data["tier"]), data.get("effort"), "command")
 
 
 ROUTERS = {"openai-decisions": openai_decisions, "google-decisions": google_decisions, "command": command}

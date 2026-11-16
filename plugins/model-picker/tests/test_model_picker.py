@@ -8,13 +8,16 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+os.environ["MODEL_PICKER_CONFIG"] = "/nonexistent/model-picker.json"  # never read the real config
 HOOK = ROOT / "hooks" / "model_picker.py"
 sys.path.insert(0, str(ROOT / "hooks"))
 import model_picker as mp  # noqa: E402
+import routers  # noqa: E402
 
 
 def run(payload, mode="advise", env=None):
-    e = {**os.environ, "MODEL_PICKER_MODE": mode, **(env or {})}
+    e = {k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")}
+    e.update({"MODEL_PICKER_CONFIG": "/nonexistent/model-picker.json", "MODEL_PICKER_MODE": mode, **(env or {})})
     out = subprocess.run([sys.executable, "-I", str(HOOK), "pretool", str(ROOT)],
                          input=json.dumps(payload), capture_output=True, text=True, env=e).stdout
     return json.loads(out) if out.strip() else None
@@ -86,6 +89,21 @@ results += [
           "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify this ticket text"),
                                                  "enforce", LOCAL))),
 ]
+
+# --- review round 2 regressions -------------------------------------------------
+results += [
+    check("local: Plan stays opus", mp.recommend("extract requirements and summarize the design", "Plan", True)[0] == "opus"),
+    check("local: Explore stays haiku", mp.recommend("classify the error categories", "Explore", True)[0] == "haiku"),
+    check("local: rewrite parser not local", mp.recommend("Rewrite the parser module for speed", local=True)[0] != "local"),
+    check("local: tag release not local", mp.recommend("tag the v1.2 release", local=True)[0] != "local"),
+    check("empty description sends no prompt",
+          "SSN" not in mp.task_text({"prompt": "Customer SSN list"}, {})),
+    check("config 0 respected", mp._num({"K": 0}, "K", 0.5) == 0.0),
+    check("INJECT false disables", not mp._enabled({"MODEL_PICKER_INJECT": False}, "MODEL_PICKER_INJECT")),
+    check("missing confidence -> probability", routers._confidence({"probabilities": {"opus": 0.7}}, "opus") == 0.7),
+    check("missing confidence and probs -> 1.0", routers._confidence({}, "opus") == 1.0),
+]
+import routers as routers  # noqa: E402,F811
 
 # --- external routers (mock server) -------------------------------------------
 import threading  # noqa: E402
@@ -164,6 +182,13 @@ with tempfile.TemporaryDirectory() as d:
     results.append(check("config file read; env overrides file",
                          out and "google-decisions" in json.dumps(out)
                          and "permissionDecision" not in out["hookSpecificOutput"]))
+SEEN.clear()
+run(agent(description="d", prompt="find x", model="opus"), "advise", OA)
+results.append(check("explicit model: router not called", not SEEN))
+mp.ROUTER_DEADLINE = 0.2
+slow = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "sleep 2; echo '{}'"}
+results.append(check("router hard deadline -> heuristic", "timed out" in
+                     mp.decide({"description": "find x"}, {**slow, "MODEL_PICKER_ROUTER_TIMEOUT": 5})["source"]))
 srv.shutdown()
 
 print(f"\n{sum(results)}/{len(results)} passed")

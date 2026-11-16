@@ -72,6 +72,7 @@ All marketplace entries have native manifests on all four runtimes. Component be
 | `copy` commands | Native commands + skills | Native skills | Native commands + skills | Native commands + skills |
 | `coacher` frame | Session-start hook + skill | Manual skill | Session-start hook + skill | Always-on rule + skill |
 | `natbag` snapshot | Hook + invocation fallback | Invocation fallback | Hook + invocation fallback | Invocation fallback |
+| `model-picker` rules + launch checks | Session-start + PreToolUse hooks + skill | Manual skill | Manual skill | Manual skill |
 
 `setup-pulse` and `claude-reviewer` can be invoked from every runtime, but their purpose remains configuring or reviewing Claude Code.
 
@@ -322,6 +323,18 @@ Primes Claude with a peer-collaborator stance at SessionStart (based on Amanda A
 | `/coacher:rant <text>` | Vent raw frustration → Claude extracts the intent and acts on it |
 
 Requires `python3` (stdlib only). The hook degrades gracefully — if python3 is missing or the frame is empty, it exits cleanly with no failure.
+
+### `model-picker` - Right Model for Every Agent Launch
+
+Applies Anthropic's [Which Claude model should you build with?](https://claude.dev/blog/which-claude-model-should-you-build-with/) guidance. A SessionStart hook injects the model/effort rules from `guide.md`; a PreToolUse hook checks every `Agent` (subagents and teammates) and `Workflow` launch for an explicit, task-appropriate `model`.
+
+| Entry point | Description |
+|-------------|-------------|
+| `/model-picker:model-picker <task>` | Per-request recommendation: model, effort, why, optional split |
+| `/model-picker:model-picker` | Load the rules manually (Codex, Grok, Cursor) |
+| `model-picker:scout` agent | Haiku read-only scout for search, logs, and test output |
+
+Set `MODEL_PICKER_MODE` in `settings.json` `env`: `advise` (default, note only), `enforce` (deny launches without a model), `auto` (fill in the recommended model), or `off`. `MODEL_PICKER_INJECT=0` skips the session-start injection. Requires `python3`; hooks exit silently without it.
 
 ## Other Commands
 

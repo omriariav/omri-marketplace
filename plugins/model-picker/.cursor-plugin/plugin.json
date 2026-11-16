@@ -1,0 +1,12 @@
+{
+  "name": "model-picker",
+  "version": "0.1.0",
+  "description": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort selection rules at session start and checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model.",
+  "author": {
+    "name": "Omri Ariav",
+    "email": "omri.ariav@gmail.com"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "hooks": "./.cursor-plugin/hooks.json"
+}

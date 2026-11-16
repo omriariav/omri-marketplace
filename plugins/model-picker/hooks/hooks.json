@@ -1,0 +1,28 @@
+{
+  "description": "model-picker: injects model-selection rules at SessionStart and checks Agent/Workflow launches for an explicit, task-appropriate model.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/run.sh session",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task|Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/run.sh pretool",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

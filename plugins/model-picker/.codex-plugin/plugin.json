@@ -1,0 +1,39 @@
+{
+  "name": "model-picker",
+  "version": "0.1.0",
+  "description": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort selection rules at session start and checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model.",
+  "author": {
+    "name": "Omri Ariav",
+    "email": "omri.ariav@gmail.com"
+  },
+  "homepage": "https://github.com/omriariav/omri-marketplace/tree/main/plugins/model-picker",
+  "repository": "https://github.com/omriariav/omri-marketplace",
+  "license": "MIT",
+  "keywords": [
+    "model",
+    "subagents",
+    "agents",
+    "effort",
+    "cost",
+    "haiku",
+    "sonnet",
+    "opus",
+    "fable"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Model Picker",
+    "shortDescription": "Pick the right Claude model and effort for each task and agent.",
+    "longDescription": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort selection rules at session start and checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model.",
+    "developerName": "Omri Ariav",
+    "category": "Utilities",
+    "capabilities": [
+      "Skills"
+    ],
+    "websiteURL": "https://github.com/omriariav/omri-marketplace/tree/main/plugins/model-picker",
+    "defaultPrompt": [
+      "Which model should I use for this task?"
+    ],
+    "brandColor": "#111827"
+  }
+}

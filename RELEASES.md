@@ -1,5 +1,16 @@
 # Releases
 
+## model-picker v0.2.0 (2026-11-16)
+
+Decisions-API routing and a local-model tier.
+
+- `MODEL_PICKER_ROUTER`: `openai-decisions` ([OpenAI](https://developers.openai.com/api/docs/guides/decisions), or any LiteLLM gateway serving `/v1/decisions`, which covers [TypeSafe Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev)), `google-decisions` ([Gemini](https://aistudio.google.com/docs/decisions-api)), or `command` (any executable). Each asks for a tier and an effort level; low confidence or any error falls back to the keyword heuristic and never blocks a launch. Recommendations now include effort and the source that decided.
+- Privacy default: only the agent's short description is sent (`MODEL_PICKER_ROUTER_INPUT=description`); `brief`/`full` are opt-in. Extra headers and request metadata are configurable for gateway attribution and redaction.
+- `MODEL_PICKER_LOCAL_HINT` adds a `local` tier for pure text work that needs no tools or files.
+- Settings can live in `~/.config/model-picker/config.json` (environment wins); API keys only from the environment or `MODEL_PICKER_ROUTER_API_KEY_CMD`.
+- `hooks/model_picker.py route "<task>"` CLI; the skill uses it for per-request recommendations.
+- Agent hook timeout raised to 10 s to fit a router call (router timeout defaults to 3 s).
+
 ## model-picker v0.1.0 (2026-11-16)
 
 New plugin: applies Anthropic's [Which Claude model should you build with?](https://claude.dev/blog/which-claude-model-should-you-build-with/) guidance (2026-11-09).

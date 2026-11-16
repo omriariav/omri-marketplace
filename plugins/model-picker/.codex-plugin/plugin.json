@@ -1,7 +1,7 @@
 {
   "name": "model-picker",
-  "version": "0.1.0",
-  "description": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort selection rules at session start and checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model.",
+  "version": "0.2.0",
+  "description": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort rules at session start, checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model, and can delegate the choice to a decisions API (OpenAI, Google, any LiteLLM gateway, or a custom command) with an optional local-model tier.",
   "author": {
     "name": "Omri Ariav",
     "email": "omri.ariav@gmail.com"
@@ -24,7 +24,7 @@
   "interface": {
     "displayName": "Model Picker",
     "shortDescription": "Pick the right Claude model and effort for each task and agent.",
-    "longDescription": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort selection rules at session start and checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model.",
+    "longDescription": "Applies Anthropic's 'Which Claude model should you build with?' guidance: injects model/effort rules at session start, checks every Agent, team-member, and Workflow launch for an explicit, task-appropriate model, and can delegate the choice to a decisions API (OpenAI, Google, any LiteLLM gateway, or a custom command) with an optional local-model tier.",
     "developerName": "Omri Ariav",
     "category": "Utilities",
     "capabilities": [

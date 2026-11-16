@@ -1,5 +1,18 @@
 # Releases
 
+## model-picker v0.4.2 (2026-11-16)
+
+Fixes from a post-release review of v0.4.1's `MODEL_PICKER_TIERS`.
+
+- A missing tier now goes to the next *stronger* available tier, keeping effort; stepping down at high effort only happens when nothing stronger exists (e.g. Fable not enabled → Opus high). Previously a missing Sonnet went to Haiku.
+- The local tier is only advertised (session rules, workflow advice, recommendations) when `local` is in the allowed tiers.
+- Workflow advice lists only available tiers instead of always naming Fable.
+- `enforce` mode now also denies an explicit launch on an unavailable model; agents pinned to an unavailable model get a note (deny in `enforce`) with the `model` to pass instead.
+- A `MODEL_PICKER_TIERS` value naming no Claude tier is ignored with a session warning instead of silently allowing every tier; non-string list items no longer crash the hook.
+- New opt-in `MODEL_PICKER_ROUTER_ON_EXPLICIT=1`: the router also judges launches that already set a model (about 0.7 s each), so the follow rate and credited savings reflect a real verdict instead of mostly "unjudged".
+- Pre-merge review fixes: session rules describe the step-up rule; a launch denied in `enforce` and retried counts once; a model name that merely contains "local" is not the local tier.
+- Tests: 159.
+
 ## model-picker v0.4.1 (2026-11-16)
 
 Respect the models an environment can actually launch.

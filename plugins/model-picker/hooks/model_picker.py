@@ -23,6 +23,7 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
   MODEL_PICKER_ROUTER_INPUT      description (default) | brief | full: what task text leaves the machine
   MODEL_PICKER_ROUTER_TIMEOUT    seconds (default 3)
   MODEL_PICKER_ROUTER_MIN_CONFIDENCE  below this the heuristic decides (default 0.5)
+  MODEL_PICKER_ROUTER_ON_EXPLICIT  0 (default) | 1   also ask the router about launches that set a model
   MODEL_PICKER_LOG               1 (default) | 0   local decision/usage ledger (see ledger.py)
   MODEL_PICKER_STATE_DIR         where the ledger lives (default ~/.config/model-picker)
   MODEL_PICKER_VERBOSE           0 (default) | 1   one-line note per launch and per finished subagent
@@ -188,8 +189,10 @@ def pinned_model(agent_type, cwd):
 
 
 def tier_of(model):
+    """Claude tier named in a model id/alias. "local" is never a launchable `model` value, so a
+    name that merely contains "local" (e.g. my-local-llama) is not treated as the local tier."""
     model = (model or "").lower()
-    for tier in TIERS:
+    for tier in CLAUDE_TIERS:
         if tier in model:
             return tier
     return None
@@ -275,23 +278,38 @@ CLAUDE_TIERS = ["haiku", "sonnet", "opus", "fable"]
 EFFORT_ORDER = ["low", "medium", "high"]
 
 
+def _tiers_and_warning(cfg):
+    local = bool(local_hint(cfg))
+    everything = [t for t in TIERS if local or t != "local"]
+    raw = cfg.get("MODEL_PICKER_TIERS")
+    if not raw:
+        return everything, None
+    items = raw if isinstance(raw, list) else str(raw).split(",")
+    wanted = {str(t).strip().lower() for t in items if str(t).strip()}
+    tiers = [t for t in TIERS if t in wanted and (t != "local" or local)]
+    if any(t in CLAUDE_TIERS for t in tiers):
+        return tiers, None
+    # Fail open (a launch must always have a model), but say so: a typo must not silently re-enable Fable.
+    return everything, (f"MODEL_PICKER_TIERS={raw!r} names no Claude tier (haiku, sonnet, opus, fable), so it is "
+                        "ignored and all tiers are allowed. Fix the setting if some models are not available.")
+
+
 def available_tiers(cfg):
     """Tiers this environment can actually launch, in TIERS order."""
-    local = bool(local_hint(cfg))
-    raw = cfg.get("MODEL_PICKER_TIERS")
-    if raw:
-        wanted = {t.strip().lower() for t in (raw if isinstance(raw, list) else str(raw).split(",")) if t.strip()}
-        tiers = [t for t in TIERS if t in wanted and (t != "local" or local)]
-        if any(t in CLAUDE_TIERS for t in tiers):
-            return tiers
-    return [t for t in TIERS if local or t != "local"]
+    return _tiers_and_warning(cfg)[0]
+
+
+def local_enabled(cfg):
+    return "local" in available_tiers(cfg)
 
 
 def fit_to_available(rec, cfg):
     """Move a recommendation to the nearest available tier.
 
-    Going down (e.g. Fable not enabled) raises effort to high, the guide's own advice: change
-    effort before changing models. Going up (a cheap tier is disabled) keeps the effort.
+    Prefer the next stronger available tier, keeping effort: a weaker model at high effort is a poor
+    stand-in for missing capability in the middle of the range. Only when nothing stronger exists
+    (e.g. Fable not enabled) step down, raising effort to high: the guide's "change effort before
+    changing models".
     """
     tiers = available_tiers(cfg)
     if rec["tier"] in tiers:
@@ -302,15 +320,15 @@ def fit_to_available(rec, cfg):
         note = "local tier not available here; cheapest available tier instead"
         effort = rec["effort"]
     else:
-        lower = [t for t in CLAUDE_TIERS[:CLAUDE_TIERS.index(want)] if t in tiers]
-        if lower:
-            target = lower[-1]
-            effort = "high"
-            note = f"{want} is not available here; {target} at high effort instead"
+        idx = CLAUDE_TIERS.index(want)
+        higher = [t for t in CLAUDE_TIERS[idx + 1:] if t in tiers]
+        lower = [t for t in CLAUDE_TIERS[:idx] if t in tiers]
+        if higher:
+            target, effort = higher[0], rec["effort"]
+            note = f"{want} is not available here; {target} instead"
         else:
-            target = next(t for t in CLAUDE_TIERS if t in tiers)
-            effort = rec["effort"]
-            note = f"{want} is not available here; nearest available tier instead"
+            target, effort = lower[-1], "high"
+            note = f"{want} is not available here; {target} at high effort instead"
     return {**rec, "tier": target, "effort": effort, "reason": f"{rec['reason']} ({note})", "capped_from": want}
 
 
@@ -321,7 +339,7 @@ def decide(inp, cfg, use_router=True):
 
 def _decide(inp, cfg, use_router=True):
     """Router first (if configured), heuristic fallback; may name a tier that is not available."""
-    local = bool(local_hint(cfg))
+    local = local_enabled(cfg)
     agent_type = str(inp.get("subagent_type") or "")
     text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name"))
     tier, why = recommend(text, agent_type, local)
@@ -427,21 +445,40 @@ def handle_agent(payload, mode, cfg):
     model = inp.get("model")
     pinned = pinned_model(agent_type, payload.get("cwd"))
     if pinned and not model:
-        log_decision(cfg, payload, inp, "pinned", chosen=pinned, pinned=pinned)
+        pinned_tier = tier_of(pinned)
+        unavailable = bool(pinned_tier) and pinned_tier not in available_tiers(cfg)
+        # A denied launch never ran: log it as "denied" so the retry isn't counted twice.
+        log_decision(cfg, payload, inp, "denied" if unavailable and mode == "enforce" else "pinned",
+                     chosen=pinned, pinned=pinned)
+        if unavailable:
+            alt = fit_to_available({"tier": pinned_tier, "effort": "medium", "reason": "pinned by the agent definition"},
+                                   cfg)
+            msg = (f"model-picker: `{label}` is pinned to {pinned} in its definition, which is not available in "
+                   f"this environment. Pass model: \"{alt['tier']}\" explicitly to override.")
+            emit("deny", msg) if mode == "enforce" else emit(context=msg)
         return  # the agent definition already pins a model
 
-    # An explicit model only needs a mismatch check: keep it local and instant (no router call).
-    rec = decide(inp, cfg, use_router=not model)
+    # An explicit model is judged by the keyword heuristic (instant) unless MODEL_PICKER_ROUTER_ON_EXPLICIT
+    # asks the router to judge it too: ~0.7s per launch, but every launch gets a real verdict.
+    chosen_unavailable = bool(model) and bool(tier_of(model)) and tier_of(model) not in available_tiers(cfg)
+    # No router round trip for a launch that is about to be redirected anyway.
+    rec = decide(inp, cfg, use_router=not chosen_unavailable and (
+        not model or _enabled(cfg, "MODEL_PICKER_ROUTER_ON_EXPLICIT", default=False)))
     session_model = ledger.last_model(payload.get("transcript_path"))
-    outcome = "explicit" if model else ("denied" if mode == "enforce" else "missing")
+    outcome = ("denied" if mode == "enforce" and (not model or chosen_unavailable)
+               else "explicit" if model else "missing")
     log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,
                  pinned=pinned)
     note = verbose_note(cfg, label, model, rec)
     if model:
         chosen = tier_of(model)
         if chosen and chosen not in available_tiers(cfg):
-            emit(context=f"model-picker: `{label}` was launched on {chosen}, which is not available in this "
-                         f"environment (MODEL_PICKER_TIERS). Use {describe(rec, cfg)} instead.", system=note)
+            msg = (f"model-picker: `{label}` was launched on {chosen}, which is not available in this "
+                   f"environment (MODEL_PICKER_TIERS). Use {describe(rec, cfg)} instead.")
+            if mode == "enforce":
+                emit("deny", msg + " Re-issue the call with an available model.", system=note)
+            else:
+                emit(context=msg, system=note)
             return
         if chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
             emit(context=f"model-picker: `{label}` launched on {chosen}, but the task reads as "
@@ -559,10 +596,13 @@ def handle_workflow(payload, mode, cfg):
     missing = sum(1 for args in calls if not re.search(r"\bmodel\s*:", strip_strings(args)))
     if not missing:
         return
+    roles = {"haiku": "search/read/summarize steps", "sonnet": "scoped edits or review",
+             "opus": "judgment", "fable": "only the lead on major work"}
+    tiers = available_tiers(cfg)
+    advice = ", ".join(f"'{t}' for {r}" for t, r in roles.items() if t in tiers)
     msg = (f"model-picker: {missing} of {len(calls)} agent() calls in this workflow set no `model`. "
-           "Pass {model: 'haiku'} for search/read/summarize steps, 'sonnet' for scoped edits or review, "
-           "'opus' for judgment, 'fable' only for the lead on major work.")
-    if local_hint(cfg):
+           f"Pass {{model: ...}} using the available tiers: {advice}.")
+    if local_enabled(cfg):
         msg += f" For tool-free text steps, use the local model: {local_hint(cfg)}."
     if mode == "enforce":
         emit("deny", msg + " Add the model options and re-run.")
@@ -581,7 +621,10 @@ def handle_session(root, cfg):
     if not m:
         return
     context = m.group(0)
-    if local_hint(cfg):
+    _, tiers_warning = _tiers_and_warning(cfg)
+    if tiers_warning:
+        context += f"\nmodel-picker warning: {tiers_warning}"
+    if local_enabled(cfg):
         context += ("\nLocal tier enabled: for pure text work that needs no tools or files (summarize, classify, "
                     f"extract, translate text you paste into the prompt itself), use the local model: {local_hint(cfg)}. "
                     "It cannot open files, URLs, PRs or tickets. Check its output: "
@@ -589,8 +632,8 @@ def handle_session(root, cfg):
     missing = [t for t in CLAUDE_TIERS if t not in available_tiers(cfg)]
     if missing:
         context += (f"\nNot available in this environment: {', '.join(missing)}. Never launch an agent on those; "
-                    "for work the rules assign to them, use the nearest available tier, raising effort when going down "
-                    "(Fable-level work: opus at high effort).")
+                    "for work the rules assign to them, use the next stronger available tier at the same effort; step down "
+                    "only when nothing stronger exists, raising effort to high (Fable-level work: opus at high effort).")
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False):
         context += ("\nModel stamps are on: foreground subagent results and ask_local answers carry a "
                     "`[model-picker] ... ran on <model>` line taken from the transcript; name that model when you "

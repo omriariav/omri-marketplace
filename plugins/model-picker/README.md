@@ -44,6 +44,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_ROUTER_INPUT` | What task text leaves the machine: `description` (agent's short description), `brief` (+ first 500 prompt chars), `full` (+ up to 8000) | `description` |
 | `MODEL_PICKER_ROUTER_TIMEOUT` | Seconds | `3` |
 | `MODEL_PICKER_ROUTER_MIN_CONFIDENCE` | Below this, the heuristic decides | `0.5` |
+| `MODEL_PICKER_ROUTER_ON_EXPLICIT` | `1` also asks the router about launches that already set a model, so every launch gets a real verdict (follow rate and credited savings depend on it). Costs one router call (~0.7 s) per launch | `0` |
 | `MODEL_PICKER_LOG` | `0` turns off the local ledger | `1` |
 | `MODEL_PICKER_STATE_DIR` | Where the ledger lives | `~/.config/model-picker` |
 | `MODEL_PICKER_VERBOSE` | `1` shows a one-line note per launch and per finished subagent | `0` |
@@ -54,7 +55,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
 | `MODEL_PICKER_OLLAMA_TIMEOUT` | Seconds per `ask_local` call | `120` |
 | `MODEL_PICKER_OLLAMA` | `0` hides the `ask_local` tools | `1` |
-| `MODEL_PICKER_TIERS` | Tiers this environment can launch, e.g. `haiku,sonnet,opus` where Fable isn't enabled. Others are never recommended or offered to the router; work meant for a missing higher tier goes to the next tier down at high effort | all |
+| `MODEL_PICKER_TIERS` | Tiers this environment can launch, e.g. `haiku,sonnet,opus` where Fable isn't enabled. Others are never recommended or offered to the router. A missing tier is replaced by the next stronger available one; only when nothing stronger exists (e.g. no Fable) does work step down, at high effort. A value naming no Claude tier is ignored with a warning | all |
 
 API keys are read from the environment or `API_KEY_CMD`, never from the config file.
 

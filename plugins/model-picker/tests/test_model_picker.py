@@ -621,5 +621,124 @@ results += [
     check("tiers: router answer outside the list is capped", r_router["tier"] in ("opus", "haiku", "sonnet")),
 ]
 
+# --- v0.4.2: post-merge review of v0.4.1 ----------------------------------------------
+def session_ctx(env):
+    out = subprocess.run([sys.executable, "-I", str(HOOK), "session", str(ROOT)], input="{}", capture_output=True,
+                         text=True, env={**os.environ, **env}).stdout
+    return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out.strip() else ""
+
+
+results += [
+    check("review: local excluded by tiers -> not advertised at session start",
+          "Local tier enabled" not in session_ctx({**OL, "MODEL_PICKER_TIERS": "opus"})),
+    check("review: local included -> advertised", "Local tier enabled" in session_ctx({**OL, "MODEL_PICKER_TIERS": "local,opus"})),
+    check("review: non-string tier items don't crash", mp.available_tiers({"MODEL_PICKER_TIERS": [1, "opus"]}) == ["opus"]),
+    check("review: typo warns instead of silently allowing everything",
+          "names no Claude tier" in session_ctx({"MODEL_PICKER_TIERS": "opuss"})),
+    check("review: missing middle tier steps UP keeping effort",
+          (lambda r: r["tier"] == "opus" and r["effort"] == "medium")(
+              mp.fit_to_available({"tier": "sonnet", "effort": "medium", "reason": "x"}, {"MODEL_PICKER_TIERS": "haiku,opus"}))),
+    check("review: missing top tier still steps DOWN at high",
+          (lambda r: r["tier"] == "opus" and r["effort"] == "high")(
+              mp.fit_to_available({"tier": "fable", "effort": "medium", "reason": "x"}, {"MODEL_PICKER_TIERS": "haiku,sonnet,opus"}))),
+]
+wf = subprocess.run([sys.executable, "-I", str(HOOK), "pretool", str(ROOT)],
+                    input=json.dumps({"tool_name": "Workflow", "tool_input": {"script": 'agent("a")'}}),
+                    capture_output=True, text=True, env={**os.environ, **NOFABLE, **fresh_state()}).stdout
+results.append(check("review: workflow advice lists only available tiers", "'opus'" in wf and "'fable'" not in wf))
+den = run(agent(description="Big job", prompt="p", model="fable"), "enforce", {**NOFABLE, **fresh_state()})
+results.append(check("review: enforce denies an explicit unavailable model",
+                     den and den["hookSpecificOutput"].get("permissionDecision") == "deny"))
+with tempfile.TemporaryDirectory() as proj:
+    adir = Path(proj) / ".claude/agents"
+    adir.mkdir(parents=True)
+    (adir / "fab.md").write_text("---\nname: fab\nmodel: fable\n---\nbody\n")
+    pin = run(agent(subagent_type="fab", prompt="p"), "advise", {**NOFABLE, "CLAUDE_PROJECT_DIR": proj, **fresh_state()})
+    results.append(check("review: agent pinned to an unavailable tier gets a note",
+                         pin and "pinned to fable" in pin["hookSpecificOutput"]["additionalContext"]
+                         and 'model: "opus"' in pin["hookSpecificOutput"]["additionalContext"]))
+
+# --- v0.4.2 pre-merge review ---------------------------------------------------------
+results += [
+    check("prereview: session text describes step-up rule",
+          "next stronger available tier at the same effort" in session_ctx({"MODEL_PICKER_TIERS": "haiku,opus"})),
+    check("prereview: 'local' inside a model name is not the local tier", mp.tier_of("my-local-llama") is None),
+]
+st = fresh_state()
+run(agent(description="Big job", prompt="p", model="fable"), "enforce", {**NOFABLE, **st})
+run(agent(description="Big job", prompt="p", model="opus"), "enforce", {**NOFABLE, **st})
+rep = ledger.report(st, "all")
+results.append(check("prereview: enforce deny + retry on an unavailable model counts once",
+                     rep["launches"] == 1 and rep["denied"] == 1))
+
+# --- ROUTER_ON_EXPLICIT --------------------------------------------------------------
+oe_srv = HTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=oe_srv.serve_forever, daemon=True).start()
+RT = {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{oe_srv.server_port}",
+      "MODEL_PICKER_ROUTER_API_KEY_ENV": "none"}
+SEEN.clear()
+st = fresh_state()
+run(agent(description="Look around", prompt="p", model="haiku"), "advise", {**RT, **st})
+off_calls = len(SEEN)
+run(agent(description="Look around", prompt="p", model="fable"), "advise", {**RT, **st, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"})
+on_calls = len(SEEN) - off_calls
+oe_srv.shutdown()
+d = [r for r in ledger.read(st) if r.get("kind") == "decision"]
+results += [
+    check("on_explicit off: explicit launch never calls the router", off_calls == 0),
+    check("on_explicit on: explicit launch is judged by the router",
+          on_calls == 1 and str(d[-1].get("source", "")).startswith("openai-decisions")),
+    check("on_explicit on: router verdict sets followed (mock says fable)", d[-1].get("followed") is True),
+]
+
+# --- re-review: lock in verified behaviour --------------------------------------------
+def outcomes(env, launches, mode):
+    st = fresh_state()
+    for inp in launches:
+        run(agent(**inp), mode, {**env, **st})
+    return [r.get("outcome") for r in ledger.read(st) if r.get("kind") == "decision"]
+
+
+with tempfile.TemporaryDirectory() as proj:
+    adir = Path(proj) / ".claude/agents"
+    adir.mkdir(parents=True)
+    (adir / "fab.md").write_text("---\nname: fab\nmodel: fable\n---\nbody\n")
+    pinned_env = {**NOFABLE, "CLAUDE_PROJECT_DIR": proj}
+    results += [
+        check("pinned+unavailable: enforce logs denied", outcomes(pinned_env, [{"subagent_type": "fab", "prompt": "p"}],
+                                                                  "enforce") == ["denied"]),
+        check("pinned+unavailable: advise logs pinned", outcomes(pinned_env, [{"subagent_type": "fab", "prompt": "p"}],
+                                                                 "advise") == ["pinned"]),
+    ]
+results += [
+    check("explicit unavailable: advise logs explicit",
+          outcomes(NOFABLE, [{"description": "d", "prompt": "p", "model": "fable"}], "advise") == ["explicit"]),
+    check("missing model: enforce denied / advise missing",
+          outcomes({}, [{"description": "d", "prompt": "p"}], "enforce") == ["denied"]
+          and outcomes({}, [{"description": "d", "prompt": "p"}], "advise") == ["missing"]),
+]
+down = {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": "http://127.0.0.1:9",
+        "MODEL_PICKER_ROUTER_API_KEY_ENV": "none", "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+st = fresh_state()
+o = run(agent(description="Find logs", prompt="p", model="haiku"), "enforce", {**down, **st})
+d = [r for r in ledger.read(st) if r.get("kind") == "decision"][-1]
+results.append(check("on_explicit + router down: not blocked, heuristic source",
+                     (o is None or o.get("hookSpecificOutput", {}).get("permissionDecision") != "deny")
+                     and str(d.get("source", "")).startswith("heuristic (router")))
+slow_srv = HTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=slow_srv.serve_forever, daemon=True).start()
+SEEN.clear()
+run(agent(description="Big", prompt="p", model="fable"), "enforce",
+    {**NOFABLE, "MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{slow_srv.server_port}",
+     "MODEL_PICKER_ROUTER_API_KEY_ENV": "none", "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1", **fresh_state()})
+results.append(check("on_explicit: no router call for a launch on an unavailable model", len(SEEN) == 0))
+SEEN.clear()
+mm = run(agent(description="Find logs", prompt="p", model="haiku"), "advise",
+         {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{slow_srv.server_port}",
+          "MODEL_PICKER_ROUTER_API_KEY_ENV": "none", "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1", **fresh_state()})
+slow_srv.shutdown()
+results.append(check("on_explicit: mismatch note uses the router verdict (mock: fable vs haiku)",
+                     mm and "reads as `fable`" in mm["hookSpecificOutput"]["additionalContext"]))
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

@@ -56,6 +56,8 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_OLLAMA_TIMEOUT` | Seconds per `ask_local` call | `120` |
 | `MODEL_PICKER_OLLAMA` | `0` hides the `ask_local` tools | `1` |
 | `MODEL_PICKER_TIERS` | Tiers this environment can launch, e.g. `haiku,sonnet,opus` where Fable isn't enabled. Others are never recommended or offered to the router. A missing tier is replaced by the next stronger available one; only when nothing stronger exists (e.g. no Fable) does work step down, at high effort. A value naming no Claude tier is ignored with a warning | all |
+| `MODEL_PICKER_FLOORS` | JSON `{"pattern": "tier"}`: your own minimum model per kind of task, e.g. `{"review": "opus"}`. Matched against the launch description and agent type; a plain word matches at a word start, anything else is a regex. Never lowers a recommendation; launches that match count as followed | unset |
+| `MODEL_PICKER_PROMPT_ROUTE` | `1` shows, after each prompt, the decisions API's raw pick for it (`model-picker: gpt-6-luna → sonnet/high (0.96, 521 ms)`). You see it, Claude doesn't. Needs a router; the prompt's first 200 characters are sent to it. Skips slash commands, agent notifications and replies under three words | `0` |
 
 API keys are read from the environment or `API_KEY_CMD`, never from the config file.
 

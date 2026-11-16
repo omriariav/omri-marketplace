@@ -34,6 +34,10 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
   MODEL_PICKER_OLLAMA_URL        Ollama base URL (default http://localhost:11434)
   MODEL_PICKER_TIERS             tiers this environment can launch, e.g. "haiku,sonnet,opus" when
                                  Fable isn't enabled; others are never recommended (default: all)
+  MODEL_PICKER_FLOORS            JSON {"pattern": "tier"}: your own minimum model per kind of task, e.g.
+                                 {"review": "opus"}; matched against the launch description and agent type
+  MODEL_PICKER_PROMPT_ROUTE      0 (default) | 1   after each prompt, show the decisions API's raw pick for
+                                 it (needs a router; the prompt's first 200 characters are sent)
 
 Also: model_picker.py report [today|24h|7d|30d|all] [--json] [--html [--out PATH] [--open]]
 """
@@ -348,7 +352,43 @@ def guard_local(rec, inp, cfg):
             "unsure": why == UNSURE_REASON, "local_vetoed": True}
 
 
-def decide(inp, cfg, use_router=True, for_launch=False):
+def _floors(cfg):
+    """[(compiled pattern, label, tier)] from MODEL_PICKER_FLOORS; bad entries are skipped."""
+    try:
+        raw = _json_obj(cfg.get("MODEL_PICKER_FLOORS"))
+    except ValueError:
+        return []
+    out = []
+    for pat, tier in (raw.items() if isinstance(raw, dict) else []):
+        tier = str(tier).strip().lower()
+        if tier not in CLAUDE_TIERS or not str(pat).strip():
+            continue
+        pat = str(pat).strip()
+        # A plain word ("review") matches at a word start: review, reviews, reviewer; not "preview".
+        rx = r"\b" + re.escape(pat) if re.fullmatch(r"[\w -]+", pat) else pat
+        try:
+            out.append((re.compile(rx, re.I), pat, tier))
+        except re.error:
+            continue
+    return out
+
+
+def apply_floors(rec, inp, cfg):
+    """Raise the recommendation to the user's own minimum tier for matching tasks (MODEL_PICKER_FLOORS).
+    A floor is the user's explicit rule, so the result counts as a confident recommendation."""
+    text = f"{inp.get('description') or inp.get('name') or ''} {inp.get('subagent_type') or ''}"
+    best = None
+    for rx, label, tier in _floors(cfg):
+        if rx.search(text) and (best is None or CLAUDE_TIERS.index(tier) > CLAUDE_TIERS.index(best[1])):
+            best = (label, tier)
+    if not best or (rec["tier"] in CLAUDE_TIERS and CLAUDE_TIERS.index(rec["tier"]) >= CLAUDE_TIERS.index(best[1])):
+        return rec
+    label, tier = best
+    return {**rec, "tier": tier, "reason": f"your rule: \"{label}\" tasks get at least {tier} (MODEL_PICKER_FLOORS)",
+            "source": f"{rec['source']} + floor", "unsure": False, "floor": label, "floored_from": rec["tier"]}
+
+
+def decide(inp, cfg, use_router=True, for_launch=False, deadline=None):
     """Recommendation dict: tier, effort, reason, source, limited to the available tiers.
 
     for_launch: the call is an Agent/teammate launch that is already happening. `local` (call ask_local
@@ -356,11 +396,11 @@ def decide(inp, cfg, use_router=True, for_launch=False):
     tool work to a model that has no tools; so launches only ever get Claude tiers. The local tier is
     offered where the choice is still open: the session rules and the /model-picker skill.
     """
-    rec = _decide(inp, cfg, use_router, allow_local=not for_launch)
-    return fit_to_available(guard_local(rec, inp, cfg), cfg)
+    rec = _decide(inp, cfg, use_router, allow_local=not for_launch, deadline=deadline)
+    return fit_to_available(apply_floors(guard_local(rec, inp, cfg), inp, cfg), cfg)
 
 
-def _decide(inp, cfg, use_router=True, allow_local=True):
+def _decide(inp, cfg, use_router=True, allow_local=True, deadline=None):
     """Router first (if configured), heuristic fallback; may name a tier that is not available."""
     local = allow_local and local_enabled(cfg)
     agent_type = str(inp.get("subagent_type") or "")
@@ -376,7 +416,7 @@ def _decide(inp, cfg, use_router=True, allow_local=True):
     worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, local)), daemon=True)
     started = time.monotonic()
     worker.start()
-    worker.join(ROUTER_DEADLINE)
+    worker.join(deadline or ROUTER_DEADLINE)
     fallback["router_ms"] = int((time.monotonic() - started) * 1000)
     res = box.get("res")
     if res is None:
@@ -595,21 +635,63 @@ def handle_posttool(payload, cfg):
     print(json.dumps(out))
 
 
+PROMPT_ROUTE_DEADLINE = 3.0  # seconds: the user is waiting for their turn to start
+
+
+def prompt_route(payload, cfg):
+    """MODEL_PICKER_PROMPT_ROUTE: the router's raw answer for this prompt, as one user-visible line.
+
+    Only the configured decisions API's own answer: no heuristic fallback, no floors, no confidence cut.
+    Nothing is shown when no router is configured or it doesn't answer in time. Skips slash commands,
+    harness messages (agent notifications), and very short replies ("ok", "merge")."""
+    if not _enabled(cfg, "MODEL_PICKER_PROMPT_ROUTE", default=False):
+        return None
+    name = str(cfg.get("MODEL_PICKER_ROUTER") or "heuristic").lower()
+    router = routers.ROUTERS.get(name)
+    prompt = str(payload.get("prompt") or "").strip()
+    if not router or not prompt or prompt[0] in "/<!" or len(prompt.split()) < 3:
+        return None
+    inp = {"description": _short(prompt, 200), "prompt": prompt, "subagent_type": "main-session"}
+    box = {}
+    worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, False)), daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(PROMPT_ROUTE_DEADLINE)
+    res = box.get("res")
+    if not isinstance(res, dict) or res.get("tier") not in TIERS:
+        return None
+    ms = int((time.monotonic() - started) * 1000)
+    ledger.append(cfg, {"kind": "prompt", "session": payload.get("session_id"), "rec_tier": res["tier"],
+                        "rec_effort": res.get("effort"), "source": res.get("source"), "confidence": res.get("confidence"),
+                        "router_ms": ms, "session_tier": ledger.tier_of(ledger.last_model(payload.get("transcript_path")))})
+    label = str(res.get("source") or name).split(":")[-1].split("/")[-1]
+    conf = f"{res['confidence']:.2f}, " if isinstance(res.get("confidence"), (int, float)) else ""
+    return f"model-picker: {label} → {res['tier']}/{res.get('effort') or 'medium'} ({conf}{ms} ms)"
+
+
 def handle_prompt(payload, cfg):
-    """UserPromptSubmit: deliver stamps of background agents that finished since the last turn.
-    Reads only the small stamp queue, never the whole ledger, so it stays fast on every prompt."""
-    if not _enabled(cfg, "MODEL_PICKER_STAMP", default=False) or not ledger.logging_enabled(cfg):
-        return
+    """UserPromptSubmit: show the router's pick for this prompt (opt-in), and deliver stamps of background
+    agents that finished since the last turn (reads only the small stamp queue, never the whole ledger)."""
+    shown, context = [], None
+    try:
+        line = prompt_route(payload, cfg)
+        if line:
+            shown.append(line)
+    except Exception:
+        pass  # advisory only: never stand between the user and their turn
     session = payload.get("session_id")
-    if not session:
+    if session and _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and ledger.logging_enabled(cfg):
+        lines = ledger.take_stamps(cfg, session)
+        if lines:
+            shown += lines
+            context = ("Background agents finished since your last turn. Their actual models, from the transcripts:\n"
+                       + "\n".join(lines) + "\nWhen you report what one of them produced, name its model.")
+    if not shown:
         return
-    lines = ledger.take_stamps(cfg, session)
-    if not lines:
-        return
-    context = ("Background agents finished since your last turn. Their actual models, from the transcripts:\n"
-               + "\n".join(lines) + "\nWhen you report what one of them produced, name its model.")
-    print(json.dumps({"systemMessage": "\n".join(lines),
-                      "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
+    body = {"systemMessage": "\n".join(shown)}
+    if context:
+        body["hookSpecificOutput"] = {"hookEventName": "UserPromptSubmit", "additionalContext": context}
+    print(json.dumps(body))
 
 
 def agent_calls(script):

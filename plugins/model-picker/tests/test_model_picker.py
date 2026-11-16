@@ -979,5 +979,85 @@ wf = subprocess.run([sys.executable, "-I", str(HOOK), "pretool", str(ROOT)],
 results.append(check("workflow advice never routes an agent() step to local",
                      "not as an agent() step" in wf and "use the local model" not in wf))
 
+
+# --- v0.4.6: floors, followed-by-direction, prompt routing -------------------------------------------
+FL = {"MODEL_PICKER_FLOORS": json.dumps({"review": "opus", "^audit": "fable", "bad": "local", "x": "nonsense"})}
+fl_review = mp.decide({"description": "Review PR #7", "prompt": "check it"}, FL)
+results += [
+    check("floor: 'review' raises sonnet work to opus, with a reason and a confident verdict",
+          fl_review["tier"] == "opus" and "your rule" in fl_review["reason"] and not fl_review.get("unsure")
+          and fl_review["source"].endswith("+ floor")),
+    check("floor: plain word matches at a word start only ('preview' is not 'review')",
+          mp.decide({"description": "Preview the page title", "prompt": "p"}, FL).get("floor") is None),
+    check("floor: regex patterns work", mp.decide({"description": "audit the auth module", "prompt": "p"}, FL)["tier"] == "fable"),
+    check("floor: never lowers a stronger recommendation",
+          mp.decide({"description": "review the major refactor of the whole repo", "prompt": "p"},
+                    {**FL, "MODEL_PICKER_FLOORS": json.dumps({"review": "sonnet"})})["tier"] == "fable"),
+    check("floor: local/unknown tiers and bad JSON are ignored",
+          mp.decide({"description": "bad x", "prompt": "find the file"}, FL)["tier"] == "haiku"
+          and mp.decide({"description": "Review PR", "prompt": "p"}, {"MODEL_PICKER_FLOORS": "{not json"})["tier"] == "sonnet"),
+    check("floor: unavailable floor tier is fitted to what's available",
+          mp.decide({"description": "audit logs", "prompt": "p"}, {**FL, "MODEL_PICKER_TIERS": "haiku,sonnet,opus"})["tier"] == "opus"),
+]
+fst = fresh_state()
+run(agent(description="Review PR #7", prompt="review it", model="opus"), env={**fst, **FL})
+dec = [r for r in ledger.read(fst) if r.get("kind") == "decision"][-1]
+results.append(check("floor: an opus review launch now counts as followed", dec["rec_tier"] == "opus" and dec["followed"] is True))
+
+dst = fresh_state()
+for chosen, rec, followed in (("opus", "sonnet", False), ("sonnet", "opus", False), ("opus", "haiku", False), ("haiku", "haiku", True)):
+    ledger.append(dst, {"kind": "decision", "outcome": "explicit", "chosen_tier": chosen, "rec_tier": rec, "followed": followed,
+                        "source": "heuristic"})
+drep = ledger.report(dst, "all")
+results += [
+    check("report: not-followed split by direction", drep["went_stronger"] == 2 and drep["went_cheaper"] == 1),
+    check("report: direction shown in Markdown and HTML", "2 went to a stronger model, 1 to a cheaper one" in ledger.format_report(drep)
+          and "2 went stronger, 1 cheaper" in ledger.format_html(drep)),
+]
+
+FAKE_SONNET = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": f"{sys.executable} -c \"print('{{\\\"tier\\\": \\\"local\\\", "
+               f"\\\"effort\\\": \\\"low\\\", \\\"confidence\\\": 0.9}}')\"", "MODEL_PICKER_OLLAMA_MODEL": "qwen2.5:7b-instruct"}
+
+
+def FAKE_ROUTER(tier, conf):
+    return {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD":
+            f"{sys.executable} -c \"print('{{\\\"tier\\\": \\\"{tier}\\\", \\\"effort\\\": \\\"medium\\\", \\\"confidence\\\": {conf}}}')\""}
+
+
+def prompt_hook(prompt, env):
+    e = {k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")}
+    e.update({"MODEL_PICKER_CONFIG": "/nonexistent/model-picker.json", **env})
+    out = subprocess.run([sys.executable, "-I", str(HOOK), "prompt", str(ROOT)], capture_output=True, text=True, env=e,
+                         input=json.dumps({"session_id": "s-prompt", "prompt": prompt, "transcript_path": "/nonexistent"})).stdout
+    return json.loads(out) if out.strip() else None
+
+
+pst = fresh_state()
+ON = {**pst, "MODEL_PICKER_PROMPT_ROUTE": "1"}
+secret = "Summarize the quarterly numbers in this pasted text: SECRET-TOKEN-123"
+shown = prompt_hook(secret, {**ON, **FAKE_ROUTER("sonnet", 0.82)})
+local_try = prompt_hook(secret, {**ON, **FAKE_SONNET})
+results += [
+    check("prompt route: off by default", prompt_hook("find where the parser lives in this repo", pst) is None),
+    check("prompt route: shows the pick to the user only (no context for Claude)",
+          bool(shown) and "→ sonnet" in shown.get("systemMessage", "") and "hookSpecificOutput" not in shown),
+    check("prompt route: a router answering local shows nothing (local isn't offered for the session)", local_try is None),
+    check("prompt route: line format", bool(shown) and re.search(r"model-picker: \S+ → sonnet/medium \(0\.82, \d+ ms\)$", shown["systemMessage"])),
+    check("prompt route: skips slash commands, notifications and short replies",
+          all(prompt_hook(p, ON) is None for p in ("/model-picker:report 7d", "<task-notification>done</task-notification>", "ok merge"))),
+    check("prompt route: nothing shown when the router fails or none is configured",
+          prompt_hook("debug the flaky login test in CI", {**ON, "MODEL_PICKER_ROUTER": "command",
+                                                           "MODEL_PICKER_ROUTER_CMD": "false"}) is None
+          and prompt_hook("debug the flaky login test in CI", ON) is None),
+    check("prompt route: shows the router's raw pick, not floors",
+          "→ sonnet" in (prompt_hook("review PR 55 for bugs please", {**ON, **FL, **FAKE_ROUTER("sonnet", 0.4)}) or {}).get("systemMessage", "")),
+]
+plog = [r for r in ledger.read(pst) if r.get("kind") == "prompt"]
+prep = ledger.report(pst, "all")
+results += [
+    check("prompt route: logged without the prompt text", bool(plog) and "SECRET" not in json.dumps(plog)),
+    check("prompt route: report counts routed prompts", prep["prompts_routed"] == len(plog) and "Prompts routed" in ledger.format_report(prep)),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

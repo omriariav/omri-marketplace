@@ -31,6 +31,7 @@ PRICES = {
 }
 HAIKU_LONG_PROMPT = 100_000
 TIERS = ("haiku", "sonnet", "opus", "fable")
+RANK = {t: i for i, t in enumerate(("local",) + TIERS)}
 ROTATE_BYTES = 5 * 1024 * 1024
 KEEP_ROTATED = 10
 
@@ -490,9 +491,14 @@ def report(cfg, period="7d", now=None):
             last_use[r.get("agent_id") or id(r)] = r
     use = list(last_use.values())
     local_calls = [r for r in recs if r.get("kind") == "local"]
+    prompts = [r for r in recs if r.get("kind") == "prompt"]
     checked = [d for d in dec if d.get("outcome") in ("explicit", "missing")]
     explicit = [d for d in checked if d["outcome"] == "explicit"]
     compared = [d for d in explicit if d.get("followed") is not None]
+    # Not followed, by direction: going stronger is often deliberate (a stated reason, a user rule) and costs
+    # money; going cheaper saves money but is the risky direction.
+    diverged = [d for d in compared if not d["followed"] and d.get("chosen_tier") in RANK and d.get("rec_tier") in RANK]
+    stronger = sum(1 for d in diverged if RANK[d["chosen_tier"]] > RANK[d["rec_tier"]])
     routed = [d for d in dec if d.get("router_ms") is not None]  # the router was actually called
     router_hits = [d for d in routed if not str(d["source"]).startswith("heuristic")]
     latencies = sorted(d["router_ms"] for d in router_hits if isinstance(d.get("router_ms"), (int, float)))
@@ -527,6 +533,8 @@ def report(cfg, period="7d", now=None):
         "denied": denied,
         "followed": sum(1 for d in compared if d["followed"]),
         "compared": len(compared),
+        "went_stronger": stronger,
+        "went_cheaper": len(diverged) - stronger,
         "launch_tiers": tiers,
         "recommended_tiers": _count(d.get("rec_tier") for d in checked),
         "router_calls": len(routed),
@@ -547,6 +555,10 @@ def report(cfg, period="7d", now=None):
         "local_output": sum(r.get("output") or 0 for r in local_calls),
         "local_errors": sum(1 for r in local_calls if r.get("error")),
         "local_haiku_equiv": round(sum(r.get("haiku_equiv") or 0 for r in local_calls), 4),
+        "prompts_routed": len(prompts),
+        "prompts_cheaper": sum(1 for r in prompts if r.get("session_tier") in RANK and r.get("rec_tier") in RANK
+                               and RANK[r["rec_tier"]] < RANK[r["session_tier"]]),
+        "prompt_tiers": _count(r.get("rec_tier") for r in prompts),
     }
 
 
@@ -566,11 +578,25 @@ def _tok(n):
     return f"{n / 1e6:.2f}M" if n >= 1e6 else f"{n / 1e3:.1f}K" if n >= 1e3 else str(int(n))
 
 
+def _diverged(r):
+    """", not followed: 5 went stronger, 1 went cheaper" (empty when everything was followed)."""
+    up, down = r.get("went_stronger", 0), r.get("went_cheaper", 0)
+    if not up and not down:
+        return ""
+    return f"; of the rest, {up} went to a stronger model, {down} to a cheaper one"
+
+
+def _prompts_line(r):
+    tiers = ", ".join(f"{k} {v}" for k, v in sorted(r["prompt_tiers"].items(), key=lambda kv: -kv[1]))
+    return (f"Prompts routed: {r['prompts_routed']} ({tiers}); {r['prompts_cheaper']} looked like work for a cheaper "
+            "model than the session's")
+
+
 def format_report(r):
     """Render the report as Markdown that survives any renderer: a bold title, bullet lists (never bare
     lines, which Markdown joins into one paragraph), and blank lines around the table."""
     lines = [f"**model-picker report ({r['period']})**", ""]
-    if not r["launches"] and not r["subagents"] and not r.get("local_calls"):
+    if not r["launches"] and not r["subagents"] and not r.get("local_calls") and not r.get("prompts_routed"):
         return "\n".join(lines + ["No launches logged yet. The ledger fills as agents launch "
                                   "(`MODEL_PICKER_LOG` must not be `0`)."])
     tiers = ", ".join(f"{k} {v}" for k, v in sorted(r["launch_tiers"].items(), key=lambda kv: -kv[1]))
@@ -578,7 +604,8 @@ def format_report(r):
         f"- Launches: {r['launches']} ({r['checked']} checked, {r['skipped']} skipped as fork/pinned/built-in"
         + (f"; {r['denied']} denied in enforce mode and retried" if r.get("denied") else "") + ")",
         f"- Explicit model: {r['explicit']}/{r['checked']} ({_pct(r['explicit'], r['checked'])})",
-        f"- Followed recommendation: {r['followed']}/{r['compared']} ({_pct(r['followed'], r['compared'])})",
+        f"- Followed recommendation: {r['followed']}/{r['compared']} ({_pct(r['followed'], r['compared'])})"
+        + _diverged(r),
         f"- Launch models: {tiers or 'n/a'}",
     ]
     if r["router_calls"]:
@@ -610,6 +637,8 @@ def format_report(r):
         if r["local_agents"]:
             lines.append(f"- {r['local_agents']} subagent(s) ran on a local model, counted at $0.")
         lines += ["", "_Estimate: same tokens at list prices; a larger model may have used fewer tokens._"]
+    if r.get("prompts_routed"):
+        lines += ["", f"- {_prompts_line(r)}"]
     if r.get("local_calls"):
         ok = r["local_calls"] - r["local_errors"]
         lines += ["", f"- Local model (ask_local): {ok} call(s), {_tok(r['local_input'])} in / "
@@ -669,7 +698,7 @@ def format_html(r, generated=None):
             f"<title>model-picker report ({e(r['period'])})</title><style>{_CSS}</style></head><body><main>"
             f"<h1>model-picker report</h1><p class=sub>Period: {e(r['period'])} · generated {e(when)} · "
             f"from the local ledger</p>")
-    if not r["launches"] and not r["subagents"] and not r.get("local_calls"):
+    if not r["launches"] and not r["subagents"] and not r.get("local_calls") and not r.get("prompts_routed"):
         return head + "<p>No launches logged yet. The ledger fills as agents launch.</p></main></body></html>"
     attr = r.get("saving_by_attribution") or {}
     credited_agents = attr.get("model-picker", {}).get("agents", 0)
@@ -679,7 +708,10 @@ def format_html(r, generated=None):
          f"difference {_money(r['saving'])} ({_pct(r['saving'], r['baseline_cost'])})", ""),
         ("Credited to model-picker", _money(r.get("credited_saving", 0)),
          f"{credited_agents} agent(s) that followed it", " hero"),
-        ("Followed recommendation", _pct(r["followed"], r["compared"]), f"{r['followed']} of {r['compared']} launches", ""),
+        ("Followed recommendation", _pct(r["followed"], r["compared"]),
+         f"{r['followed']} of {r['compared']} launches" + (f"; {r.get('went_stronger', 0)} went stronger, "
+                                                           f"{r.get('went_cheaper', 0)} cheaper"
+                                                           if r.get("went_stronger") or r.get("went_cheaper") else ""), ""),
     ]
     out = [head, "<div class=tiles>"]
     for k, v, n, cls in tiles:
@@ -733,6 +765,8 @@ def format_html(r, generated=None):
                      f"(p50 {r['router_p50_ms']} ms, avg confidence {r['router_avg_conf']}); rest by heuristic")
     if r["local_agents"]:
         facts.append(f"{r['local_agents']} subagent(s) ran on a local model, counted at $0")
+    if r.get("prompts_routed"):
+        facts.append(_prompts_line(r))
     if r.get("local_calls"):
         facts.append(f"Local model (ask_local): {r['local_calls'] - r['local_errors']} call(s), "
                      f"{_tok(r['local_input'])} in / {_tok(r['local_output'])} out, $0; "

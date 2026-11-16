@@ -1,5 +1,13 @@
 # Releases
 
+## model-picker v0.4.6 (2026-11-16)
+
+- **Followed, by direction.** `/model-picker:report` splits launches that didn't follow the recommendation into "went to a stronger model" and "went to a cheaper one". Going stronger is often deliberate (a stated reason, a user rule) and costs money; going cheaper saves money but is the risky direction. A low follow rate made mostly of deliberate upgrades no longer reads like ignored advice.
+- **Your own minimum models: `MODEL_PICKER_FLOORS`.** JSON `{"pattern": "tier"}`, e.g. `{"review": "opus"}`. A launch whose description or agent type matches is recommended at least that tier, so a standing rule like "reviews run on Opus" counts as followed instead of being nudged down. A plain word matches at a word start (`review` matches "reviews", not "preview"); anything else is a regex. A floor never lowers a recommendation.
+- **Tie-break in the guide.** When a task fits more than one row, pick the row for its hardest part: slides rendered and checked by eye are a vision loop (Opus), not just slides (Sonnet).
+- **The router's pick for each prompt: `MODEL_PICKER_PROMPT_ROUTE=1`** (off by default). After each prompt you see one line with the decisions API's raw answer, e.g. `model-picker: gpt-6-luna → sonnet/high (0.96, 521 ms)`: no heuristic fallback, no floors. Shown to you only; Claude doesn't see it. Needs a configured router; the prompt's first 200 characters are sent to it (3 s budget; nothing is shown if it doesn't answer). Slash commands, agent notifications and replies under three words are skipped. Each pick is logged without the prompt text, and the report counts them.
+- Tests: 220.
+
 ## model-picker v0.4.5 (2026-11-16)
 
 `/model-picker:report` now also writes an HTML report and opens it in the browser: headline tiles (subagent spend, cost at the session model, saving credited to model-picker, follow rate), recommended vs launched models, spend by model, and who gets credit for each saving. It is one self-contained file (no scripts, fonts or network requests), owner-only (`0600`), at `~/.config/model-picker/report.html` (or under `MODEL_PICKER_STATE_DIR`), and follows the system light/dark mode. CLI: `model_picker.py report <period> --html [--out PATH] [--open]`.

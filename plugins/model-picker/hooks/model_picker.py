@@ -23,6 +23,12 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
   MODEL_PICKER_ROUTER_INPUT      description (default) | brief | full: what task text leaves the machine
   MODEL_PICKER_ROUTER_TIMEOUT    seconds (default 3)
   MODEL_PICKER_ROUTER_MIN_CONFIDENCE  below this the heuristic decides (default 0.5)
+  MODEL_PICKER_LOG               1 (default) | 0   local decision/usage ledger (see ledger.py)
+  MODEL_PICKER_STATE_DIR         where the ledger lives (default ~/.config/model-picker)
+  MODEL_PICKER_VERBOSE           0 (default) | 1   one-line note per launch and per finished subagent
+  MODEL_PICKER_PRICES            JSON price overrides per tier ($/M tokens)
+
+Also: model_picker.py report [today|24h|7d|30d|all] [--json]
 """
 
 import json
@@ -31,9 +37,11 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ledger  # noqa: E402
 import routers  # noqa: E402
 
 TIERS = ["local", "haiku", "sonnet", "opus", "fable"]
@@ -175,7 +183,7 @@ def tier_of(model):
     return None
 
 
-def emit(decision=None, reason=None, context=None):
+def emit(decision=None, reason=None, context=None, system=None):
     out = {"hookEventName": "PreToolUse"}
     if decision:
         out["permissionDecision"] = decision
@@ -183,7 +191,11 @@ def emit(decision=None, reason=None, context=None):
         out["permissionDecisionReason"] = reason
     if context:
         out["additionalContext"] = context
-    print(json.dumps({"hookSpecificOutput": out}))
+    body = {"hookSpecificOutput": out} if len(out) > 1 else {}
+    if system:
+        body["systemMessage"] = system
+    if body:
+        print(json.dumps(body))
 
 
 def load_config():
@@ -240,15 +252,18 @@ def decide(inp, cfg, use_router=True):
     agent_type = str(inp.get("subagent_type") or "")
     text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name"))
     tier, why = recommend(text, agent_type, local)
-    fallback = {"tier": tier, "effort": "medium", "reason": why, "source": "heuristic"}
+    fallback = {"tier": tier, "effort": "medium", "reason": why, "source": "heuristic",
+                "confidence": None, "router_ms": None}
     name = str(cfg.get("MODEL_PICKER_ROUTER") or "heuristic").lower()
     router = routers.ROUTERS.get(name)
     if not use_router or not router or agent_type.lower().split(":")[-1] in (READ_ONLY_TYPES | PLANNING_TYPES):
         return fallback
     box = {}
     worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, local)), daemon=True)
+    started = time.monotonic()
     worker.start()
     worker.join(ROUTER_DEADLINE)
+    fallback["router_ms"] = int((time.monotonic() - started) * 1000)
     res = box.get("res")
     if res is None:
         fallback["source"] = "heuristic (router timed out)"
@@ -258,7 +273,8 @@ def decide(inp, cfg, use_router=True):
         fallback["source"] = f"heuristic (router {res['source']} unsure: {res['confidence']:.2f})"
     else:
         return {"tier": res["tier"], "effort": res["effort"], "reason": routers.TIER_CRITERIA[res["tier"]],
-                "source": f"{res['source']} ({res['confidence']:.2f})"}
+                "source": f"{res['source']} ({res['confidence']:.2f})", "confidence": res["confidence"],
+                "router_ms": fallback["router_ms"]}
     return fallback
 
 
@@ -293,33 +309,104 @@ def describe(rec, cfg):
     return f"{target}, effort {rec['effort']}: {rec['reason']} [via {rec['source']}]"
 
 
+def _short(text, n=120):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None):
+    """One ledger line per checked launch. Description only (local file); never the prompt."""
+    chosen_tier = ledger.tier_of(chosen) if chosen else None
+    entry = {
+        "kind": "decision", "session": payload.get("session_id"), "tool_use_id": payload.get("tool_use_id"),
+        "tool": payload.get("tool_name"), "agent_type": str(inp.get("subagent_type") or "general-purpose"),
+        "description": _short(inp.get("description") or inp.get("name")), "outcome": outcome,
+        "chosen": chosen, "chosen_tier": chosen_tier,
+    }
+    if rec:
+        entry.update({"rec_tier": rec["tier"], "rec_effort": rec["effort"], "source": rec["source"],
+                      "confidence": rec.get("confidence"), "router_ms": rec.get("router_ms"),
+                      "followed": (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))
+                      if chosen_tier else None})
+    ledger.append(cfg, entry)
+
+
+def verbose_note(cfg, label, chosen, rec):
+    if not _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
+        return None
+    conf = f" {rec['confidence']:.2f}" if isinstance(rec.get("confidence"), (int, float)) else ""
+    ms = f", {rec['router_ms']} ms" if rec.get("router_ms") is not None else ""
+    src = str(rec["source"]).split(" (")[0].split(":")[-1]
+    picked = f"on {chosen}" if chosen else "no model set"
+    return f"model-picker: {label} {picked} → recommends {rec['tier']}/{rec['effort']} ({src}{conf}{ms})"
+
+
 def handle_agent(payload, mode, cfg):
     inp = payload.get("tool_input")
     if not isinstance(inp, dict):
         raise ValueError(f"unexpected tool_input type {type(inp).__name__}")
     agent_type = str(inp.get("subagent_type") or "")
+    label = agent_type or "general-purpose"
     if agent_type.lower().split(":")[-1] in SKIP_TYPES:
+        log_decision(cfg, payload, inp, "skipped")
         return
     model = inp.get("model")
-    label = agent_type or "general-purpose"
-    if not model and pinned_model(agent_type, payload.get("cwd")):
+    pinned = None if model else pinned_model(agent_type, payload.get("cwd"))
+    if pinned:
+        log_decision(cfg, payload, inp, "pinned", chosen=pinned)
         return  # the agent definition already pins a model
 
     # An explicit model only needs a mismatch check: keep it local and instant (no router call).
     rec = decide(inp, cfg, use_router=not model)
+    session_model = None if model else ledger.last_model(payload.get("transcript_path"))
+    log_decision(cfg, payload, inp, "explicit" if model else "missing", chosen=model or session_model, rec=rec)
+    note = verbose_note(cfg, label, model, rec)
     if model:
         chosen = tier_of(model)
         if chosen and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
             emit(context=f"model-picker: `{label}` launched on {chosen}, but the task reads as "
-                         f"{describe(rec, cfg)}. Prefer that for similar launches unless you have a specific reason.")
+                         f"{describe(rec, cfg)}. Prefer that for similar launches unless you have a specific reason.",
+                 system=note)
+        else:
+            emit(system=note)
         return
 
     if mode == "enforce":
         emit("deny", f"model-picker: launch `{label}` with an explicit `model`. Recommended: {describe(rec, cfg)}. "
-                     "Re-issue the same call with that model, or pick another tier if you have a reason.")
+                     "Re-issue the same call with that model, or pick another tier if you have a reason.", system=note)
     else:
         emit(context=f"model-picker: `{label}` launched with no explicit model. "
-                     f"Recommended: {describe(rec, cfg)}. Pass `model` explicitly on future launches.")
+                     f"Recommended: {describe(rec, cfg)}. Pass `model` explicitly on future launches.", system=note)
+
+
+def handle_subagent_stop(payload, cfg):
+    """Record the finished subagent's token usage, cost, and saving vs the session model."""
+    if payload.get("stop_hook_active"):
+        return
+    path = ledger.subagent_transcript(payload)
+    if not path:
+        return
+    messages = ledger.transcript_usage(path)
+    if not messages:
+        return
+    meta = ledger.subagent_meta(path)
+    session_model = ledger.last_model(payload.get("transcript_path"))
+    baseline = ledger.tier_of(session_model)
+    totals = ledger.summarize_usage(messages, baseline, ledger.price_table(cfg))
+    main_model = max(totals["models"], key=totals["models"].get)
+    ledger.append(cfg, {
+        "kind": "usage", "session": payload.get("session_id"), "agent_id": payload.get("agent_id"),
+        "tool_use_id": meta.get("toolUseId"), "agent_type": meta.get("agentType") or payload.get("agent_type"),
+        "description": _short(meta.get("description")), "model": main_model, "tier": ledger.tier_of(main_model)
+        or ("local" if totals["local"] else None), "session_model": session_model,
+        **{k: totals[k] for k in ("messages", "input", "output", "cache_read", "cache_write", "cost",
+                                  "baseline_cost", "saving", "local", "unpriced")},
+    })
+    if _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
+        tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
+        vs = f" vs ~${totals['baseline_cost']:.3f} on {baseline}" if baseline and totals["saving"] else ""
+        print(json.dumps({"systemMessage": f"model-picker: {meta.get('agentType') or 'subagent'} on {main_model} "
+                                            f"used {tokens:,} tokens, ~${totals['cost']:.3f}{vs}"}))
 
 
 def agent_calls(script):
@@ -391,6 +478,12 @@ def main():
         task = (" ".join(sys.argv[2:3]) or sys.stdin.read()).strip()
         print(json.dumps(decide({"description": task[:200], "prompt": task}, cfg), indent=2))
         return
+    if event == "report":
+        args = sys.argv[2:]
+        period = next((a for a in args if not a.startswith("-")), "7d")
+        data = ledger.report(cfg, period)
+        print(json.dumps(data, indent=2) if "--json" in args else ledger.format_report(data))
+        return
     root = sys.argv[2]
     raw = sys.stdin.read()
     mode = str(cfg.get("MODEL_PICKER_MODE") or "advise").strip().lower()
@@ -402,6 +495,9 @@ def main():
         handle_session(root, cfg)
         return
     payload = json.loads(raw or "{}")
+    if event == "subagentstop":
+        handle_subagent_stop(payload, cfg)
+        return
     tool = payload.get("tool_name")
     if tool in ("Agent", "Task"):
         handle_agent(payload, mode, cfg)

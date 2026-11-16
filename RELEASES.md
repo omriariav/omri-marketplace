@@ -1,5 +1,16 @@
 # Releases
 
+## model-picker v0.3.0 (2026-11-16)
+
+Visibility: what model-picker decided, which models ran, and what that saved.
+
+- Local ledger at `~/.config/model-picker/log.jsonl` (mode 600, rotated at 5 MB; nothing leaves the machine). Every checked launch logs the agent type, short description (never the prompt), the chosen or inherited model, the recommended tier and effort, what decided it (decisions API or heuristic) with confidence and latency, and whether the recommendation was followed.
+- New SubagentStop hook reads each finished subagent's transcript, counts tokens once per API message (input, output, cache reads, 5-minute and 1-hour cache writes), and joins them to the launch via the transcript's `toolUseId`.
+- Cost and estimated saving per subagent: priced at its actual model and at the session model it would otherwise have inherited, using Claude API list prices (Haiku's >100K-prompt tier included). Local models count as $0. Override prices with `MODEL_PICKER_PRICES`.
+- `/model-picker:report [today|24h|7d|30d|all]` (and `model_picker.py report --json`): launches, explicit-model and follow rates, model mix, router hit rate/latency/confidence, spend by model, and estimated saving.
+- `MODEL_PICKER_VERBOSE=1` prints a one-line note per launch and per finished subagent. `MODEL_PICKER_LOG=0` turns the ledger off; `MODEL_PICKER_STATE_DIR` moves it.
+- Tests: 71 (from 47), including real-format transcripts, streamed-duplicate dedupe, cache-write pricing, and ledger rotation; tests never touch the real ledger.
+
 ## model-picker v0.2.0 (2026-11-16)
 
 Decisions-API routing and a local-model tier.

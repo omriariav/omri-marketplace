@@ -1,5 +1,9 @@
 # Releases
 
+## model-picker v0.4.3 (2026-11-16)
+
+Fix: `/model-picker:report` output rendered as one run-together paragraph in Markdown views. The summary is now a bullet list with a bold title, blank lines around the table, and the not-credited breakdown nested under the credited saving. Tests: 162.
+
 ## model-picker v0.4.2 (2026-11-16)
 
 Fixes from a post-release review of v0.4.1's `MODEL_PICKER_TIERS`.

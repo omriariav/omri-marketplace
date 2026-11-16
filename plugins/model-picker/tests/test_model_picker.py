@@ -740,5 +740,23 @@ slow_srv.shutdown()
 results.append(check("on_explicit: mismatch note uses the router verdict (mock: fable vs haiku)",
                      mm and "reads as `fable`" in mm["hookSpecificOutput"]["additionalContext"]))
 
+# --- report renders as Markdown -------------------------------------------------------
+st = fresh_state()
+ledger.append(st, {"kind": "decision", "outcome": "explicit", "chosen_tier": "haiku", "rec_tier": "haiku",
+                   "followed": True, "source": "openai-decisions:x (0.9)", "router_ms": 700, "confidence": 0.9})
+for aid, attr in (("a1", "model-picker"), ("a2", "unknown")):
+    ledger.append(st, {"kind": "usage", "agent_id": aid, "tier": "haiku", "input": 1000, "output": 10, "cache_read": 0,
+                       "cache_write": 0, "cost": 0.01, "baseline_cost": 0.5, "saving": 0.49, "attribution": attr})
+ledger.append(st, {"kind": "local", "model": "ollama:x", "input": 10, "output": 2, "haiku_equiv": 0.0})
+md = ledger.format_report(ledger.report(st, "all")).split("\n")
+bad = [ln for ln in md if ln.strip() and not ln.startswith(("- ", "  - ", "**", "|", "_"))]
+results += [
+    check("report markdown: every line is a heading, bullet, table row, or note", not bad),
+    check("report markdown: blank line before the table",
+          any(md[i] == "" and md[i + 1].startswith("| Model") for i in range(len(md) - 1))),
+    check("report markdown: attribution nested under the credited bullet",
+          any(ln.startswith("  - Not credited") for ln in md)),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

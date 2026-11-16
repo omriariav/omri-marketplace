@@ -111,17 +111,17 @@ def google_decisions(task, tiers, cfg):
 def run_shell(cmd, timeout, stdin=None):
     """Run a shell command with a hard timeout that also kills its children (`a; b`, pipes), so a slow
     command never outlives the hook. Returns stdout; raises on timeout or a non-zero exit."""
-    proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, start_new_session=True)
-    try:
-        out, _ = proc.communicate(stdin, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    with subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          text=True, start_new_session=True) as proc:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        proc.wait()
-        raise
+            out, _ = proc.communicate(stdin, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, AttributeError):  # AttributeError: no process groups (Windows)
+                proc.kill()
+            proc.wait()
+            raise
     if proc.returncode:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
     return out

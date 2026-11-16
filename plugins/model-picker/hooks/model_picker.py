@@ -43,10 +43,8 @@ import os
 import re
 import subprocess
 import sys
-import fcntl
 import threading
 import time
-import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -334,9 +332,31 @@ def fit_to_available(rec, cfg):
     return {**rec, "tier": target, "effort": effort, "reason": f"{rec['reason']} ({note})", "capped_from": want}
 
 
+LOCAL_MIN_CONFIDENCE = 0.75  # a wrong "local" call costs the most: the local model can't use tools at all
+
+
+def guard_local(rec, inp, cfg):
+    """Never send tool or code work to the local model.
+
+    The router only sees a one-line description, so it can read "label the keys" as text work. The full
+    prompt stays on this machine; if it (or the description) mentions files, code, git, PRs, editing or
+    tools, or the router's local call was not confident, fall back to the best non-local tier.
+    """
+    if rec.get("tier") != "local":
+        return rec
+    text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name")).lower()
+    needs_tools = bool(TOOL_RE.search(text) or EDIT_RE.search(text))
+    unsure = isinstance(rec.get("confidence"), (int, float)) and rec["confidence"] < LOCAL_MIN_CONFIDENCE
+    if not (needs_tools or unsure):
+        return rec
+    tier, why = recommend(text, str(inp.get("subagent_type") or ""), local=False)
+    note = "the task needs tools or files" if needs_tools else f"local confidence {rec['confidence']:.2f} too low"
+    return {**rec, "tier": tier, "reason": f"{why} (not local: {note})", "local_vetoed": True}
+
+
 def decide(inp, cfg, use_router=True):
     """Recommendation dict: tier, effort, reason, source, limited to the available tiers."""
-    return fit_to_available(_decide(inp, cfg, use_router), cfg)
+    return fit_to_available(guard_local(_decide(inp, cfg, use_router), inp, cfg), cfg)
 
 
 def _decide(inp, cfg, use_router=True):
@@ -537,8 +557,8 @@ def handle_subagent_stop(payload, cfg):
         # A SubagentStop systemMessage reaches neither Claude nor (reliably) the user, so queue the stamp:
         # the session's next turn (UserPromptSubmit, which also fires when the agent's result notification
         # arrives) delivers it next to the agent's report. `pid` makes each pending stamp uniquely deliverable.
-        ledger.append(cfg, {"kind": "pending_stamp", "pid": uuid.uuid4().hex, "session": payload.get("session_id"),
-                            "agent_id": payload.get("agent_id"), "text": line})
+        if not ledger.queue_stamp(cfg, payload.get("session_id"), payload.get("agent_id"), line):
+            print(json.dumps({"systemMessage": line}))  # couldn't queue: at least show it
     elif _enabled(cfg, "MODEL_PICKER_VERBOSE", default=False):
         tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
         vs = f" vs ~${totals['baseline_cost']:.3f} on {baseline}" if baseline and totals["saving"] else ""
@@ -575,47 +595,19 @@ def handle_posttool(payload, cfg):
 
 def handle_prompt(payload, cfg):
     """UserPromptSubmit: deliver stamps of background agents that finished since the last turn.
-
-    Runs on every prompt, so it reads only the tail of the current log. Concurrent turns of one session
-    (a prompt and a task notification) serialize on a lock; a turn that can't get it skips delivery and
-    the next turn picks the stamps up, so nothing is delivered twice or lost.
-    """
+    Reads only the small stamp queue, never the whole ledger, so it stays fast on every prompt."""
     if not _enabled(cfg, "MODEL_PICKER_STAMP", default=False) or not ledger.logging_enabled(cfg):
         return
     session = payload.get("session_id")
     if not session:
         return
-    lock_path = ledger.state_dir(cfg) / ".prompt.lock"
-    try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError:
+    lines = ledger.take_stamps(cfg, session)
+    if not lines:
         return
-    try:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return
-        recent = ledger.read(cfg, time.time() - 86400, tail_bytes=512 * 1024)
-        delivered = {r.get("pid") for r in recent if r.get("kind") == "stamp_delivered" and r.get("session") == session}
-        pending = [r for r in recent if r.get("kind") == "pending_stamp" and r.get("session") == session
-                   and r.get("text") and r.get("pid") and r["pid"] not in delivered]
-        if not pending:
-            return
-        latest = {}
-        for r in pending:  # a resumed agent stops more than once: show only its newest stamp
-            latest[r.get("agent_id") or r["pid"]] = r
-        for r in pending:  # but mark every pending one delivered
-            ledger.append(cfg, {"kind": "stamp_delivered", "session": session, "pid": r["pid"]})
-        lines = [r["text"] for r in latest.values()]
-        context = ("Background agents finished since your last turn. Their actual models, from the transcripts:\n"
-                   + "\n".join(lines) + "\nWhen you report what one of them produced, name its model.")
-        print(json.dumps({"systemMessage": "\n".join(lines),
-                          "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
+    context = ("Background agents finished since your last turn. Their actual models, from the transcripts:\n"
+               + "\n".join(lines) + "\nWhen you report what one of them produced, name its model.")
+    print(json.dumps({"systemMessage": "\n".join(lines),
+                      "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
 
 
 def agent_calls(script):

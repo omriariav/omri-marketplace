@@ -132,7 +132,7 @@ Asking a model which model it is gives unreliable answers, and behind a gateway 
 
 - **Foreground subagents:** when the `Agent` call returns, a line like this is shown to you and added to Claude's context, and Claude is told to name that model when it reports the result:
   `[model-picker] web-fetch ran on claude-haiku-5-5 · 13K tokens · ~$0.001 (~$0.055 on opus)`
-- **Background subagents:** their `Agent` call returns at launch, so the stamp is queued when they finish (SubagentStop) and delivered on the session's next turn (UserPromptSubmit), which also fires when the agent's result notification arrives. Claude sees it next to the agent's report and names the model; you see it too. Each stamp is delivered once per session; a resumed agent's newer stamp is delivered again.
+- **Background subagents:** their `Agent` call returns at launch, so the stamp is queued when they finish (SubagentStop) and delivered on the session's next turn (UserPromptSubmit), which also fires when the agent's result notification arrives. Claude sees it next to the agent's report and names the model; you see it too. Queued stamps sit in `pending-stamps.jsonl` (24 h) and are delivered exactly once to their own session; a resumed agent's newer stamp is delivered again. Stamps don't carry over after `/clear`.
 - **`ask_local` answers** end with `[model-picker] answered by ollama:<model> · N in / M out tokens · $0 · Xs`.
 - **Replies (opt-in):** `MODEL_PICKER_STAMP_REPLIES=1` asks Claude to end every reply with its model id, taken from its system prompt. Off by default because it adds a line to every reply.
 

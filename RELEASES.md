@@ -5,9 +5,11 @@
 Fix: stamps for background agents never reached anyone. Claude Code runs most agents in the background, and their stamp was only a SubagentStop `systemMessage`, which Claude never receives and the user didn't see.
 
 - Background stamps are now queued when the agent finishes and delivered on the session's next turn through a new UserPromptSubmit hook, which also fires when the agent's result notification arrives. Claude gets the stamp next to the agent's report, with a rule to name that model.
-- Delivered once per session; a resumed agent's newer stamp is delivered again. Off unless `MODEL_PICKER_STAMP=1`.
-- Smoke-tested in a real headless session: a background Haiku agent's stamp was quoted verbatim by Claude when its result arrived.
-- Tests: 168.
+- Queued stamps live in a small `pending-stamps.jsonl` (kept 24 h), read in full under a lock: each is delivered exactly once to its own session (8 racing turns tested), a resumed agent's newer stamp is delivered again, and a failed bookkeeping write delivers nothing rather than repeating on every prompt. With `MODEL_PICKER_LOG=0` the stamp falls back to a plain user-visible line. Off unless `MODEL_PICKER_STAMP=1`. Stamps don't carry over after `/clear` or into a new session.
+- `local` is never recommended for work whose description or full prompt mentions files, code, git, PRs, editing or tools, or when the router's local call is below 0.75 confidence. The check runs locally; the prompt is never sent anywhere. (Found in a real session: Jev picked `local` at 0.60 for "Label … keys pending", which was a code-and-git task.)
+- `ledger.read()` skips rotated files older than the requested window by their name; a tail-read edge case no longer drops a complete record.
+- Smoke-tested three times in real headless sessions: a background Haiku agent's stamp was quoted verbatim by Claude when its result arrived.
+- Tests: 184.
 
 ## model-picker v0.4.3 (2026-11-16)
 

@@ -487,8 +487,7 @@ with tempfile.TemporaryDirectory() as d:
     fgstop = hook("subagentstop", {"agent_id": "fg", "transcript_path": str(sess)}, on)
     results += [
         check("stamp: background stamp queued at SubagentStop for the next turn",
-              any(r.get("kind") == "pending_stamp" and "ran on claude-haiku-5-5" in r.get("text", "")
-                  for r in ledger.read(on))),
+              any("ran on claude-haiku-5-5" in r.get("text", "") for r in ledger._queue_read(on))),
         check("stamp: foreground not double-stamped at SubagentStop", fgstop is None),
     ]
     ctx = hook("session", {}, {"MODEL_PICKER_STAMP": "1", "MODEL_PICKER_STAMP_REPLIES": "1", **OL})
@@ -556,7 +555,7 @@ with tempfile.TemporaryDirectory() as d:
     results += [
         check("stamp: unknown shape, unfinished -> not stamped at PostToolUse", pt_unfinished is None),
         check("stamp: unknown shape -> stamp queued once at SubagentStop",
-              sum(1 for r in ledger.read(on) if r.get("kind") == "pending_stamp") == 1),
+              len(ledger._queue_read(on)) == 1),
         check("stamp: later PostToolUse gives Claude the stamp without repeating it to the user",
               pt_after and "additionalContext" in pt_after["hookSpecificOutput"] and "systemMessage" not in pt_after),
         check("stamp: missing meta never crashes PostToolUse",
@@ -816,7 +815,7 @@ with tempfile.TemporaryDirectory() as d:
     # Race: a resumed agent's second pending lands after the first delivery read: it must still be delivered.
     hookrun("subagentstop", {"session_id": "S", "agent_id": "x", "transcript_path": str(sess)}, on)
     first = hookrun("prompt", {"session_id": "S"}, on)
-    ledger.append(on, {"kind": "pending_stamp", "pid": "late", "session": "S", "agent_id": "x", "text": "[model-picker] x ran on late"})
+    ledger.queue_stamp(on, "S", "x", "[model-picker] x ran on late")
     second = hookrun("prompt", {"session_id": "S"}, on)
     third = hookrun("prompt", {"session_id": "S"}, on)
     results += [
@@ -825,37 +824,43 @@ with tempfile.TemporaryDirectory() as d:
               second and "ran on late" in second["hookSpecificOutput"]["additionalContext"]),
         check("pid dedupe: nothing delivered twice", third is None),
     ]
-    # Concurrency: while another turn holds the delivery lock, this turn skips (no double delivery).
-    import fcntl as _fc
-    ledger.append(on, {"kind": "pending_stamp", "pid": "busy", "session": "S", "agent_id": "y", "text": "[model-picker] y ran on z"})
-    lfd = os.open(Path(on["MODEL_PICKER_STATE_DIR"]) / ".prompt.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    _fc.flock(lfd, _fc.LOCK_EX)
-    skipped = hookrun("prompt", {"session_id": "S"}, on)
-    _fc.flock(lfd, _fc.LOCK_UN)
-    os.close(lfd)
-    picked = hookrun("prompt", {"session_id": "S"}, on)
-    results += [
-        check("lock busy: this turn skips delivery", skipped is None),
-        check("lock free: next turn delivers it", picked and "y ran on z" in picked["hookSpecificOutput"]["additionalContext"]),
-    ]
+    # Concurrency: 8 turns of one session racing for one stamp deliver it exactly once.
+    ledger.queue_stamp(on, "S", "y", "[model-picker] y ran on z")
+    procs = [subprocess.Popen([sys.executable, "-I", str(HOOK), "prompt", str(ROOT)], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True, env={**os.environ, **on}) for _ in range(8)]
+    outs = [p.communicate(json.dumps({"session_id": "S"}))[0] for p in procs]
+    results.append(check("8 racing turns: stamp delivered exactly once", sum("y ran on z" in o for o in outs) == 1))
+    # Another session's queued stamp is never taken by this session.
+    ledger.queue_stamp(on, "OTHER", "w", "[model-picker] w ran on q")
+    results.append(check("queue: other session's stamp untouched", hookrun("prompt", {"session_id": "S"}, on) is None
+                         and ledger.take_stamps(on, "OTHER") == ["[model-picker] w ran on q"]))
+    # Bookkeeping failure: if the queue can't be rewritten, nothing is shown (never re-shown on every prompt).
+    ledger.queue_stamp(on, "S", "v", "[model-picker] v ran on u")
+    qdir = Path(on["MODEL_PICKER_STATE_DIR"])
+    os.chmod(qdir, 0o500)
+    try:
+        blocked = ledger.take_stamps(on, "S")
+    finally:
+        os.chmod(qdir, 0o700)
+    results.append(check("queue write failure: nothing delivered, stamp kept for later",
+                         blocked == [] and ledger.take_stamps(on, "S") == ["[model-picker] v ran on u"]))
     results.append(check("prompt hook errors are silent", subprocess.run(
         [sys.executable, "-I", str(HOOK), "prompt", str(ROOT)], input="not json", capture_output=True, text=True,
         env={**os.environ, **on}).stdout == ""))
 
-# read(): rotated files older than `since` are skipped; tail mode still sees a just-rotated pending stamp.
+# read(): rotated files older than `since` are skipped by name.
 st = fresh_state()
 sdir = Path(st["MODEL_PICKER_STATE_DIR"])
 sdir.mkdir(parents=True, exist_ok=True)
 old_ms = int((time.time() - 3 * 86400) * 1000)
 (sdir / f"log.{old_ms}.jsonl").write_text(json.dumps({"ts": time.time() - 3 * 86400 - 10, "kind": "decision"}) + "\n")
-new_ms = int(time.time() * 1000)
-(sdir / f"log.{new_ms}.jsonl").write_text(json.dumps({"ts": time.time() - 5, "kind": "pending_stamp", "pid": "r",
-                                                      "session": "S", "text": "t"}) + "\n")
-recent = ledger.read(st, time.time() - 86400)
-tail = ledger.read(st, time.time() - 86400, tail_bytes=4096)
+results.append(check("read: old rotated file skipped by its name",
+                     all(r.get("kind") != "decision" for r in ledger.read(st, time.time() - 86400))))
+tf = sdir / "tail.txt"
+tf.write_text("aaaa\nbbbb\ncccc\n")
 results += [
-    check("read: old rotated file skipped by its name", all(r.get("kind") != "decision" for r in recent)),
-    check("read tail: just-rotated pending stamp still seen", any(r.get("pid") == "r" for r in tail)),
+    check("tail: window starting exactly at a line keeps it", ledger._tail_lines(tf, 10) == ["bbbb", "cccc"]),
+    check("tail: window starting mid-line drops the partial", ledger._tail_lines(tf, 8) == ["bbb", "cccc"][1:]),
 ]
 big = sdir / "log.jsonl"
 with open(big, "w") as fh:
@@ -865,6 +870,20 @@ t0 = time.monotonic()
 hookrun("prompt", {"session_id": "S"}, {**st, "MODEL_PICKER_STAMP": "1"})
 dt = time.monotonic() - t0
 results.append(check(f"prompt hook on a ~5MB ledger stays fast ({dt*1000:.0f} ms incl. interpreter start)", dt < 0.35))
+
+# --- local veto (real-session finding) ---------------------------------------------------
+lv = {"tier": "local", "effort": "low", "reason": "r", "source": "openai-decisions:x (0.90)", "confidence": 0.9}
+results += [
+    check("local veto: code/git work in the prompt is never local",
+          mp.guard_local(lv, {"description": "Label vendor-dependent keys pending",
+                              "prompt": "Edit SKILL.md and the config, then open a PR with git"}, {})["tier"] != "local"),
+    check("local veto: unsure local call falls back",
+          mp.guard_local({**lv, "confidence": 0.60}, {"description": "Label keys", "prompt": "label these"}, {})["tier"] != "local"),
+    check("local kept: confident, pasted-text-only task",
+          mp.guard_local(lv, {"description": "Translate sentence", "prompt": "Translate this sentence into French: hello"},
+                         {})["tier"] == "local"),
+    check("local veto: non-local recs untouched", mp.guard_local({**lv, "tier": "sonnet"}, {"prompt": "edit code"}, {})["tier"] == "sonnet"),
+]
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

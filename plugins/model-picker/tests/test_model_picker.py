@@ -98,7 +98,7 @@ results += [
     check("local: needs files -> not local", mp.recommend("summarize the log files", local=True)[0] == "haiku"),
     check("local: disabled -> haiku", mp.recommend("summarize this paragraph")[0] == "haiku"),
     check("local: hint in deny reason",
-          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify the sentiment of this sentence"),
+          "gateway maps haiku" in json.dumps(run(agent(description="classify", prompt="classify the sentiment of this sentence: I love it, works great"),
                                                  "enforce", LOCAL))),
 ]
 
@@ -452,7 +452,7 @@ results.append(check("mcp: Ollama down -> isError, not a crash",
 off = mcp([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}], {**OL, "MODEL_PICKER_OLLAMA": "0"})
 results.append(check("mcp: MODEL_PICKER_OLLAMA=0 hides tools", off[0]["result"]["tools"] == []))
 results.append(check("local tier on via OLLAMA_MODEL", mp.local_hint(OL) and "ask_local" in mp.local_hint(OL)
-                     and mp.decide({"description": "summarize this paragraph", "prompt": "summarize this paragraph"},
+                     and mp.decide({"description": "summarize this paragraph", "prompt": "summarize this paragraph: The cat sat on the mat all day long."},
                                    OL)["tier"] == "local"))
 srv.shutdown()
 
@@ -877,29 +877,43 @@ hookrun("prompt", {"session_id": "S"}, {**st, "MODEL_PICKER_STAMP": "1"})
 dt = time.monotonic() - t0
 results.append(check(f"prompt hook on a ~5MB ledger stays fast ({dt*1000:.0f} ms incl. interpreter start)", dt < 0.35))
 
-# --- local veto (real-session finding) ---------------------------------------------------
-lv = {"tier": "local", "effort": "low", "reason": "r", "source": "openai-decisions:x (0.90)", "confidence": 0.9}
+
+# --- local guard: `local` must be earned (both review rounds' examples) ------------------
+LV = {"tier": "local", "effort": "low", "reason": "r", "source": "openai-decisions:x (0.90)", "confidence": 0.9}
+TOOL_WORK = [  # (description, prompt): must never stay local
+    ("Label vendor-dependent keys pending", "Add a pending label to the two keys in SKILL.md and open a PR"),
+    ("Tidy config", "edit config.yaml and commit the change"),
+    ("Docs", "update the README"), ("Bug", "fix the bug in auth"), ("Logs", "look at the logs"),
+    ("Diff", "check the diff"), ("Tests", "Run pytest and report failures"), ("PR", "Review my PR #12"),
+    ("Cleanup", "Delete the temp folder"), ("Debug", "Debug the failing test"), ("Test", "Add a test for login"),
+    ("TODOs", "Find all TODOs in the codebase"), ("Files", "List the files in the repo"),
+    ("Migrate", "execute the migration"), ("Sync", "pull the latest changes"), ("API", "curl the endpoint"),
+    ("Save", "Write the results to a file"), ("Rename", "Rename the variable foo to bar across the project"),
+    ("Summarize text", "Summarize this:\n" + "word " * 120 + "\nthen git commit the changes and open a PR"),
+    ("Notes", "Summarize the meeting notes"),  # nothing pasted: ask_local can't see them
+]
+TEXT_WORK = [  # must stay local
+    ("Summarize this email", "Summarize this email in 3 bullets:\n\nHi team, see the link and page 3.5 e.g. and/or notes."),
+    ("Summarize", "Summarize the 3.5 results: revenue up 3.5%, churn flat, NPS 41 (see page 2)."),
+    ("Extract names", "Extract the names from the paragraph below: Bob and/or Alice met Carol in Paris."),
+    ("Translate", "Translate to French: hello, e.g. world"),
+    ("Translate", "Translate: see config.yaml for details"),
+    ("Summarize log", "Summarize this log: Traceback (most recent call last): File main.py line 3 KeyError 'x'"),
+    ("Classify", "Classify the sentiment of this review: The battery died after two days."),
+]
+bad_local = [p for d, p in TOOL_WORK if mp.guard_local(LV, {"description": d, "prompt": p}, {})["tier"] == "local"]
+bad_vetoed = [p for d, p in TEXT_WORK if mp.guard_local(LV, {"description": d, "prompt": p}, {})["tier"] != "local"]
 results += [
-    check("local veto: code/git work in the prompt is never local",
-          mp.guard_local(lv, {"description": "Label vendor-dependent keys pending",
-                              "prompt": "Edit SKILL.md and the config, then open a PR with git"}, {})["tier"] != "local"),
-    check("local kept: pasted email text",
-          mp.guard_local(lv, {"description": "Summarize this email", "prompt": "Summarize this email in 3 bullets:\n\nHi team, see the link and page 3.5 e.g. and/or notes"}, {})["tier"] == "local"),
-    check("local kept: translation with e.g.", mp.guard_local(lv, {"description": "Translate",
-          "prompt": "Translate to French: hello, e.g. world"}, {})["tier"] == "local"),
-    check("local veto: code path in instructions",
-          mp.guard_local(lv, {"description": "Tidy", "prompt": "Update hooks/model_picker.py to rename x"}, {})["tier"] != "local"),
-    check("local veto: tool verb only counts in the instruction head",
-          mp.guard_local(lv, {"description": "Summarize text", "prompt": "Summarize this:\n" + "x " * 300 + " then git push"}, {})["tier"] == "local"),
-    check("local veto: metadata reset (no stale router source/confidence)",
+    check(f"local guard: no tool work stays local ({len(TOOL_WORK)} cases){' -> ' + str(bad_local) if bad_local else ''}",
+          not bad_local),
+    check(f"local guard: pasted-text work stays local ({len(TEXT_WORK)} cases){' -> ' + str(bad_vetoed) if bad_vetoed else ''}",
+          not bad_vetoed),
+    check("local guard: low confidence falls back",
+          mp.guard_local({**LV, "confidence": 0.6}, {"description": d, "prompt": p}, {})["tier"] != "local") if (d := TEXT_WORK[0][0]) and (p := TEXT_WORK[0][1]) else False,
+    check("local guard: vetoed rec metadata reset",
           (lambda r: r["source"].startswith("heuristic (local vetoed") and r["confidence"] is None and r["effort"] == "medium")(
-              mp.guard_local(lv, {"description": "Edit the config", "prompt": "edit config.yaml and commit"}, {}))),
-    check("local veto: unsure local call falls back",
-          mp.guard_local({**lv, "confidence": 0.60}, {"description": "Label keys", "prompt": "label these"}, {})["tier"] != "local"),
-    check("local kept: confident, pasted-text-only task",
-          mp.guard_local(lv, {"description": "Translate sentence", "prompt": "Translate this sentence into French: hello"},
-                         {})["tier"] == "local"),
-    check("local veto: non-local recs untouched", mp.guard_local({**lv, "tier": "sonnet"}, {"prompt": "edit code"}, {})["tier"] == "sonnet"),
+              mp.guard_local(LV, {"description": "Docs", "prompt": "update the README"}, {}))),
+    check("local guard: non-local recs untouched", mp.guard_local({**LV, "tier": "sonnet"}, {"prompt": "x"}, {})["tier"] == "sonnet"),
 ]
 
 print(f"\n{sum(results)}/{len(results)} passed")

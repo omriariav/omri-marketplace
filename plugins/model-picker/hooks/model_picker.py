@@ -333,36 +333,54 @@ def fit_to_available(rec, cfg):
 
 
 LOCAL_MIN_CONFIDENCE = 0.75  # a wrong "local" call costs the most: the local model can't use tools at all
-# Tool-use intent in the *instructions* (not in pasted content): verbs that need files, git, a shell or the web,
-# and code-file paths. Ordinary words like "email", "page" or "link" don't count: they appear in text to summarize.
-AGENT_ACTION_RE = re.compile(
-    r"\b(edit|modify|commit|push|merge|rebase|open (a |the )?(pr|pull request)|pull request|git|"
-    r"run (the )?(tests?|command|script|suite)|grep|search (the |this )?(repo|codebase|files?|directory)|"
-    r"(read|open|load|scan) (the |this |each )?(file|files|repo|directory|folder)|"
-    r"create (a |the )?(file|branch|pr|directory)|apply (the |a )?(patch|fix|change)|patch|refactor|implement|"
-    r"install|deploy|browse|fetch (the |this )?(url|page|site)|navigate to)\b"
-    r"|(^|[\s(`'\"])[\w./-]+\.(py|ts|tsx|js|jsx|md|json|ya?ml|sh|go|rb|java|toml|sql|txt|csv|ipynb)\b",
+# `local` must be earned: the local model only transforms text that is already in the prompt.
+LOCAL_TASK_START_RE = re.compile(
+    r"^\W*(please\s+)?(summari[sz]e|translate|classify|categori[sz]e|extract|rephrase|rewrite|paraphrase|"
+    r"proofread|shorten|simplify|tag|label)\b", re.I)
+# Action verbs inside an otherwise text-transform instruction ("summarize the logs and fix the bug").
+# Tasks that don't start with a transform verb are not local anyway, so words like review/check aren't needed.
+INSTRUCTION_ACTION_RE = re.compile(
+    r"\b(fix|update|debug|delete|remove|rename|run|execute|curl|find|search|grep|commit|push|merge|deploy|"
+    r"install|edit|modify|implement|refactor|create|write to|save)\b",
     re.I)
-INSTRUCTION_CHARS = 400  # instructions come first; anything after is usually the material to work on
+# Unmistakable tool work anywhere in the prompt (multi-word, so pasted prose rarely trips it).
+STRONG_TOOL_RE = re.compile(
+    r"\b(git (add|commit|push|pull|diff|log|checkout|rebase)|pull request|open (a|the) pr|run (the )?tests|pytest|"
+    r"npm (test|run|install)|commit (the|your|these|all) changes|edit (the )?(repo|repository|codebase|files?)|"
+    r"in the (repo|repository|codebase))\b", re.I)
+LOCAL_MIN_MATERIAL = 12  # chars of pasted material after the instruction
+
+
+def local_ok(inp):
+    """True only when the task is plainly "transform this pasted text": a text-transform verb starts the
+    instruction, the material is included, and nothing asks for tools. (Checked locally; never sent.)"""
+    desc = str(inp.get("description") or inp.get("name") or "")
+    prompt = str(inp.get("prompt") or "")
+    m = re.search(r"[:\n]", prompt)
+    instruction = prompt[:m.start()] if m else prompt
+    material = prompt[m.end():].strip() if m else ""
+    starts_right = bool(LOCAL_TASK_START_RE.search(instruction) or LOCAL_TASK_START_RE.search(desc))
+    return (starts_right and len(material) >= LOCAL_MIN_MATERIAL
+            and not INSTRUCTION_ACTION_RE.search(f"{desc} {instruction}")
+            and not STRONG_TOOL_RE.search(prompt))
 
 
 def guard_local(rec, inp, cfg):
-    """Never send tool or code work to the local model.
+    """Only keep a `local` recommendation for plain text transformation of pasted material.
 
-    The router only sees a one-line description, so it can read "label the keys" as text work. The full
-    prompt stays on this machine. Its instruction part (description + first INSTRUCTION_CHARS of the
-    prompt) is checked for tool-use verbs and code-file paths; pasted material after that is ignored.
-    A local call below LOCAL_MIN_CONFIDENCE is also not trusted.
+    The router only sees a one-line description ("label the keys" sounds like text work). The full
+    prompt stays on this machine and must show the task is pure transformation (local_ok); a local
+    call below LOCAL_MIN_CONFIDENCE is also not trusted.
     """
     if rec.get("tier") != "local":
         return rec
-    head = f"{inp.get('description') or inp.get('name') or ''} {str(inp.get('prompt') or '')[:INSTRUCTION_CHARS]}"
-    needs_tools = bool(AGENT_ACTION_RE.search(head))
+    ok = local_ok(inp)
     unsure = isinstance(rec.get("confidence"), (int, float)) and rec["confidence"] < LOCAL_MIN_CONFIDENCE
-    if not (needs_tools or unsure):
+    if ok and not unsure:
         return rec
-    tier, why = recommend(head.lower(), str(inp.get("subagent_type") or ""), local=False)
-    note = "the instructions need tools or files" if needs_tools else f"local confidence {rec['confidence']:.2f} too low"
+    text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt")).lower()[:2000]
+    tier, why = recommend(text, str(inp.get("subagent_type") or ""), local=False)
+    note = "not a pure text task on pasted material" if not ok else f"local confidence {rec['confidence']:.2f} too low"
     # The router chose local, not this tier: don't keep its effort, confidence or source on a tier it never picked.
     return {**rec, "tier": tier, "effort": "medium", "reason": f"{why} (not local: {note})",
             "source": f"heuristic (local vetoed: {note})", "confidence": None,

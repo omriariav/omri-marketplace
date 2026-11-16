@@ -11,7 +11,7 @@ Fixes from a post-release review of v0.4.1's `MODEL_PICKER_TIERS`.
 - A `MODEL_PICKER_TIERS` value naming no Claude tier is ignored with a session warning instead of silently allowing every tier; non-string list items no longer crash the hook.
 - New opt-in `MODEL_PICKER_ROUTER_ON_EXPLICIT=1`: the router also judges launches that already set a model (about 0.7 s each), so the follow rate and credited savings reflect a real verdict instead of mostly "unjudged".
 - Pre-merge review fixes: session rules describe the step-up rule; a launch denied in `enforce` and retried counts once; a model name that merely contains "local" is not the local tier.
-- Tests: 152.
+- Tests: 159.
 
 ## model-picker v0.4.1 (2026-11-16)
 

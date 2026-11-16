@@ -460,9 +460,11 @@ def handle_agent(payload, mode, cfg):
 
     # An explicit model is judged by the keyword heuristic (instant) unless MODEL_PICKER_ROUTER_ON_EXPLICIT
     # asks the router to judge it too: ~0.7s per launch, but every launch gets a real verdict.
-    rec = decide(inp, cfg, use_router=not model or _enabled(cfg, "MODEL_PICKER_ROUTER_ON_EXPLICIT", default=False))
-    session_model = ledger.last_model(payload.get("transcript_path"))
     chosen_unavailable = bool(model) and bool(tier_of(model)) and tier_of(model) not in available_tiers(cfg)
+    # No router round trip for a launch that is about to be redirected anyway.
+    rec = decide(inp, cfg, use_router=not chosen_unavailable and (
+        not model or _enabled(cfg, "MODEL_PICKER_ROUTER_ON_EXPLICIT", default=False)))
+    session_model = ledger.last_model(payload.get("transcript_path"))
     outcome = ("denied" if mode == "enforce" and (not model or chosen_unavailable)
                else "explicit" if model else "missing")
     log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,

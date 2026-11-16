@@ -691,5 +691,54 @@ results += [
     check("on_explicit on: router verdict sets followed (mock says fable)", d[-1].get("followed") is True),
 ]
 
+# --- re-review: lock in verified behaviour --------------------------------------------
+def outcomes(env, launches, mode):
+    st = fresh_state()
+    for inp in launches:
+        run(agent(**inp), mode, {**env, **st})
+    return [r.get("outcome") for r in ledger.read(st) if r.get("kind") == "decision"]
+
+
+with tempfile.TemporaryDirectory() as proj:
+    adir = Path(proj) / ".claude/agents"
+    adir.mkdir(parents=True)
+    (adir / "fab.md").write_text("---\nname: fab\nmodel: fable\n---\nbody\n")
+    pinned_env = {**NOFABLE, "CLAUDE_PROJECT_DIR": proj}
+    results += [
+        check("pinned+unavailable: enforce logs denied", outcomes(pinned_env, [{"subagent_type": "fab", "prompt": "p"}],
+                                                                  "enforce") == ["denied"]),
+        check("pinned+unavailable: advise logs pinned", outcomes(pinned_env, [{"subagent_type": "fab", "prompt": "p"}],
+                                                                 "advise") == ["pinned"]),
+    ]
+results += [
+    check("explicit unavailable: advise logs explicit",
+          outcomes(NOFABLE, [{"description": "d", "prompt": "p", "model": "fable"}], "advise") == ["explicit"]),
+    check("missing model: enforce denied / advise missing",
+          outcomes({}, [{"description": "d", "prompt": "p"}], "enforce") == ["denied"]
+          and outcomes({}, [{"description": "d", "prompt": "p"}], "advise") == ["missing"]),
+]
+down = {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": "http://127.0.0.1:9",
+        "MODEL_PICKER_ROUTER_API_KEY_ENV": "none", "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+st = fresh_state()
+o = run(agent(description="Find logs", prompt="p", model="haiku"), "enforce", {**down, **st})
+d = [r for r in ledger.read(st) if r.get("kind") == "decision"][-1]
+results.append(check("on_explicit + router down: not blocked, heuristic source",
+                     (o is None or o.get("hookSpecificOutput", {}).get("permissionDecision") != "deny")
+                     and str(d.get("source", "")).startswith("heuristic (router")))
+slow_srv = HTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=slow_srv.serve_forever, daemon=True).start()
+SEEN.clear()
+run(agent(description="Big", prompt="p", model="fable"), "enforce",
+    {**NOFABLE, "MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{slow_srv.server_port}",
+     "MODEL_PICKER_ROUTER_API_KEY_ENV": "none", "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1", **fresh_state()})
+results.append(check("on_explicit: no router call for a launch on an unavailable model", len(SEEN) == 0))
+SEEN.clear()
+mm = run(agent(description="Find logs", prompt="p", model="haiku"), "advise",
+         {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{slow_srv.server_port}",
+          "MODEL_PICKER_ROUTER_API_KEY_ENV": "none", "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1", **fresh_state()})
+slow_srv.shutdown()
+results.append(check("on_explicit: mismatch note uses the router verdict (mock: fable vs haiku)",
+                     mm and "reads as `fable`" in mm["hookSpecificOutput"]["additionalContext"]))
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

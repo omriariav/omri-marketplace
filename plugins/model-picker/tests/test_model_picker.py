@@ -1544,5 +1544,75 @@ results += [
           "you asked" not in (prompt_hook("please use opus for the code review", off2) or {}).get("systemMessage", "")),
 ]
 
+# v0.4.10: floors can set a minimum effort ("opus/high").
+FE = {"MODEL_PICKER_FLOORS": json.dumps({"review": "opus/high", "docs": "sonnet", "bad": "opus/extreme"})}
+base_rec = {"tier": "opus", "effort": "medium", "reason": "r", "source": "x", "unsure": False}
+r_eff = mp.apply_floors(base_rec, {"description": "Review PR 60"}, FE)
+r_both = mp.apply_floors({**base_rec, "tier": "haiku", "effort": "low"}, {"description": "review the diff"}, FE)
+r_keep = mp.apply_floors({**base_rec, "effort": "high"}, {"description": "review the diff"}, {"MODEL_PICKER_FLOORS": '{"review": "opus/medium"}'})
+results += [
+    check("floor effort: parsed; an unknown effort level skips the entry",
+          [(f[1], f[2], f[3]) for f in mp._floors(FE)] == [("review", "opus", "high"), ("docs", "sonnet", None)]),
+    check("floor effort: raises effort alone when the model already meets the floor (not credited as the rule's model)",
+          r_eff["tier"] == "opus" and r_eff["effort"] == "high" and not r_eff.get("floor")
+          and r_eff["floor_effort"] == "high" and "effort raised to high by your rule \"review\"" in r_eff["reason"]),
+    check("floor effort: raises model and effort together", (r_both["tier"], r_both["effort"]) == ("opus", "high")),
+    check("floor effort: never lowers effort", r_keep["effort"] == "high" and not r_keep.get("floor")),
+]
+fst2 = {**fresh_state(), **FE}
+below = run(agent(description="Review PR 60 for bugs", prompt="p", model="opus"), "advise", fst2)
+at = run(agent(description="Review PR 60 for bugs", prompt="p", model="opus", effort="high"), "advise", fst2)
+results += [
+    check("floor effort: a launch under the floor (no effort set) is reminded of the rule",
+          "matches your MODEL_PICKER_FLOORS rule (at least opus/high effort)" in json.dumps(below)
+          and "with no effort set" in json.dumps(below)),
+    check("floor effort: a launch that meets the floor gets no reminder", "MODEL_PICKER_FLOORS" not in json.dumps(at)),
+]
+
+# v0.4.10 review: fitted floors, stronger tiers meet effort floors, labels, stamp effort.
+nf = {"MODEL_PICKER_TIERS": "haiku,sonnet,opus", "MODEL_PICKER_FLOORS": '{"review": "fable/max"}'}
+fit_rec = mp.decide({"description": "review the auth change"}, nf, use_router=False)
+results += [
+    check("floor: an unavailable floor tier steps to an available one, keeping a max effort",
+          (fit_rec["tier"], fit_rec["effort"]) == ("opus", "max") and fit_rec["floor_min"] == "opus/max"),
+    check("floor: no reminder demands an unavailable tier",
+          mp._below_floor(fit_rec, "opus", "max") is None and mp._below_floor(fit_rec, "opus", "high") == "opus/max effort"),
+]
+sh = {"MODEL_PICKER_FLOORS": '{"review": "sonnet/high"}'}
+strong = mp.apply_floors({**base_rec, "tier": "fable", "effort": "low"}, {"description": "review"}, sh)
+results += [
+    check("floor: a stronger model meets an effort floor at any effort",
+          strong["effort"] == "low" and not strong.get("floor_effort")
+          and mp._below_floor({"floor_min": "sonnet/high"}, "opus", "medium") is None
+          and mp._below_floor({"floor_min": "sonnet/high"}, "sonnet", "medium") == "sonnet/high effort"),
+]
+mix = mp.apply_floors({**base_rec, "tier": "haiku", "effort": "low"}, {"description": "review the docs and tests"},
+                      {"MODEL_PICKER_FLOORS": json.dumps({"review": "opus", "docs": "sonnet/high", "test": "haiku"})})
+results += [
+    check("floor: the reason names only the rules that set the minimum",
+          mix["tier"] == "opus" and mix["floor"] == "review" and "docs" not in mix["reason"] and "test" not in mix["reason"]),
+    check("stamp: an effort set by a floor is compared even on keyword-rule recommendations",
+          ledger.stamp_verdict({"rec_tier": "opus", "rec_effort": "high", "source": "heuristic + floor", "chosen_tier": "opus",
+                                "outcome": "explicit", "floor_effort": "high"}, "medium").endswith("effort differs")),
+]
+
+# v0.4.10 re-review.
+xf = {"MODEL_PICKER_TIERS": "haiku,sonnet,opus", "MODEL_PICKER_FLOORS": '{"review": "opus/xhigh"}'}
+xr = mp.decide({"description": "plan the architecture for a major refactor, review it"}, xf, use_router=False)
+both = mp.apply_floors({**base_rec, "tier": "sonnet", "effort": "medium"}, {"description": "review"}, {"MODEL_PICKER_FLOORS": '{"review": "opus/high"}'})
+results += [
+    check("stamp: a router verdict with unknown effort doesn't claim 'effort differs'",
+          ledger.stamp_verdict(dec(), None) == " · ✓ followed jev-latest (opus/high)"),
+    check("floor: an unavailable stronger pick is fitted before the floor applies",
+          (xr["tier"], xr["effort"]) == ("opus", "xhigh") and mp._below_floor(xr, "opus", "xhigh") is None),
+    check("floor: raising model and effort records the effort too, and the stamp compares it",
+          both.get("floor") == "review" and both.get("floor_effort") == "high"
+          and ledger.stamp_verdict({"rec_tier": "opus", "rec_effort": "high", "source": "heuristic + floor", "chosen_tier": "opus",
+                                    "outcome": "explicit", "floor": "review", "floor_effort": "high"}, None).endswith("effort differs")),
+    check("stamp: an effort-only floor is named", "+ your floor" in ledger.stamp_verdict(
+          {"rec_tier": "sonnet", "rec_effort": "high", "source": "heuristic + floor", "chosen_tier": "opus",
+           "outcome": "explicit", "floor_effort": "high"}, "medium")),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

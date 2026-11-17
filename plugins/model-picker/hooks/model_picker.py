@@ -735,16 +735,21 @@ ASK_EFFORTS = "low|medium|high|xhigh|max"
 _VERB = r"\b(?:use|run|launch|spawn|start|switch\s+to|go\s+with|try|pick|do)\b"
 _ASK_TIER_RX = re.compile(
     _VERB + r"[^.;:!?\n]{0,30}?"
-    r"(?:\b(?:the|a|an)\s+(?:claude[- ])?(?P<t1>" + ASK_TIERS + r")(?:[- ]?\d(?:\.\d)?)?\s+(?:agents?|subagents?|model)\b(?!\s+(?:definition|file|config))"
-    r"|(?<![\w-])(?:claude[- ])?(?P<t2>" + ASK_TIERS + r")\b(?!\s+(?:poem|poems|about))(?![- ](?:agent\s+)?definition))", re.I)
+    r"(?:\b(?:the|a|an)\s+(?:claude[- ])?(?P<t1>" + ASK_TIERS + r")(?:[- ]?\d+(?:[.-]\d+)*)?\s+(?:agents?|subagents?|model)\b(?!['’]s\b)(?!\s+(?:definition|file|config))"
+    r"|(?<![\w-])(?:claude[- ])?(?P<t2>" + ASK_TIERS + r")(?:[- ]?\d+(?:[.-]\d+)*)?(?![\w-])"
+    r"(?!\s+(?:poem|poems|about))(?!\s+(?:agent\s+)?definition))", re.I)
+_ANY_TIER = re.compile(r"(?<![\w-])(?:claude[- ])?(" + ASK_TIERS + r")(?:[- ]?\d+(?:[.-]\d+)*)?(?![\w-])", re.I)
 _ASK_EFFORT_RX = [
     re.compile(r"\b(?:use|run|at|with|on)\s+(" + ASK_EFFORTS + r")[- ]effort\b", re.I),
     re.compile(r"\beffort\s*[:=]\s*(" + ASK_EFFORTS + r")\b", re.I),
     re.compile(r"\bset\s+(?:the\s+)?effort\s+to\s+(" + ASK_EFFORTS + r")\b", re.I),
 ]
-_NEGATION = re.compile(r"\b(?:don'?t|do\s+not|not|never|no|avoid|instead\s+of|rather\s+than|without|except)\b"
+_NEGATION = re.compile(r"\b(?:don['’]?t|do\s+not|(?:can|won|shouldn|mustn|doesn|didn|isn|wouldn)['’]?t|cannot|not|never|no"
+                       r"|avoid|stop|instead\s+of|rather\s+than|without|except)\b"
                        r"[^.!?;,\n]{0,25}$", re.I)
-_QUOTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”", re.S)
+# Code (an unclosed fence runs to the end), inline code, double and curly quotes (straight single quotes are
+# left alone: they are usually apostrophes).
+_QUOTED = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”|‘[^’\n]*’", re.S)
 _ASK_ARTICLE_POEM = re.compile(r"\b(?:a|an|the)\s+$", re.I)
 ASK_TTL = 86400
 
@@ -752,11 +757,12 @@ ASK_TTL = 86400
 def _ask_text_body(prompt):
     """The parts of a prompt a person wrote as an instruction: no code, quotes, quoted lines or pasted
     model-picker output, and no questions."""
-    text = _QUOTED.sub(" ", str(prompt or "")[:4000])
-    lines = [ln for ln in text.splitlines()
-             if not re.match(r"\s*(?:>|\[?model-picker\b|\$ )", ln, re.I)]
-    sentences = re.split(r"(?<=[.!?])\s+|\n+", "\n".join(lines))
-    return "\n".join(x for x in sentences if not x.rstrip().endswith("?"))[:2000]
+    text = _QUOTED.sub(" ", str(prompt or "")[:20000])
+    lines = [ln for ln in text.splitlines()  # quoted lines, shell lines, tracebacks, pasted hook output
+             if not re.match(r"[\s⎿│●⏺]*(?:>|\$ |File \")", ln) and not re.match(r"\s{4,}\S", ln)
+             and "model-picker" not in ln.lower()]
+    sentences = re.split(r"(?<!\be\.g\.)(?<!\bi\.e\.)(?<=[.!?])\s+|(?<=[。！？])|\n+", "\n".join(lines))
+    return "\n".join(x for x in sentences if not x.rstrip().endswith(("?", "？")))[:2000]
 
 
 def detect_ask(prompt):
@@ -776,6 +782,10 @@ def detect_ask(prompt):
         for m in rx.finditer(text):
             if not _NEGATION.search(text[max(0, m.start() - 45):m.start()]):
                 efforts.add(m.group(1).lower())
+    if len(tiers) == 1:  # any other model named (not negated) anywhere makes it a comparison, not a pick
+        for m in _ANY_TIER.finditer(text):
+            if m.group(1).lower() not in tiers and not _NEGATION.search(text[max(0, m.start() - 45):m.start()]):
+                tiers.add(m.group(1).lower())
     ask = {"tier": tiers.pop() if len(tiers) == 1 else None, "effort": efforts.pop() if len(efforts) == 1 else None}
     return ask if ask["tier"] or ask["effort"] else None
 
@@ -926,8 +936,10 @@ def handle_agent(payload, mode, cfg):
     launch_effort = inp.get("effort") if isinstance(inp.get("effort"), str) else None
     honored = bool(ask and ask["tier"]) and bool(model) and tier_of(model) == ask["tier"] and (
         not ask["effort"] or not launch_effort or launch_effort == ask["effort"])
+    # Record only what the launch actually honored (an omitted effort isn't the asked effort).
+    user_pick = {"tier": ask["tier"], "effort": ask["effort"] if launch_effort == ask["effort"] else None} if honored else None
     log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,
-                 pinned=pinned, user_pick=ask if honored else None)
+                 pinned=pinned, user_pick=user_pick)
     note = "\n".join(n for n in (rec.get("notice"), verbose_note(cfg, label, model, rec)) if n) or None
     if model:
         chosen = tier_of(model)
@@ -1091,7 +1103,7 @@ def handle_prompt(payload, cfg):
         raw = str(payload.get("prompt") or "").lstrip()
         if not raw.startswith("<task-notification"):  # an agent finishing isn't a new request: keep the ask
             prompt = _human_prompt(payload)
-            ask = detect_ask(prompt) if prompt is not None else None  # slash commands, shell lines: clear it
+            ask = detect_ask(prompt) if prompt is not None and _asks_enabled(cfg) else None  # slash commands: clear
             remember_ask(cfg, payload.get("session_id"), ask)
     except Exception:
         pass

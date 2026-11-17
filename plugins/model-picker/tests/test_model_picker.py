@@ -1520,5 +1520,29 @@ results += [
     check("ask: no bare 'you asked for' line when the router didn't answer (2-word prompt)", short is None),
 ]
 
+# v0.4.9 re-review: negation forms, comparisons, hyphens, pasted output, quotes, punctuation, honored effort.
+NOT_ASKS2 = ["Don’t use opus for this.", "You can't use opus here, run it", "We won't use opus for this one.",
+             "Shouldn't run on opus.", "use haiku or sonnet, whichever is cheaper", "use haiku vs opus",
+             "Run haiku and opus side by side to compare", "Do a quick pass on haiku-level complexity bugs",
+             "  ⎿  [model-picker] Explore ran on claude-opus-5-5 at high effort", "Write ‘use opus for reviews’ in the README",
+             "Explain this:\n```\nuse opus\n" + "x" * 5000, "run on opus？", "Run on opus, e.g. for the review?",
+             "use the opus agent's definition"]
+results += [
+    check(f"ask: re-review cases give no pick ({len(NOT_ASKS2)} cases)", not [p for p in NOT_ASKS2 if da(p)]),
+    check("ask: version forms still count", da("use the haiku-5-5 model") == {"tier": "haiku", "effort": None}
+          and da("use Opus 5.5 for the migration") == {"tier": "opus", "effort": None}),
+]
+hp = {**fresh_state(), **FAKE_ROUTER("haiku", 0.9), "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+mp.remember_ask(hp, "S4", {"tier": "opus", "effort": "high"})
+run({**agent(description="review the PR", prompt="p", model="opus"), "session_id": "S4", "tool_use_id": "t-hp"}, "advise", hp)
+hp_dec = next((r for r in ledger.read(hp) if r.get("kind") == "decision"), {})
+off2 = {**fresh_state(), "MODEL_PICKER_ASK": "0", "MODEL_PICKER_PROMPT_ROUTE": "1", **FAKE_ROUTER("sonnet", 0.82)}
+results += [
+    check("ask: a launch without the asked effort records only the model as honored",
+          hp_dec.get("user_pick") == {"tier": "opus", "effort": None}),
+    check("ask: MODEL_PICKER_ASK=0 also drops the prompt-line suffix",
+          "you asked" not in (prompt_hook("please use opus for the code review", off2) or {}).get("systemMessage", "")),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

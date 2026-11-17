@@ -643,7 +643,7 @@ def _failure(res):
 
 def _clear(h, prefix):
     changed = False
-    for k in ("fails", "reason", "rejected", "last", "paused_until"):
+    for k in ("fails", "reason", "rejected", "last", "paused_until") + (() if prefix else ("slow",)):
         changed = h.pop(prefix + k, None) is not None or changed
     return changed
 
@@ -651,10 +651,12 @@ def _clear(h, prefix):
 def record_router(cfg, res, now=None, scope="launch"):
     """Count this router call in the shared state. Returns a one-line notice when it starts a pause.
 
-    Two counts per router: the main one (connection failures and rejections from both hooks, and launch
-    timeouts) pauses every router call; the prompt line's own count (prompt timeouts: prompts get 3 s,
-    launches more) pauses only the prompt line, which shows nothing on a timeout anyway. A retry that fails
-    right after a pause, for the same kind of reason, pauses again quietly (the user was told)."""
+    Two counts per router. The main one (connection failures and rejections from both hooks, and launch
+    timeouts) pauses every router call. The prompt line's own count (every prompt failure, timeouts included:
+    prompts get less time than launches can) pauses only the prompt line, which shows nothing on a failure
+    anyway. A prompt that answers proves nothing about launch timeouts, so it clears the main count only
+    when that count has none. A retry that fails right after a pause, for the same kind of reason, pauses
+    again quietly (the user was told)."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
@@ -664,6 +666,7 @@ def record_router(cfg, res, now=None, scope="launch"):
     proceed, fd = _health_lock(cfg)
     if not proceed:
         return None
+    notices = {}
     try:
         now = now or time.time()
         h = _health_read(cfg)
@@ -673,36 +676,43 @@ def record_router(cfg, res, now=None, scope="launch"):
             if last and now > last + pause:
                 _clear(h, pre)
         if fail is None:
-            _clear(h, "")
+            if scope != "prompt" or not h.get("slow"):
+                _clear(h, "")
             if scope == "prompt":
                 _clear(h, "prompt_")  # answered inside the prompt budget
             if h != before:
                 _health_write(cfg, h, now)
             return None
         reason, rejected, slow = fail
-        pre = "prompt_" if scope == "prompt" and slow else ""
-        until = _paused_until(h, pre)
-        fails = h[pre + "fails"] + 1 if isinstance(h.get(pre + "fails"), int) else 1
-        h.update({pre + "fails": fails, pre + "reason": reason, pre + "rejected": rejected, pre + "last": now})
-        if not rejected and fails < ROUTER_FAILS_TO_PAUSE:
-            h.pop(pre + "paused_until", None)
-            _health_write(cfg, h, now)
-            return None
-        # Same kind (can't reach vs rejected): "timed out" and "unreachable" alternating isn't news.
-        told = bool(until) and bool(before.get(pre + "rejected")) == rejected
-        h[pre + "paused_until"] = now + pause
+        counts = ["prompt_"] if scope == "prompt" else []
+        if scope != "prompt" or not slow:
+            counts.append("")
+            h["slow"] = bool(h.get("slow")) or slow
+        for pre in counts:
+            until = _paused_until(h, pre)
+            fails = h[pre + "fails"] + 1 if isinstance(h.get(pre + "fails"), int) else 1
+            h.update({pre + "fails": fails, pre + "reason": reason, pre + "rejected": rejected, pre + "last": now})
+            if not rejected and fails < ROUTER_FAILS_TO_PAUSE:
+                h.pop(pre + "paused_until", None)
+                continue
+            h[pre + "paused_until"] = now + pause
+            # Same kind (can't reach vs rejected): "timed out" and "unreachable" alternating isn't news.
+            if not (until and bool(before.get(pre + "rejected")) == rejected):
+                notices[pre] = fails
         _health_write(cfg, h, now)
     finally:
         if fd is not None:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
-    if told:
+    if not notices:
         return None
+    pre = "" if "" in notices else "prompt_"  # a main pause covers the prompt line too: one line is enough
+    fails = notices[pre]
     mins = f"{pause / 60:g} min"
     label = _router_label(cfg)
     reset = f"delete {_health_path(cfg)} to retry sooner"
     if pre:
-        return (f"model-picker: {label} didn't answer 3 prompts in a row in time ({reason}); the prompt line is paused "
+        return (f"model-picker: {label} failed on {fails} prompts in a row ({reason}); the prompt line is paused "
                 f"for {mins}, agent launches still ask it ({reset}).")
     if rejected:
         return (f"model-picker: {label} rejected the call ({reason}), which a retry won't fix; router calls paused "

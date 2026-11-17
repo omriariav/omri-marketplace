@@ -64,7 +64,7 @@ API keys are read from the environment or `API_KEY_CMD`, never from the config f
 
 ## Decisions APIs
 
-A decisions API answers typed questions (here: which tier, which effort) with calibrated probabilities and no generated text, in roughly 100 ms. The router asks two choice questions, takes the answer when confidence clears the threshold, and otherwise falls back to the keyword heuristic. Router errors never block a launch; the recommendation's `source` says what decided. A router that keeps failing (say, a gateway behind a VPN that is off) is paused for `MODEL_PICKER_ROUTER_PAUSE` minutes, so prompts and launches stop waiting on it; prompt timeouts alone pause only the prompt line. After the pause, calls try again, and a success clears the count.
+A decisions API answers typed questions (here: which tier, which effort) with calibrated probabilities and no generated text, in roughly 100 ms. The router asks two choice questions, takes the answer when confidence clears the threshold, and otherwise falls back to the keyword heuristic. Router errors never block a launch; the recommendation's `source` says what decided. A router that keeps failing (say, a gateway behind a VPN that is off) is paused for `MODEL_PICKER_ROUTER_PAUSE` minutes, so prompts and launches stop waiting on it; 3 failed prompts in a row that weren't all connection failures (prompts get only 3 s) pause just the prompt line. After the pause, calls try again, and a success clears the count.
 
 | Provider | Router | Notes |
 |----------|--------|-------|

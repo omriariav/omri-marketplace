@@ -1297,5 +1297,31 @@ with um.patch.object(mp.fcntl, "flock", side_effect=OSError(45, "Operation not s
 results.append(check("pause: works without flock (network filesystems), with no lock wait",
                      mp.router_paused(nl) == "timed out" and nolock_s < 0.5))
 
+# v0.4.8: follow-ups from the v0.4.7 review.
+lt = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(lt, None)                                   # a launch times out
+    mp.record_router(lt, {"tier": "haiku"}, scope="prompt")      # a short prompt answers in time
+lc = {**fresh_state(), **DOWN}
+mp.record_router(lc, urllib.error.URLError(OSError()))
+mp.record_router(lc, {"tier": "haiku"}, scope="prompt")
+results += [
+    check("pause: prompt successes don't reset launch timeouts (3 launch timeouts still pause)",
+          mp.router_paused(lt) == "timed out"),
+    check("pause: a prompt success still clears connection failures", mp._health_read(lc).get("fails") is None),
+]
+mx = {**fresh_state(), **DOWN}
+mixed = [mp.record_router(mx, e, scope="prompt") for e in (None, urllib.error.URLError(TimeoutError()), None)]
+cn = {**fresh_state(), **DOWN}
+conn = [mp.record_router(cn, urllib.error.URLError(OSError()), scope="prompt") for _ in range(3)]
+results += [
+    check("pause: mixed prompt failures (timeout, connect timeout, timeout) pause the prompt line on the 3rd",
+          mixed[:2] == [None, None] and "prompt line is paused" in (mixed[2] or "")
+          and mp.router_paused(mx, scope="prompt") and mp.router_paused(mx) is None),
+    check("pause: 3 prompt connection failures pause everything, with one notice (not two)",
+          conn[:2] == [None, None] and "router calls paused" in (conn[2] or "") and "prompt line" not in conn[2]
+          and mp.router_paused(cn) == "unreachable"),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

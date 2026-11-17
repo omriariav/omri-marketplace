@@ -386,6 +386,11 @@ def stamp_verdict(decision, effort):
     rec = f"{decision['rec_tier']}/{rec_effort}" if by_router else decision["rec_tier"]
     who = _rec_label(decision.get("source")) + (" + your floor" if decision.get("floor") else "")
     chosen = decision.get("chosen_tier")
+    pick = decision.get("user_pick")
+    if isinstance(pick, dict) and (pick.get("tier") or pick.get("effort")):
+        mine = "/".join(x for x in (pick.get("tier"), pick.get("effort") and f"{pick['effort']} effort") if x)
+        said = "only guessed" if decision.get("unsure") else "said"
+        return f" · your call ({mine}); {who} {said} {rec}"
     if decision.get("unsure"):
         return f" · {who} only guessed {rec}"
     if decision.get("outcome") != "explicit":
@@ -432,6 +437,7 @@ def attribute(decision):
 
     model-picker  explicit model that matched the recommendation, not already set by the agent definition
     rule          matched a recommendation that the user's own MODEL_PICKER_FLOORS rule raised
+    user          the model the user asked for in their prompt
     definition    the agent's own definition set that model (saving would have happened anyway)
     explicit      explicit model that differed from the recommendation
     unjudged      explicit model, but the recommendation was only a fallback guess
@@ -445,6 +451,8 @@ def attribute(decision):
     if outcome == "pinned" or (pinned_tier and pinned_tier == decision.get("chosen_tier")):
         return "definition"
     if outcome == "explicit":
+        if decision.get("user_pick"):
+            return "user"
         if decision.get("followed") is None:
             return "unjudged"  # explicit model, but no confident recommendation to compare against
         if decision.get("followed"):
@@ -548,7 +556,9 @@ def report(cfg, period="7d", now=None):
     prompts = [r for r in recs if r.get("kind") == "prompt"]
     checked = [d for d in dec if d.get("outcome") in ("explicit", "missing")]
     explicit = [d for d in checked if d["outcome"] == "explicit"]
-    compared = [d for d in explicit if d.get("followed") is not None]
+    user_picks = [d for d in explicit if d.get("user_pick")]
+    # The user's own pick isn't a verdict on the recommendation either way.
+    compared = [d for d in explicit if d.get("followed") is not None and not d.get("user_pick")]
     # Not followed, by direction: going stronger is often deliberate (a stated reason, a user rule) and costs
     # money; going cheaper saves money but is the risky direction.
     diverged = [d for d in compared if not d["followed"] and d.get("chosen_tier") in RANK and d.get("rec_tier") in RANK]
@@ -586,6 +596,7 @@ def report(cfg, period="7d", now=None):
         "skipped": len(dec) - len(checked),
         "denied": denied,
         "followed": sum(1 for d in compared if d["followed"]),
+        "user_picks": len(user_picks),
         "compared": len(compared),
         "went_stronger": stronger,
         "went_cheaper": len(diverged) - stronger,
@@ -659,7 +670,8 @@ def format_report(r):
         + (f"; {r['denied']} denied in enforce mode and retried" if r.get("denied") else "") + ")",
         f"- Explicit model: {r['explicit']}/{r['checked']} ({_pct(r['explicit'], r['checked'])})",
         f"- Followed recommendation: {r['followed']}/{r['compared']} ({_pct(r['followed'], r['compared'])})"
-        + _diverged(r),
+        + _diverged(r)
+        + (f"; {r['user_picks']} more used the model you asked for" if r.get("user_picks") else ""),
         f"- Launch models: {tiers or 'n/a'}",
     ]
     if r["router_calls"]:
@@ -674,6 +686,7 @@ def format_report(r):
                          f"${row['baseline_cost']:.2f} | ${row['saving']:.2f} |")
         labels = {"model-picker": "followed model-picker's recommendation",
                   "rule": "followed your own MODEL_PICKER_FLOORS rule",
+                  "user": "the model you asked for in your prompt",
                   "definition": "model set by the agent's own definition (would have happened anyway)",
                   "explicit": "explicit model that differed from the recommendation",
                   "unjudged": "explicit model with no confident recommendation to compare against",
@@ -685,7 +698,7 @@ def format_report(r):
                   f"({_pct(r['saving'], r['baseline_cost'])}).",
                   f"- **Credited to model-picker: ${r.get('credited_saving', 0):.2f}** "
                   f"({attr.get('model-picker', {}).get('agents', 0)} agent(s) that followed its recommendation)."]
-        for key in ("rule", "definition", "explicit", "unjudged", "inherited", "unknown"):
+        for key in ("rule", "user", "definition", "explicit", "unjudged", "inherited", "unknown"):
             if key in attr:
                 lines.append(f"  - Not credited, {labels[key]}: {attr[key]['agents']} agent(s), "
                              f"${attr[key]['saving']:.2f}")
@@ -704,7 +717,8 @@ def format_report(r):
 
 # --- HTML report -------------------------------------------------------------------
 
-_ATTR_LABELS = {"model-picker": "Followed model-picker", "rule": "Your own rule (floors)", "definition": "Agent definition's own model",
+_ATTR_LABELS = {"model-picker": "Followed model-picker", "rule": "Your own rule (floors)", "user": "You asked for it",
+                "definition": "Agent definition's own model",
                 "explicit": "Explicit, differed from recommendation", "unjudged": "Explicit, no confident recommendation",
                 "inherited": "Inherited the session model", "unknown": "No launch record"}
 _TIER_ORDER = ("local", "haiku", "sonnet", "opus", "fable")
@@ -766,7 +780,8 @@ def format_html(r, generated=None):
         ("Followed recommendation", _pct(r["followed"], r["compared"]),
          f"{r['followed']} of {r['compared']} launches" + (f"; {r.get('went_stronger', 0)} went stronger, "
                                                            f"{r.get('went_cheaper', 0)} cheaper"
-                                                           if r.get("went_stronger") or r.get("went_cheaper") else ""), ""),
+                                                           if r.get("went_stronger") or r.get("went_cheaper") else "")
+         + (f"; {r['user_picks']} you picked" if r.get("user_picks") else ""), ""),
     ]
     out = [head, "<div class=tiles>"]
     for k, v, n, cls in tiles:

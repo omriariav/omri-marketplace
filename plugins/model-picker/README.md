@@ -43,6 +43,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_ROUTER_CMD` | Executable for `command`: JSON `{task, tiers, efforts}` on stdin, JSON `{tier, effort, confidence}` on stdout | unset |
 | `MODEL_PICKER_ROUTER_INPUT` | What task text leaves the machine: `description` (agent's short description), `brief` (+ first 500 prompt chars), `full` (+ up to 8000) | `description` |
 | `MODEL_PICKER_ROUTER_TIMEOUT` | Seconds | `3` |
+| `MODEL_PICKER_ASK` | `0` stops noticing a model or effort you name in your prompt (see [You asked for it](#you-asked-for-it)) | `1` |
 | `MODEL_PICKER_ROUTER_PAUSE` | Minutes to skip router calls after 3 failures in a row (timeouts, connection or HTTP errors, a router/key command exiting non-zero) or one rejected request (HTTP 400/401/403/404/405/407). Connection failures and rejections pause every call (launches use the keyword heuristic, the prompt line stays off); repeated prompt or launch failures pause only that kind of call (see the decisions API section). One line tells you when a pause starts. Shared by all sessions (`router-health.json` in the state dir; delete it to retry at once). `0` never pauses | `10` |
 | `MODEL_PICKER_ROUTER_MIN_CONFIDENCE` | Below this, the heuristic decides | `0.5` |
 | `MODEL_PICKER_ROUTER_ON_EXPLICIT` | `1` also asks the router about launches that already set a model, so every launch gets a real verdict (follow rate and credited savings depend on it). Costs one router call (~0.7 s) per launch | `0` |
@@ -50,7 +51,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_STATE_DIR` | Where the ledger lives | `~/.config/model-picker` |
 | `MODEL_PICKER_VERBOSE` | `1` shows a one-line note per launch and per finished subagent | `0` |
 | `MODEL_PICKER_PRICES` | JSON price overrides per tier, $ per million tokens | built-in list prices |
-| `MODEL_PICKER_STAMP` | `1` stamps subagent results with the model and effort that actually ran, and whether that followed the recommendation | `0` |
+| `MODEL_PICKER_STAMP` | `1` stamps subagent results with the model and effort that actually ran, and whether that followed the recommendation (a launch that sets a model is judged by the router only with `MODEL_PICKER_ROUTER_ON_EXPLICIT=1`; otherwise by the keyword rules, which name a model but no effort) | `0` |
 | `MODEL_PICKER_STAMP_REPLIES` | `1` asks Claude to end every reply with its model id | `0` |
 | `MODEL_PICKER_OLLAMA_MODEL` | Ollama model for `ask_local`; also turns on the `local` tier | unset |
 | `MODEL_PICKER_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
@@ -155,3 +156,14 @@ Without a configured model the tools still list but return a clear error naming 
 Claude Code sends every request to one Anthropic-format endpoint, so beyond `ask_local` a local model is reached either through a gateway that routes by model name (set `ANTHROPIC_BASE_URL` to the gateway and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to the local model's name, so `model: haiku` runs locally) or through an MCP tool that wraps the local server. Set `MODEL_PICKER_LOCAL_HINT` to describe whichever you use. The session rules and `/model-picker:model-picker` then offer `local` for pure text work on text already in hand (summarize, classify, extract, translate); agent launches and workflow steps are never routed to it, since a local model has no tools.
 
 Tests: `python3 plugins/model-picker/tests/test_model_picker.py`. Requires `python3` (stdlib only); hooks exit silently without it.
+
+## You asked for it
+
+When your prompt names a model or effort (`run the search on haiku`, `use opus at high effort`, `spawn a sonnet agent`), Claude reads it and the guide tells it your ask beats the recommendation. model-picker only labels the result; it never steers a launch from its own reading of your prompt:
+
+- A launch on the model you asked for gets no advice, and its stamp ends `· your call (opus/high effort); gpt-6-luna said sonnet/medium`.
+- The report lists those launches as your picks: they leave the follow rate, and their savings are listed under you, not credited to model-picker.
+- With `MODEL_PICKER_PROMPT_ROUTE=1` the router's line ends `· you asked for opus`.
+- Launches on anything else are judged as usual. An ask that names only an effort is shown on the prompt line but doesn't mark launches.
+
+Detection is deliberately narrow: a model after a verb (use, run, launch, spawn, start, switch to, go with, try, pick, do), as a name (`use opus`, `run it on haiku`) or as `a/the <model> agent`; `<level> effort` after use/run/at/with/on, `effort: <level>`, `set effort to <level>`. It skips questions, negations (`don't`/`can't`/`won't use opus`), code, double and curly quotes, quoted and indented lines and pasted model-picker output, and gives up when any second model is named (`use haiku vs opus`). It misses some real asks (`Can you run this on haiku?`); that costs a label, nothing else. The ask lasts until your next prompt; agent notifications keep it, slash commands clear it. It is stored per session under `asked/` in the state dir (model and effort only, no prompt text), and not at all with `MODEL_PICKER_ASK=0` or `MODEL_PICKER_LOG=0`.

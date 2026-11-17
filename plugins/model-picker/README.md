@@ -20,7 +20,7 @@ claude plugin install model-picker@omri-marketplace
 | `hooks/model_picker.py route "<task>"` | CLI: prints the recommendation as JSON. |
 | `model-picker:scout` agent | Haiku read-only scout for search, logs, and test output. |
 | SubagentStop hook | Records each finished subagent's tokens, model, cost, and the cost at the session model. |
-| PostToolUse hook on `Agent` | With `MODEL_PICKER_STAMP=1`, stamps each subagent result with the model that actually ran, its tokens, and cost. |
+| PostToolUse hook on `Agent` | With `MODEL_PICKER_STAMP=1`, stamps each subagent result with the model that actually ran, its effort, tokens, cost, and whether it followed the recommendation. |
 | `ask_local` MCP tool | Runs tool-free text work on a local Ollama model at $0, stamped and logged. |
 | `/model-picker:report [period]` | Launches, model mix, follow rate, router stats, spend by model, estimated saving; also opens an HTML version. |
 
@@ -43,14 +43,14 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_ROUTER_CMD` | Executable for `command`: JSON `{task, tiers, efforts}` on stdin, JSON `{tier, effort, confidence}` on stdout | unset |
 | `MODEL_PICKER_ROUTER_INPUT` | What task text leaves the machine: `description` (agent's short description), `brief` (+ first 500 prompt chars), `full` (+ up to 8000) | `description` |
 | `MODEL_PICKER_ROUTER_TIMEOUT` | Seconds | `3` |
-| `MODEL_PICKER_ROUTER_PAUSE` | Minutes to skip router calls after 3 failures in a row (timeouts, connection or HTTP errors, a router/key command exiting non-zero) or one rejected request (HTTP 400/401/403/404/405/407). One line tells you when a pause starts; launches use the keyword heuristic meanwhile and the prompt line stays off. Shared by all sessions (`router-health.json` in the state dir; delete it to retry at once). `0` never pauses | `10` |
+| `MODEL_PICKER_ROUTER_PAUSE` | Minutes to skip router calls after 3 failures in a row (timeouts, connection or HTTP errors, a router/key command exiting non-zero) or one rejected request (HTTP 400/401/403/404/405/407). Connection failures and rejections pause every call (launches use the keyword heuristic, the prompt line stays off); repeated prompt or launch failures pause only that kind of call (see the decisions API section). One line tells you when a pause starts. Shared by all sessions (`router-health.json` in the state dir; delete it to retry at once). `0` never pauses | `10` |
 | `MODEL_PICKER_ROUTER_MIN_CONFIDENCE` | Below this, the heuristic decides | `0.5` |
 | `MODEL_PICKER_ROUTER_ON_EXPLICIT` | `1` also asks the router about launches that already set a model, so every launch gets a real verdict (follow rate and credited savings depend on it). Costs one router call (~0.7 s) per launch | `0` |
 | `MODEL_PICKER_LOG` | `0` turns off the local ledger | `1` |
 | `MODEL_PICKER_STATE_DIR` | Where the ledger lives | `~/.config/model-picker` |
 | `MODEL_PICKER_VERBOSE` | `1` shows a one-line note per launch and per finished subagent | `0` |
 | `MODEL_PICKER_PRICES` | JSON price overrides per tier, $ per million tokens | built-in list prices |
-| `MODEL_PICKER_STAMP` | `1` stamps subagent results with the model that actually ran | `0` |
+| `MODEL_PICKER_STAMP` | `1` stamps subagent results with the model and effort that actually ran, and whether that followed the recommendation | `0` |
 | `MODEL_PICKER_STAMP_REPLIES` | `1` asks Claude to end every reply with its model id | `0` |
 | `MODEL_PICKER_OLLAMA_MODEL` | Ollama model for `ask_local`; also turns on the `local` tier | unset |
 | `MODEL_PICKER_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
@@ -134,7 +134,7 @@ model-picker: model-picker:scout on claude-haiku-5-5 used 247,607 tokens, ~$0.00
 Asking a model which model it is gives unreliable answers, and behind a gateway it is simply wrong. With `MODEL_PICKER_STAMP=1`, the model name comes from the transcript instead: the API response records exactly which model answered.
 
 - **Foreground subagents:** when the `Agent` call returns, a line like this is shown to you and added to Claude's context, and Claude is told to name that model when it reports the result:
-  `[model-picker] web-fetch ran on claude-haiku-5-5 · 13K tokens · ~$0.001 (~$0.055 on opus)`
+  `[model-picker] web-fetch ran on claude-haiku-5-5 at low effort · 13K tokens · ~$0.001 (~$0.055 on opus) · ✓ followed gpt-6-luna (haiku/low)`
 - **Background subagents:** their `Agent` call returns at launch, so the stamp is queued when they finish (SubagentStop) and delivered on the session's next turn (UserPromptSubmit), which also fires when the agent's result notification arrives. Claude sees it next to the agent's report and names the model; you see it too. Queued stamps sit in `pending-stamps.jsonl` (24 h) and are delivered exactly once to their own session; a resumed agent's newer stamp is delivered again. Stamps don't carry over after `/clear`.
 - **`ask_local` answers** end with `[model-picker] answered by ollama:<model> · N in / M out tokens · $0 · Xs`.
 - **Replies (opt-in):** `MODEL_PICKER_STAMP_REPLIES=1` asks Claude to end every reply with its model id, taken from its system prompt. Off by default because it adds a line to every reply.

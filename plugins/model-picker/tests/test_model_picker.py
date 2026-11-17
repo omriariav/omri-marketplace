@@ -1355,5 +1355,54 @@ results += [
           and mp.router_paused(lcn, scope="prompt") == "unreachable"),
 ]
 
+# v0.4.8: the stamp shows the effort the agent ran at and whether it followed the recommendation.
+JEV = "openai-decisions:team/jev-latest (0.88)"
+dec = lambda **k: {"rec_tier": "opus", "rec_effort": "high", "source": JEV, "chosen_tier": "opus", **k}  # noqa: E731
+results += [
+    check("stamp verdict: followed", ledger.stamp_verdict(dec(), "high") == " · ✓ followed jev-latest (opus/high)"),
+    check("stamp verdict: model followed, effort differs",
+          ledger.stamp_verdict(dec(), "low") == " · ✓ model as jev-latest recommended (opus/high), effort differs"),
+    check("stamp verdict: not followed",
+          ledger.stamp_verdict(dec(chosen_tier="sonnet"), "high") == " · ✗ jev-latest recommended opus/high"),
+    check("stamp verdict: keyword-rule fallback and floors are named as such",
+          ledger.stamp_verdict(dec(source="heuristic (router paused: unreachable)", unsure=True), None)
+          == " · keyword rules only guessed opus/high"
+          and "jev-latest + your floor" in ledger.stamp_verdict(dec(source=JEV + " + floor", floor="review"), "high")),
+    check("stamp verdict: nothing to compare (pinned agent, no launch record)",
+          ledger.stamp_verdict({"outcome": "pinned"}, "high") == "" and ledger.stamp_verdict(None, "high") == ""),
+    check("stamp: run effort is the most common recorded effort",
+          ledger.run_effort([{"effort": "high"}, {"effort": "high"}, {"effort": "low"}, {}]) == "high"
+          and ledger.run_effort([{}]) is None),
+]
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sub_dir = Path(d) / "sess" / "subagents"
+    write_transcript(sub_dir / "agent-ef.jsonl", [{**amsg(f"e{i}", "claude-opus-5-5", inp=1000, out=200), "effort": "high"}
+                                                  for i in range(2)])
+    (sub_dir / "agent-ef.meta.json").write_text(json.dumps(
+        {"agentType": "general-purpose", "toolUseId": "toolu_ef", "requestShape": "foreground"}))
+    est2 = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+    ledger.append(est2, {"kind": "decision", "tool_use_id": "toolu_ef", "outcome": "explicit", "chosen": "opus",
+                         "chosen_tier": "opus", "rec_tier": "opus", "rec_effort": "high", "source": JEV,
+                         "followed": True, "chosen_effort": "high"})
+    r = subprocess.run([sys.executable, "-I", str(HOOK), "posttool", str(ROOT)], capture_output=True, text=True,
+                       input=json.dumps({"tool_name": "Agent", "tool_use_id": "toolu_ef", "transcript_path": str(sess)}),
+                       env={**os.environ, **est2})
+    stamp = json.loads(r.stdout).get("systemMessage", "") if r.stdout.strip() else ""
+    results.append(check("stamp e2e: effort and verdict in the line",
+                         "general-purpose ran on claude-opus-5-5 at high effort" in stamp
+                         and stamp.endswith("· ✓ followed jev-latest (opus/high)")))
+st0 = fresh_state()
+run(agent(description="find x", prompt="p", model="haiku", effort="low"), "advise", st0)
+results.append(check("decision log: the launch's effort is recorded",
+                     any(r.get("chosen_effort") == "low" for r in ledger.read(st0))))
+
+both = {**fresh_state(), **DOWN}
+first = [mp.record_router(both, None, scope="prompt") for _ in range(3)][-1]
+second = [mp.record_router(both, None) for _ in range(3)][-1]
+results.append(check("pause notice: says when the other kind of call is already paused",
+                     "agent launches still ask it" in (first or "") and "the prompt line is paused too" in (second or "")))
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

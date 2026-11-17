@@ -6,9 +6,10 @@ Follow-ups to the v0.4.7 router pause. Each kind of call now keeps its own count
 
 - **Prompt line:** every prompt failure counts, timeouts included; 3 in a row pause the prompt line. A prompt answer clears it. Before, connect failures and timeouts went to separate counts, so alternating them took up to 5 slow prompts.
 - **Agent launches:** every launch failure counts; 3 in a row pause launches (they use the keyword rules meanwhile, and the prompt line keeps asking). Only a launch answer clears it. Before, a short prompt answered in time cleared everything, so with long launch input (`MODEL_PICKER_ROUTER_INPUT=full`) launches that kept timing out never paused.
-- **Everything:** connection failures and rejections from either kind of call also count toward pausing all router calls, as in v0.4.7; any answer clears that count. When two pauses start on the same call you get one line.
+- **Everything:** connection failures and rejections from either kind of call also count toward pausing all router calls, as in v0.4.7; any answer clears that count. Unlike v0.4.7, launch timeouts no longer pause the prompt line. When two pauses start on the same call you get one line, and a pause line says whether the other kind of call is already paused.
+- **Stamps show effort and the verdict.** With `MODEL_PICKER_STAMP=1` the stamp now says the effort the subagent ran at (from its transcript, else the launch's `effort`) and whether the launch followed the recommendation, naming who made it: `[model-picker] general-purpose ran on claude-opus-5-5 at high effort · 120K tokens · ~$0.41 · ✓ followed gpt-6-luna (opus/high)`. Other endings: `✓ model as … recommended (opus/high), effort differs`, `✗ … recommended sonnet/medium`, `keyword rules only guessed …` (no confident pick), or nothing for agents pinned by their definition. Launch records now keep the requested `effort`.
 - v0.4.7 notes corrected: with the default `MODEL_PICKER_ROUTER_TIMEOUT` (3 s) launches get about as long as prompts; raising it (up to about 6 s, the launch hook's cap) lets a slower router keep serving launches.
-- Tests: 272.
+- Tests: 281.
 
 ## model-picker v0.4.7 (2026-11-17)
 

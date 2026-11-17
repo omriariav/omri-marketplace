@@ -673,7 +673,6 @@ def record_router(cfg, res, now=None, scope="launch"):
     try:
         now = now or time.time()
         h = _health_read(cfg)
-        h.pop("slow", None)  # written by a 0.4.8 pre-release build
         before = dict(h)
         for pre in ("", "prompt_", "launch_"):  # old failures, or a pause that ended long ago (overnight): start over
             last = max(_paused_until(h, pre), _num_field(h, pre + "last"))
@@ -710,12 +709,15 @@ def record_router(cfg, res, now=None, scope="launch"):
     mins = f"{pause / 60:g} min"
     label = _router_label(cfg)
     reset = f"delete {_health_path(cfg)} to retry sooner"
+    other_paused = pre and now < max(_paused_until(h, "launch_" if pre == "prompt_" else "prompt_"), _paused_until(h, ""))
     if pre == "launch_":
+        rest = "the prompt line is paused too" if other_paused else "the prompt line still asks it"
         return (f"model-picker: {label} failed {fails}× in a row ({reason}) on agent launches; launches use the "
-                f"keyword rules for {mins}, the prompt line still asks it ({reset}).")
+                f"keyword rules for {mins}, {rest} ({reset}).")
     if pre:
+        rest = "agent launches are paused too" if other_paused else "agent launches still ask it"
         return (f"model-picker: {label} failed on {fails} prompts in a row ({reason}); the prompt line is paused "
-                f"for {mins}, agent launches still ask it ({reset}).")
+                f"for {mins}, {rest} ({reset}).")
     if rejected:
         return (f"model-picker: {label} rejected the call ({reason}), which a retry won't fix; router calls paused "
                 f"for {mins}. Check the router URL, key (MODEL_PICKER_ROUTER_API_KEY_ENV / _API_KEY_CMD) and "
@@ -744,6 +746,7 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
         "tool": payload.get("tool_name"), "agent_type": str(inp.get("subagent_type") or "general-purpose"),
         "description": _short(inp.get("description") or inp.get("name")), "outcome": outcome,
         "chosen": chosen, "chosen_tier": chosen_tier, "session_model": session_model, "pinned": pinned,
+        "chosen_effort": inp.get("effort") if isinstance(inp.get("effort"), str) else None,
     }
     if rec:
         entry.update({"rec_tier": rec["tier"], "rec_effort": rec["effort"], "source": rec["source"],
@@ -858,7 +861,8 @@ def handle_subagent_stop(payload, cfg):
     # Foreground agents are stamped at PostToolUse (where Claude also sees it). Everything else
     # (background, or a meta with no requestShape) is stamped here, once, to the user.
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and meta.get("requestShape") != "foreground":
-        line = ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)
+        line = ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline,
+                                 ledger.run_effort(messages) or launch.get("chosen_effort"), launch)
         if not ledger.logging_enabled(cfg):
             # Delivery needs the ledger; without it, the user-facing line is the best we can do.
             print(json.dumps({"systemMessage": line}))
@@ -893,7 +897,8 @@ def handle_posttool(payload, cfg):
     baseline = ledger.tier_of(session_model)
     totals = ledger.summarize_usage(messages, baseline, ledger.price_table(cfg))
     model = max(totals["models"], key=totals["models"].get)
-    line = ledger.stamp_text(meta.get("agentType"), model, totals, baseline)
+    line = ledger.stamp_text(meta.get("agentType"), model, totals, baseline,
+                             ledger.run_effort(messages) or launch.get("chosen_effort"), launch)
     out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": line}}
     already = any(r.get("kind") == "stamp" and r.get("tool_use_id") == payload.get("tool_use_id")
                   for r in ledger.read(cfg, time.time() - 86400))

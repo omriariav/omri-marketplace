@@ -519,23 +519,45 @@ def _health_path(cfg):
     return ledger.state_dir(cfg) / "router-health.json"
 
 
-def _health_read(cfg):
-    """Shared across sessions, so one session's failures spare the others the wait."""
+def _health_all(cfg):
     try:
         data = json.loads(_health_path(cfg).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) and data.get("router") == _router_id(cfg) else {}
+    entries = data.get("routers") if isinstance(data, dict) else None
+    return {k: v for k, v in entries.items() if isinstance(v, dict)} if isinstance(entries, dict) else {}
 
 
-def _health_write(cfg, data):
-    """Atomic: readers never see a half-written file."""
+def _health_read(cfg):
+    """This router's state. Shared across sessions, so one session's failures spare the others the wait;
+    kept per fingerprint, so sessions with different keys or settings don't overwrite each other."""
+    return dict(_health_all(cfg).get(_router_id(cfg)) or {})
+
+
+def _entry_last(e):
+    vals = []
+    for k in ("last", "paused_until", "prompt_last", "prompt_paused_until"):
+        try:
+            vals.append(float(e.get(k) or 0))
+        except (TypeError, ValueError):
+            pass
+    return max(vals or [0.0])
+
+
+def _health_write(cfg, entry, now=None):
+    """Atomic (readers never see a half-written file). Entries idle for a day are dropped."""
     tmp = None
     try:
+        now = now or time.time()
+        entries = {k: v for k, v in _health_all(cfg).items() if now - _entry_last(v) < MAX_PAUSE_MINUTES * 60}
+        if entry:
+            entries[_router_id(cfg)] = entry
+        else:
+            entries.pop(_router_id(cfg), None)
         path = _health_path(cfg)
         fd, tmp = tempfile.mkstemp(prefix=".router-health.", suffix=".tmp", dir=path.parent)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({**data, "router": _router_id(cfg)}, fh)
+            json.dump({"routers": entries}, fh)
         os.replace(tmp, path)
     except OSError:
         if tmp:
@@ -547,50 +569,58 @@ def _health_write(cfg, data):
 
 def _health_lock(cfg):
     """flock serializing read-modify-write across parallel hooks (parallel launches run their hooks at once).
-    Returns the fd, or None when the lock can't be had quickly."""
+    Returns (proceed, fd): fd to unlock; (True, None) where the filesystem has no flock (a lost update there
+    only delays a pause); (False, None) when another hook holds the lock too long or the dir is unusable."""
     try:
         d = ledger.state_dir(cfg)
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(d / ".router-health.lock", os.O_CREAT | os.O_RDWR, 0o600)
     except OSError:
-        return None
+        return False, None
     deadline = time.monotonic() + HEALTH_LOCK_WAIT
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except BlockingIOError:  # held by another hook; any other error (no flock on this filesystem) won't pass
+            return True, fd
+        except BlockingIOError:  # held by another hook
             if time.monotonic() > deadline:
                 os.close(fd)
-                return None
+                return False, None
             time.sleep(0.01)
-        except OSError:
+        except OSError:  # no flock here (ENOLCK, EOPNOTSUPP): go on without it
             os.close(fd)
-            return None
+            return True, None
 
 
-def _paused_until(h):
+def _num_field(h, key):
     try:
-        return float(h.get("paused_until") or 0)
+        return float(h.get(key) or 0)
     except (TypeError, ValueError):
         return 0.0
 
 
-def router_paused(cfg, now=None):
-    """Why router calls are paused right now, or None. A pause ending further ahead than one pause from now
-    (clock moved back, hand-edited file) is ignored."""
+def _paused_until(h, prefix=""):
+    return _num_field(h, prefix + "paused_until")
+
+
+def router_paused(cfg, now=None, scope="launch"):
+    """Why router calls are paused right now, or None. scope="prompt" also honors the prompt line's own pause.
+    A pause ending further ahead than one pause from now (clock moved back, hand-edited file) is ignored."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
     h = _health_read(cfg)
     now = now or time.time()
-    return str(h.get("reason") or "failing") if now < _paused_until(h) <= now + pause else None
+    for prefix in ("", "prompt_") if scope == "prompt" else ("",):
+        if now < _paused_until(h, prefix) <= now + pause:
+            return str(h.get(prefix + "reason") or "failing")
+    return None
 
 
 def _failure(res):
     """(reason, rejected, slow) when the router could not be reached or refused the call; None when it answered;
     "other" for any other error (a malformed or unusable answer means the router is up and fast).
-    slow: the call ran out of time after connecting (or we can't tell), so a longer budget might have worked."""
+    slow: the call ran out of time (after connecting, or we can't tell), so a longer budget might have worked."""
     if isinstance(res, dict):
         return None
     if res is None:
@@ -611,52 +641,70 @@ def _failure(res):
     return "other"
 
 
-def record_router(cfg, res, now=None, count_timeouts=True):
+def _clear(h, prefix):
+    changed = False
+    for k in ("fails", "reason", "rejected", "last", "paused_until"):
+        changed = h.pop(prefix + k, None) is not None or changed
+    return changed
+
+
+def record_router(cfg, res, now=None, scope="launch"):
     """Count this router call in the shared state. Returns a one-line notice when it starts a pause.
-    A retry that fails right after a pause, for the same kind of reason, pauses again quietly (the user was told).
-    count_timeouts=False: the call had less time than launches get, so running out of time after connecting
-    says nothing about launches; failing to connect at all still counts."""
+
+    Two counts per router: the main one (connection failures and rejections from both hooks, and launch
+    timeouts) pauses every router call; the prompt line's own count (prompt timeouts: prompts get 3 s,
+    launches more) pauses only the prompt line, which shows nothing on a timeout anyway. A retry that fails
+    right after a pause, for the same kind of reason, pauses again quietly (the user was told)."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
     fail = _failure(res)
-    if fail == "other" or (fail and not count_timeouts and fail[2]):
+    if fail == "other":
         return None  # no sign either way: leave the count alone
-    fd = _health_lock(cfg)
-    if fd is None:
+    proceed, fd = _health_lock(cfg)
+    if not proceed:
         return None
     try:
         now = now or time.time()
         h = _health_read(cfg)
-        until = _paused_until(h)
-        try:
-            last = max(until, float(h.get("last") or 0))
-        except (TypeError, ValueError):
-            last = until
-        if last and now > last + pause:
-            h, until = {}, 0.0  # old failures or a pause that ended long ago (overnight): start over, tell again
+        before = dict(h)
+        for pre in ("", "prompt_"):  # old failures, or a pause that ended long ago (overnight): start over
+            last = max(_paused_until(h, pre), _num_field(h, pre + "last"))
+            if last and now > last + pause:
+                _clear(h, pre)
         if fail is None:
-            if h.get("fails") or until:
-                _health_write(cfg, {})
+            _clear(h, "")
+            if scope == "prompt":
+                _clear(h, "prompt_")  # answered inside the prompt budget
+            if h != before:
+                _health_write(cfg, h, now)
             return None
-        reason, pause_now, _ = fail
-        fails = h["fails"] + 1 if isinstance(h.get("fails"), int) else 1
-        if not pause_now and fails < ROUTER_FAILS_TO_PAUSE:
-            _health_write(cfg, {"fails": fails, "reason": reason, "rejected": False, "last": now})
+        reason, rejected, slow = fail
+        pre = "prompt_" if scope == "prompt" and slow else ""
+        until = _paused_until(h, pre)
+        fails = h[pre + "fails"] + 1 if isinstance(h.get(pre + "fails"), int) else 1
+        h.update({pre + "fails": fails, pre + "reason": reason, pre + "rejected": rejected, pre + "last": now})
+        if not rejected and fails < ROUTER_FAILS_TO_PAUSE:
+            h.pop(pre + "paused_until", None)
+            _health_write(cfg, h, now)
             return None
         # Same kind (can't reach vs rejected): "timed out" and "unreachable" alternating isn't news.
-        told = bool(until) and bool(h.get("rejected")) == pause_now
-        _health_write(cfg, {"fails": fails, "reason": reason, "rejected": pause_now, "last": now,
-                            "paused_until": now + pause})
+        told = bool(until) and bool(before.get(pre + "rejected")) == rejected
+        h[pre + "paused_until"] = now + pause
+        _health_write(cfg, h, now)
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        if fd is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
     if told:
         return None
     mins = f"{pause / 60:g} min"
     label = _router_label(cfg)
     reset = f"delete {_health_path(cfg)} to retry sooner"
-    if pause_now:
+    if pre:
+        return (f"model-picker: {label} didn't answer 3 prompts in a row in time ({reason}); the prompt line is paused "
+                f"for {mins}, agent launches still ask it ({reset}).")
+    if rejected:
         return (f"model-picker: {label} rejected the call ({reason}), which a retry won't fix; router calls paused "
                 f"for {mins}. Check the router URL, key (MODEL_PICKER_ROUTER_API_KEY_ENV / _API_KEY_CMD) and "
                 f"headers, then {reset}.")
@@ -859,7 +907,7 @@ def prompt_route(payload, cfg):
     prompt = str(payload.get("prompt") or "").strip()
     if not router or not prompt or prompt[0] in "/<!" or len(prompt.split()) < 3:
         return None
-    if router_paused(cfg):
+    if router_paused(cfg, scope="prompt"):
         return None  # don't make every prompt wait on a router that is down
     # Only the first 200 characters, whatever MODEL_PICKER_ROUTER_INPUT says (that setting is for launches).
     inp = {"description": _short(prompt, 200), "subagent_type": "main-session"}
@@ -871,10 +919,7 @@ def prompt_route(payload, cfg):
     worker.start()
     worker.join(PROMPT_ROUTE_DEADLINE)
     res = box.get("res")
-    # Prompts give the router less time than launches (2.5 s socket timeout, 3 s overall): failing to connect
-    # counts, running out of time after connecting only when launches wouldn't get more time.
-    notice = record_router(cfg, res, count_timeouts=_num(cfg, "MODEL_PICKER_ROUTER_TIMEOUT", 3) <= PROMPT_ROUTE_DEADLINE - 0.5
-                           and not cfg.get("MODEL_PICKER_ROUTER_API_KEY_CMD"))
+    notice = record_router(cfg, res, scope="prompt")
     if notice:
         return notice
     if not isinstance(res, dict) or res.get("tier") not in TIERS:

@@ -343,7 +343,8 @@ def fit_to_available(rec, cfg):
             target, effort = higher[0], rec["effort"]
             note = f"{want} is not available here; {target} instead"
         else:
-            target, effort = lower[-1], "high"
+            target = lower[-1]
+            effort = rec["effort"] if _effort_rank(rec.get("effort")) > _effort_rank("high") else "high"
             note = f"{want} is not available here; {target} at high effort instead"
     return {**rec, "tier": target, "effort": effort, "reason": f"{rec['reason']} ({note})", "capped_from": want}
 
@@ -394,27 +395,57 @@ def _effort_rank(effort):
     return FLOOR_EFFORTS.index(effort) if effort in FLOOR_EFFORTS else -1
 
 
+def _fitted_floor(tier, effort, cfg):
+    """The floor as it applies here: an unavailable tier moves to the nearest available one. A stronger stand-in
+    meets the floor at any effort (guide rule 3: past high, the next model up at lower effort); a weaker one
+    needs at least high."""
+    tiers = available_tiers(cfg)
+    if tier in tiers:
+        return tier, effort
+    idx = CLAUDE_TIERS.index(tier)
+    higher = [t for t in CLAUDE_TIERS[idx + 1:] if t in tiers]
+    if higher:
+        return higher[0], None
+    lower = [t for t in CLAUDE_TIERS[:idx] if t in tiers]
+    if not lower:
+        return tier, effort
+    return lower[-1], effort if _effort_rank(effort) > _effort_rank("high") else "high"
+
+
 def apply_floors(rec, inp, cfg):
-    """Raise the recommendation to the user's own minimum tier (and effort) for matching tasks
-    (MODEL_PICKER_FLOORS). A floor never lowers anything, and it is the user's explicit rule, so the result
-    counts as a confident recommendation."""
+    """Raise the recommendation to the user's own minimum model (and effort) for matching tasks
+    (MODEL_PICKER_FLOORS). A stronger model meets a floor at any effort; a floor never lowers anything.
+    floor (the rule's name, used for credit) is set only when the model was raised; an effort-only raise is
+    recorded as floor_effort."""
     # Bounded input: patterns are the user's own regexes and run as written.
     text = f"{str(inp.get('description') or inp.get('name') or '')[:300]} {str(inp.get('subagent_type') or '')[:100]}"
     hits = [(label, tier, effort) for rx, label, tier, effort in _floors(cfg) if rx.search(text)]
     if not hits:
         return rec
-    tier = max((h[1] for h in hits), key=CLAUDE_TIERS.index)
-    effort = max((h[2] for h in hits if h[2]), key=_effort_rank, default=None)
-    new_tier = rec["tier"] if rec["tier"] in CLAUDE_TIERS and CLAUDE_TIERS.index(rec["tier"]) >= CLAUDE_TIERS.index(tier) else tier
-    new_effort = effort if effort and _effort_rank(effort) > _effort_rank(rec.get("effort")) else rec.get("effort")
-    if new_tier == rec["tier"] and new_effort == rec.get("effort"):
-        return {**rec, "floor_min": f"{tier}/{effort}" if effort else tier}  # already at or above the minimum
-    label = ", ".join(dict.fromkeys(h[0] for h in hits))
+    top = max((h[1] for h in hits), key=CLAUDE_TIERS.index)
+    at_top = [h for h in hits if h[1] == top]  # weaker rules are met by the stronger tier at any effort
+    effort = max((h[2] for h in at_top if h[2]), key=_effort_rank, default=None)
+    tier, effort = _fitted_floor(top, effort, cfg)
+    floor_min = f"{tier}/{effort}" if effort else tier
+    # Name only the rules that set the minimum: the top-tier ones, and of those the one giving the effort.
+    labels = ", ".join(dict.fromkeys(h[0] for h in at_top if not h[2] or h[2] == effort or tier != top))
     minimum = f"{tier}/{effort} effort" if effort else tier
-    return {**rec, "tier": new_tier, "effort": new_effort,
-            "reason": f"your rule: \"{label}\" tasks get at least {minimum} (MODEL_PICKER_FLOORS)",
-            "source": f"{rec['source']} + floor", "unsure": False, "floor": label, "floored_from": rec["tier"],
-            "floor_min": f"{tier}/{effort}" if effort else tier}
+    cur = rec["tier"] if rec["tier"] in CLAUDE_TIERS else None
+    if cur and CLAUDE_TIERS.index(cur) > CLAUDE_TIERS.index(tier):
+        return {**rec, "floor_min": floor_min}  # a stronger model meets the floor
+    raise_tier = not cur or CLAUDE_TIERS.index(cur) < CLAUDE_TIERS.index(tier)
+    new_effort = effort if effort and _effort_rank(effort) > _effort_rank(rec.get("effort")) else rec.get("effort")
+    if not raise_tier and new_effort == rec.get("effort"):
+        return {**rec, "floor_min": floor_min}  # already meets the floor
+    out = {**rec, "tier": tier, "effort": new_effort, "unsure": False, "floor_min": floor_min,
+           "source": f"{rec['source']} + floor"}
+    if raise_tier:
+        out.update(reason=f"your rule: \"{labels}\" tasks get at least {minimum} (MODEL_PICKER_FLOORS)",
+                   floor=labels, floored_from=rec["tier"])
+    else:
+        out.update(reason=f"{rec['reason']}; effort raised to {new_effort} by your rule \"{labels}\"",
+                   floor_effort=new_effort)
+    return out
 
 
 def decide(inp, cfg, use_router=True, for_launch=False, track=True):
@@ -894,6 +925,7 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
         entry.update({"rec_tier": rec["tier"], "rec_effort": rec["effort"], "source": rec["source"],
                       "confidence": rec.get("confidence"), "router_ms": rec.get("router_ms"),
                       "unsure": bool(rec.get("unsure")), "floor": rec.get("floor"),
+                      "floor_effort": rec.get("floor_effort"),
                       # A fallback guess can't judge an explicit choice: leave "followed" unknown.
                       "followed": None if (not chosen_tier or rec.get("unsure")) else
                       (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))})
@@ -907,9 +939,9 @@ def _below_floor(rec, chosen_tier, effort):
     if not floor or chosen_tier not in CLAUDE_TIERS:
         return None
     tier, _, f_effort = floor.partition("/")
-    low_tier = CLAUDE_TIERS.index(chosen_tier) < CLAUDE_TIERS.index(tier)
-    low_effort = bool(f_effort) and _effort_rank(effort) < _effort_rank(f_effort)
-    return (f"{tier}/{f_effort} effort" if f_effort else tier) if low_tier or low_effort else None
+    have, need = CLAUDE_TIERS.index(chosen_tier), CLAUDE_TIERS.index(tier)
+    below = have < need or (have == need and bool(f_effort) and _effort_rank(effort) < _effort_rank(f_effort))
+    return (f"{tier}/{f_effort} effort" if f_effort else tier) if below else None
 
 
 def verbose_note(cfg, label, chosen, rec):

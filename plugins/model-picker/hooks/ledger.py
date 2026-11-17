@@ -382,8 +382,9 @@ def stamp_verdict(decision, effort):
     if not decision or not decision.get("rec_tier"):
         return ""
     by_router = not str(decision.get("source") or "heuristic").startswith("heuristic")
+    effort_chosen = by_router or bool(decision.get("floor_effort"))  # the keyword rules' "medium" is a placeholder
     rec_effort = decision.get("rec_effort") or "medium"
-    rec = f"{decision['rec_tier']}/{rec_effort}" if by_router else decision["rec_tier"]
+    rec = f"{decision['rec_tier']}/{rec_effort}" if effort_chosen else decision["rec_tier"]
     who = _rec_label(decision.get("source")) + (" + your floor" if decision.get("floor") else "")
     chosen = decision.get("chosen_tier")
     pick = decision.get("user_pick")
@@ -399,7 +400,7 @@ def stamp_verdict(decision, effort):
         return f" · {who} recommended {rec}"
     if chosen != decision["rec_tier"] and not (decision["rec_tier"] == "local" and chosen == "haiku"):
         return f" · ✗ {who} recommended {rec}"
-    if by_router and effort and effort != rec_effort:
+    if effort_chosen and effort != rec_effort:
         return f" · ✓ model as {who} recommended ({rec}), effort differs"
     return f" · ✓ followed {who} ({rec})"
 

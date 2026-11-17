@@ -5,7 +5,7 @@
 - **High effort for work that's costly to get wrong.** Guide rule 1 now says `high` for subtle or costly-to-get-wrong work that no automatic check covers (reviews that gate a merge, security, debugging a hard failure), not only after a model fell short, and to take the higher of model-picker's effort and this rule's. In v0.4.9 such work defaulted to `medium` now that Claude passes effort explicitly instead of inheriting the session's.
 - **Effort floors.** `MODEL_PICKER_FLOORS` values can name an effort: `{"review": "opus/high"}`. A matching launch is recommended at least that model and effort; a stronger model meets the floor at any effort (guide rule 3), and a floor never lowers either. If the floor's model isn't available here, the nearest available one stands in (a weaker stand-in needs at least high). An explicit launch below the floor, including one with no effort set, is reminded of your rule. A floor that only raised effort doesn't take model-picker's credit for the model, and the stamp compares effort whenever a floor set it.
 - Step-downs to a weaker available model keep an effort above `high` (`xhigh`, `max`) instead of capping it at `high`.
-- Tests: 321.
+- Tests: 325.
 
 ## model-picker v0.4.9 (2026-11-17)
 

@@ -442,6 +442,8 @@ def apply_floors(rec, inp, cfg):
     if raise_tier:
         out.update(reason=f"your rule: \"{labels}\" tasks get at least {minimum} (MODEL_PICKER_FLOORS)",
                    floor=labels, floored_from=rec["tier"])
+        if effort:
+            out["floor_effort"] = new_effort
     else:
         out.update(reason=f"{rec['reason']}; effort raised to {new_effort} by your rule \"{labels}\"",
                    floor_effort=new_effort)
@@ -459,7 +461,8 @@ def decide(inp, cfg, use_router=True, for_launch=False, track=True):
     track=False: honor a router pause but don't count this call toward one (its notice would have no reader).
     """
     rec = _decide(inp, cfg, use_router, allow_local=not for_launch, track=track)
-    return fit_to_available(apply_floors(guard_local(rec, inp, cfg), inp, cfg), cfg)
+    # Fit first, so a floor compares against a model that can actually run here.
+    return fit_to_available(apply_floors(fit_to_available(guard_local(rec, inp, cfg), cfg), inp, cfg), cfg)
 
 
 def _decide(inp, cfg, use_router=True, allow_local=True, track=True):

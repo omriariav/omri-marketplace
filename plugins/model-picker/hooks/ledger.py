@@ -385,7 +385,7 @@ def stamp_verdict(decision, effort):
     effort_chosen = by_router or bool(decision.get("floor_effort"))  # the keyword rules' "medium" is a placeholder
     rec_effort = decision.get("rec_effort") or "medium"
     rec = f"{decision['rec_tier']}/{rec_effort}" if effort_chosen else decision["rec_tier"]
-    who = _rec_label(decision.get("source")) + (" + your floor" if decision.get("floor") else "")
+    who = _rec_label(decision.get("source")) + (" + your floor" if decision.get("floor") or decision.get("floor_effort") else "")
     chosen = decision.get("chosen_tier")
     pick = decision.get("user_pick")
     if isinstance(pick, dict) and (pick.get("tier") or pick.get("effort")):
@@ -400,7 +400,8 @@ def stamp_verdict(decision, effort):
         return f" · {who} recommended {rec}"
     if chosen != decision["rec_tier"] and not (decision["rec_tier"] == "local" and chosen == "haiku"):
         return f" · ✗ {who} recommended {rec}"
-    if effort_chosen and effort != rec_effort:
+    # An unknown effort is "differs" only against a floor's effort (no effort set inherits the session's).
+    if effort_chosen and effort != rec_effort and (effort or decision.get("floor_effort")):
         return f" · ✓ model as {who} recommended ({rec}), effort differs"
     return f" · ✓ followed {who} ({rec})"
 

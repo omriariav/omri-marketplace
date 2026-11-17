@@ -1596,5 +1596,23 @@ results += [
                                 "outcome": "explicit", "floor_effort": "high"}, "medium").endswith("effort differs")),
 ]
 
+# v0.4.10 re-review.
+xf = {"MODEL_PICKER_TIERS": "haiku,sonnet,opus", "MODEL_PICKER_FLOORS": '{"review": "opus/xhigh"}'}
+xr = mp.decide({"description": "plan the architecture for a major refactor, review it"}, xf, use_router=False)
+both = mp.apply_floors({**base_rec, "tier": "sonnet", "effort": "medium"}, {"description": "review"}, {"MODEL_PICKER_FLOORS": '{"review": "opus/high"}'})
+results += [
+    check("stamp: a router verdict with unknown effort doesn't claim 'effort differs'",
+          ledger.stamp_verdict(dec(), None) == " · ✓ followed jev-latest (opus/high)"),
+    check("floor: an unavailable stronger pick is fitted before the floor applies",
+          (xr["tier"], xr["effort"]) == ("opus", "xhigh") and mp._below_floor(xr, "opus", "xhigh") is None),
+    check("floor: raising model and effort records the effort too, and the stamp compares it",
+          both.get("floor") == "review" and both.get("floor_effort") == "high"
+          and ledger.stamp_verdict({"rec_tier": "opus", "rec_effort": "high", "source": "heuristic + floor", "chosen_tier": "opus",
+                                    "outcome": "explicit", "floor": "review", "floor_effort": "high"}, None).endswith("effort differs")),
+    check("stamp: an effort-only floor is named", "+ your floor" in ledger.stamp_verdict(
+          {"rec_tier": "sonnet", "rec_effort": "high", "source": "heuristic + floor", "chosen_tier": "opus",
+           "outcome": "explicit", "floor_effort": "high"}, "medium")),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

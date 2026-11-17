@@ -1,5 +1,11 @@
 # Releases
 
+## model-picker v0.4.7 (2026-11-17)
+
+- **Router pause.** A router that can't be reached no longer slows every prompt and launch. After 3 failures in a row (connection errors, timeouts, HTTP errors, or a router/key command that exits non-zero) router calls pause for 10 minutes (`MODEL_PICKER_ROUTER_PAUSE`, minutes, capped at a day; `0` never pauses), with one line telling you so. A rejected request that a retry can't fix (HTTP 400/401/403/404/405/407) pauses at once and points at the key and header settings. While paused, launches use the keyword heuristic (`source: heuristic (router paused: …)`) and the prompt line isn't shown. Prompts get less time than launches (3 s), so 3 prompt timeouts in a row pause only the prompt line, which shows nothing on a timeout anyway; launches keep asking the router. After a pause, calls try again: a success clears the count, and a failure of the same kind (can't reach vs rejected) pauses again without a new message. A malformed answer or a missing API key doesn't count (neither costs any time). State is shared by all sessions and both hooks, under a lock, in `router-health.json` in the state dir (written even with `MODEL_PICKER_LOG=0`; delete it to retry at once), with one entry per router fingerprint: a hash of the router, key and header settings and of the key itself, so sessions with different keys don't share a pause. Failures older than one pause are forgotten, and entries idle for a day are dropped. The `route` CLI behind `/model-picker` honors a pause but never starts one.
+- The ledger's state dir now also honors `MODEL_PICKER_STATE_DIR` from the environment when the config passed in lacks it.
+- Tests: 264.
+
 ## model-picker v0.4.6 (2026-11-16)
 
 - **Followed, by direction.** `/model-picker:report` splits launches that didn't follow the recommendation into "went to a stronger model" and "went to a cheaper one". Going stronger is often deliberate (a stated reason, a user rule) and costs money; going cheaper saves money but is the risky direction. A low follow rate made mostly of deliberate upgrades no longer reads like ignored advice.

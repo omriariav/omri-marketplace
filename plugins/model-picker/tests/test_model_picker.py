@@ -1086,5 +1086,216 @@ results += [
     check("prompt route: report counts routed prompts", prep["prompts_routed"] == len(plog) and "Prompts routed" in ledger.format_report(prep)),
 ]
 
+# --- v0.4.7 router pause ---------------------------------------------------------
+import urllib.error  # noqa: E402
+
+DOWN = {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": "http://127.0.0.1:9",
+        "MODEL_PICKER_ROUTER_MODEL": "team/jev-latest", "MODEL_PICKER_ROUTER_API_KEY_ENV": "none"}
+bst = {**fresh_state(), **DOWN}
+n1, n2, n3 = (mp.record_router(bst, None) for _ in range(3))
+health = json.loads((Path(bst["MODEL_PICKER_STATE_DIR"]) / "router-health.json").read_text())  # raw file
+results += [
+    check("pause: first two failures are quiet, the third pauses with one notice",
+          n1 is None and n2 is None and n3 and "jev-latest failed 3× in a row (timed out)" in n3 and "10 min" in n3),
+    check("pause: router_paused reports the reason", mp.router_paused(bst) == "timed out"),
+    check("pause: the shared state holds no router settings in clear", "127.0.0.1" not in json.dumps(health)),
+    check("pause: a launch while paused skips the router at once",
+          mp.decide({"description": "debug the flaky test"}, bst)["source"] == "heuristic (router paused: timed out)"),
+    check("pause: other router settings start a fresh count",
+          mp.router_paused({**bst, "MODEL_PICKER_ROUTER_MODEL": "team/jev-next"}) is None),
+    check("pause: MODEL_PICKER_ROUTER_PAUSE=0 never pauses", mp.router_paused({**bst, "MODEL_PICKER_ROUTER_PAUSE": "0"}) is None),
+]
+later = time.time() + 601
+results += [
+    check("pause: ends after 10 minutes", mp.router_paused(bst, now=later) is None),
+    check("pause: a failed retry after the pause pauses again, quietly",
+          mp.record_router(bst, None, now=later) is None and mp.router_paused(bst, now=later + 1) == "timed out"),
+    check("pause: one success clears the count",
+          mp.record_router(bst, {"tier": "opus"}) is None and mp.router_paused(bst) is None
+          and mp.record_router(bst, None) is None),
+]
+rst = {**fresh_state(), **DOWN}
+e401 = urllib.error.HTTPError("http://x", 401, "Unauthorized", {}, None)
+e503 = urllib.error.HTTPError("http://x", 503, "Unavailable", {}, None)
+note401 = mp.record_router(rst, e401)
+ost = {**fresh_state(), **DOWN}
+results += [
+    check("pause: a rejected request (HTTP 401) pauses at once and points at the config",
+          note401 and "HTTP 401" in note401 and "retry won't fix" in note401 and mp.router_paused(rst) == "HTTP 401"),
+    check("pause: HTTP 503 and connection errors count toward three",
+          mp.record_router(ost, e503) is None and mp.record_router(ost, urllib.error.URLError(ConnectionRefusedError())) is None
+          and "unreachable" in (mp.record_router(ost, urllib.error.URLError(OSError())) or "")),
+]
+gst = {**fresh_state(), **DOWN}
+for _ in range(5):
+    mp.record_router(gst, ValueError("no usable tier answer"))
+results.append(check("pause: a malformed answer doesn't count (the router is up)", mp.router_paused(gst) is None))
+(Path(gst["MODEL_PICKER_STATE_DIR"]) / "router-health.json").write_text("{not json")
+results.append(check("pause: a corrupt state file means not paused", mp.router_paused(gst) is None
+                     and mp.record_router(gst, None) is None))
+
+# End to end: the prompt hook and the launch hook share one count.
+est = {**fresh_state(), **DOWN, "MODEL_PICKER_PROMPT_ROUTE": "1"}
+p1 = prompt_hook("debug the flaky login test in CI", est)
+p2 = prompt_hook("debug the flaky login test in CI", est)
+l3 = run(agent(description="debug the flaky login test", prompt="p"), "advise", est)
+p4 = prompt_hook("debug the flaky login test in CI", est)
+fails_after = mp._health_read(est).get("fails")
+l5 = run(agent(description="debug the flaky login test", prompt="p"), "advise", est)
+results += [
+    check("pause e2e: prompts and launches share the count; the third failure tells the user",
+          p1 is None and p2 is None and "failed 3× in a row (unreachable)" in (l3 or {}).get("systemMessage", "")),
+    check("pause e2e: while paused a prompt shows nothing and calls no router", p4 is None and fails_after == 3),
+    check("pause e2e: while paused a launch still gets a recommendation, no repeat notice",
+          "router paused: unreachable" in json.dumps(l5) and "systemMessage" not in (l5 or {})),
+]
+
+# Review round 1 of v0.4.7.
+import socket  # noqa: E402
+
+def _paused_after(errs):
+    st = {**fresh_state(), **DOWN}
+    for e in errs:
+        mp.record_router(st, e)
+    return mp.router_paused(st)
+
+results += [
+    check("pause: real exception shapes count (TimeoutError, socket.timeout, TimeoutExpired, URLError(timeout))",
+          _paused_after([TimeoutError(), socket.timeout(), subprocess.TimeoutExpired("x", 1)]) == "timed out"
+          and _paused_after([urllib.error.URLError(TimeoutError())] * 3) == "connect timed out"),
+    check("pause: a failing router/key command counts (a wrapped curl that can't connect exits non-zero)",
+          _paused_after([subprocess.CalledProcessError(28, "curl")] * 3) == "command exit 28"),
+    check("pause: no API key never pauses (it costs no time, and another session may have the key)",
+          _paused_after([ValueError("no API key")] * 5) is None),
+    check("pause: the key source and headers are part of the fingerprint",
+          mp._router_id(DOWN) != mp._router_id({**DOWN, "MODEL_PICKER_ROUTER_API_KEY_ENV": "OTHER_KEY"})
+          and mp._router_id(DOWN) != mp._router_id({**DOWN, "MODEL_PICKER_ROUTER_HEADERS": '{"a": "b"}'})),
+    check("pause: an absurd MODEL_PICKER_ROUTER_PAUSE is capped at a day",
+          mp._pause_seconds({"MODEL_PICKER_ROUTER_PAUSE": "inf"}) == 86400
+          and mp._pause_seconds({"MODEL_PICKER_ROUTER_PAUSE": "nan"}) == 600
+          and mp._pause_seconds({"MODEL_PICKER_ROUTER_PAUSE": "soon"}) == 600),
+]
+sst = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(sst, None)
+stale_now = time.time() + 600 + 600 + 5   # the pause ended more than one pause ago
+results.append(check("pause: after a long-expired pause one blip doesn't re-pause; three do, with a new notice",
+                     mp.record_router(sst, None, now=stale_now) is None and mp.router_paused(sst, now=stale_now + 1) is None
+                     and mp.record_router(sst, None, now=stale_now) is None
+                     and "3× in a row" in (mp.record_router(sst, None, now=stale_now) or "")))
+cst = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(cst, None)
+results += [
+    check("pause: a new reason (HTTP 401 after timeouts) gets its own notice",
+          "HTTP 401" in (mp.record_router(cst, e401) or "")),
+    check("pause: prompt timeouts pause only the prompt line",
+          [mp.record_router(fst := {**fresh_state(), **DOWN}, None, scope="prompt") for _ in range(1)]
+          and mp.record_router(fst, None, scope="prompt") is None
+          and "prompt line is paused" in (mp.record_router(fst, None, scope="prompt") or "")
+          and mp.router_paused(fst) is None and mp.router_paused(fst, scope="prompt") == "timed out"),
+]
+# Parallel hooks: one notice, no lost counts.
+par = {**fresh_state(), **DOWN}
+code = ("import json,sys; sys.path.insert(0, %r); import model_picker as mp; "
+        "print(json.dumps(mp.record_router(json.loads(sys.argv[1]), None)))") % str(ROOT / "hooks")
+procs = [subprocess.Popen([sys.executable, "-I", "-c", code, json.dumps(par)], stdout=subprocess.PIPE, text=True)
+         for _ in range(6)]
+outs = [json.loads(p.communicate()[0] or "null") for p in procs]
+pfails = mp._health_read(par)["fails"]
+results.append(check("pause: 6 parallel failures count 6 and give exactly one notice",
+                     pfails == 6 and sum(1 for o in outs if o) == 1))
+# The route CLI (the /model-picker skill) honors a pause but never starts one: its notice would reach Claude, not you.
+rcli = {**fresh_state(), **DOWN}
+for _ in range(3):
+    subprocess.run([sys.executable, "-I", str(HOOK), "route", "debug the flaky login test"], capture_output=True, text=True,
+                   env={**{k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")}, **rcli,
+                        "MODEL_PICKER_CONFIG": "/nonexistent"})
+results.append(check("pause: the route CLI doesn't count toward a pause",
+                     not (Path(rcli["MODEL_PICKER_STATE_DIR"]) / "router-health.json").exists()))
+# A paused launch really makes no call.
+spst = fresh_state()
+hit = Path(spst["MODEL_PICKER_STATE_DIR"]) / "called"
+SPY = {**spst, "MODEL_PICKER_ROUTER": "command",
+       "MODEL_PICKER_ROUTER_CMD": f"touch {hit}; {sys.executable} -c \"print('{{}}')\""}
+for _ in range(3):
+    mp.record_router(SPY, None)
+hit.unlink(missing_ok=True)
+paused_src = mp.decide({"description": "debug the flaky test"}, SPY)["source"]
+results.append(check("pause: a launch while paused never calls the router",
+                     paused_src.startswith("heuristic (router paused") and not hit.exists()))
+
+# Review round 2 of v0.4.7.
+pp = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "command",
+      "MODEL_PICKER_ROUTER_CMD": "sleep 2.7; echo '{\"tier\": \"haiku\", \"effort\": \"low\", \"confidence\": 1}'"}
+slow_prompts = [prompt_hook("debug the flaky login test in CI", pp) for _ in range(3)]
+saved_deadline, mp.ROUTER_DEADLINE = mp.ROUTER_DEADLINE, 7.0  # real launch budget (an earlier test lowers it)
+launch_src = mp.decide({"description": "debug the flaky test"}, pp)["source"]
+mp.ROUTER_DEADLINE = saved_deadline
+cp = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(cp, urllib.error.URLError(ConnectionRefusedError()), scope="prompt")
+results += [
+    check("pause: a router slower than the prompt budget (2.7 s) pauses only the prompt line; launches still use it",
+          not any(slow_prompts[:2]) and "prompt line is paused" in (slow_prompts[2] or {}).get("systemMessage", "")
+          and mp.router_paused(pp) is None and mp.router_paused(pp, scope="prompt") == "timed out"
+          and launch_src == "command (1.00)"),
+    check("pause: on the prompt path, failing to connect pauses everything", mp.router_paused(cp) == "unreachable"),
+]
+os.environ["KEY_FOR_TEST"] = "old-key"
+KEYED = {**DOWN, "MODEL_PICKER_ROUTER_API_KEY_ENV": "KEY_FOR_TEST"}
+before = mp._router_id(KEYED)
+os.environ["KEY_FOR_TEST"] = "new-key"
+results.append(check("pause: a different key value starts a fresh count", mp._router_id(KEYED) != before))
+del os.environ["KEY_FOR_TEST"]
+ost2 = {**fresh_state(), **DOWN}
+mp.record_router(ost2, None, now=time.time() - 700)
+mp.record_router(ost2, None, now=time.time() - 690)
+results.append(check("pause: failures from long ago (never paused) expire", mp.record_router(ost2, None) is None
+                     and mp._health_read(ost2)["fails"] == 1))
+fut = {**fresh_state(), **DOWN}
+mp._health_write(fut, {"fails": 3, "reason": "timed out", "paused_until": time.time() + 10 ** 9})
+results.append(check("pause: a pause ending implausibly far ahead is ignored", mp.router_paused(fut) is None))
+alt = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(alt, None)
+results.append(check("pause: 'unreachable' right after a 'timed out' pause re-pauses quietly",
+                     mp.record_router(alt, urllib.error.URLError(OSError()), now=time.time() + 601) is None
+                     and mp.router_paused(alt, now=time.time() + 602) == "unreachable"))
+
+# Review round 3 of v0.4.7.
+two = {**fresh_state(), **DOWN}
+os.environ["KEY_A"], os.environ["KEY_B"] = "a", "b"
+ka, kb = {**two, "MODEL_PICKER_ROUTER_API_KEY_ENV": "KEY_A"}, {**two, "MODEL_PICKER_ROUTER_API_KEY_ENV": "KEY_B"}
+for _ in range(3):
+    mp.record_router(ka, urllib.error.URLError(OSError()))
+    mp.record_router(kb, urllib.error.URLError(OSError()))
+results.append(check("pause: sessions with different keys keep separate counts in one file",
+                     mp.router_paused(ka) == "unreachable" and mp.router_paused(kb) == "unreachable"))
+old = {**fresh_state(), **DOWN}
+mp.record_router({**old, "MODEL_PICKER_ROUTER_MODEL": "gone"}, None, now=time.time() - 2 * 86400)
+mp.record_router(old, None)
+results.append(check("pause: entries idle for a day are pruned",
+                     list(json.loads((Path(old["MODEL_PICKER_STATE_DIR"]) / "router-health.json").read_text())["routers"])
+                     == [mp._router_id(old)]))
+ps = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(ps, None, scope="prompt")
+mp.record_router(ps, {"tier": "opus"})  # a launch answered (it had more time)
+results += [
+    check("pause: a launch success doesn't lift the prompt line's pause", mp.router_paused(ps, scope="prompt") == "timed out"),
+    check("pause: a prompt success clears both counts",
+          mp.record_router(ps, {"tier": "haiku"}, scope="prompt") is None and mp.router_paused(ps, scope="prompt") is None),
+]
+import unittest.mock as um  # noqa: E402
+nl = {**fresh_state(), **DOWN}
+with um.patch.object(mp.fcntl, "flock", side_effect=OSError(45, "Operation not supported")):
+    t0 = time.monotonic()
+    for _ in range(3):
+        mp.record_router(nl, None)
+    nolock_s = time.monotonic() - t0
+results.append(check("pause: works without flock (network filesystems), with no lock wait",
+                     mp.router_paused(nl) == "timed out" and nolock_s < 0.5))
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

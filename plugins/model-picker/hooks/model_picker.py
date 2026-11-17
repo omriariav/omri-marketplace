@@ -38,16 +38,24 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
                                  {"review": "opus"}; matched against the launch description and agent type
   MODEL_PICKER_PROMPT_ROUTE      0 (default) | 1   after each prompt, show the decisions API's raw pick for
                                  it (needs a router; the prompt's first 200 characters are sent)
+  MODEL_PICKER_ROUTER_PAUSE      minutes (default 10; 0 = never pause): after 3 router failures in a row
+                                 (or one rejected request, e.g. HTTP 401), skip router calls for this long
 
 Also: model_picker.py report [today|24h|7d|30d|all] [--json] [--html [--out PATH] [--open]]
 """
 
+import fcntl
+import hashlib
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -229,8 +237,12 @@ def local_hint(cfg):
     return None
 
 
+def config_path():
+    return Path(os.environ.get("MODEL_PICKER_CONFIG") or Path.home() / ".config/model-picker/config.json")
+
+
 def load_config():
-    path = Path(os.environ.get("MODEL_PICKER_CONFIG") or Path.home() / ".config/model-picker/config.json")
+    path = config_path()
     cfg = {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -390,19 +402,21 @@ def apply_floors(rec, inp, cfg):
             "source": f"{rec['source']} + floor", "unsure": False, "floor": label, "floored_from": rec["tier"]}
 
 
-def decide(inp, cfg, use_router=True, for_launch=False):
+def decide(inp, cfg, use_router=True, for_launch=False, track=True):
     """Recommendation dict: tier, effort, reason, source, limited to the available tiers.
 
     for_launch: the call is an Agent/teammate launch that is already happening. `local` (call ask_local
     instead of launching an agent) can't apply there, and guessing it from a one-line description sends
     tool work to a model that has no tools; so launches only ever get Claude tiers. The local tier is
     offered where the choice is still open: the session rules and the /model-picker skill.
+
+    track=False: honor a router pause but don't count this call toward one (its notice would have no reader).
     """
-    rec = _decide(inp, cfg, use_router, allow_local=not for_launch)
+    rec = _decide(inp, cfg, use_router, allow_local=not for_launch, track=track)
     return fit_to_available(apply_floors(guard_local(rec, inp, cfg), inp, cfg), cfg)
 
 
-def _decide(inp, cfg, use_router=True, allow_local=True):
+def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
     """Router first (if configured), heuristic fallback; may name a tier that is not available."""
     local = allow_local and local_enabled(cfg)
     agent_type = str(inp.get("subagent_type") or "")
@@ -414,6 +428,10 @@ def _decide(inp, cfg, use_router=True, allow_local=True):
     router = routers.ROUTERS.get(name)
     if not use_router or not router or agent_type.lower().split(":")[-1] in (READ_ONLY_TYPES | PLANNING_TYPES):
         return fallback
+    paused = router_paused(cfg)
+    if paused:
+        fallback["source"] = f"heuristic (router paused: {paused})"
+        return fallback
     box = {}
     worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, local)), daemon=True)
     started = time.monotonic()
@@ -421,6 +439,9 @@ def _decide(inp, cfg, use_router=True, allow_local=True):
     worker.join(ROUTER_DEADLINE)
     fallback["router_ms"] = int((time.monotonic() - started) * 1000)
     res = box.get("res")
+    notice = record_router(cfg, res) if track else None
+    if notice:
+        fallback["notice"] = notice
     if res is None:
         fallback["source"] = "heuristic (router timed out)"
     elif isinstance(res, Exception):
@@ -455,6 +476,240 @@ def _route(router, name, inp, cfg, local):
         return router(task_text(inp, cfg), tiers, rcfg)
     except Exception as exc:  # router trouble never blocks a launch
         return exc
+
+
+# --- router pause: stop waiting on a router that is down (e.g. a gateway behind a VPN that is off) ----------
+ROUTER_FAILS_TO_PAUSE = 3                         # timeouts / connection errors in a row
+REJECTED_CODES = {400, 401, 403, 404, 405, 407}   # a retry can't fix these: pause on the first one
+MAX_PAUSE_MINUTES = 1440
+HEALTH_LOCK_WAIT = 1.0                            # seconds; past this the call just isn't counted
+# Settings that decide whether calls can succeed; changing any of them starts a fresh count.
+ROUTER_ID_KEYS = ("MODEL_PICKER_ROUTER", "MODEL_PICKER_ROUTER_URL", "MODEL_PICKER_ROUTER_MODEL",
+                  "MODEL_PICKER_ROUTER_CMD", "MODEL_PICKER_ROUTER_API_KEY_ENV", "MODEL_PICKER_ROUTER_API_KEY_CMD",
+                  "MODEL_PICKER_ROUTER_HEADERS")
+
+
+def _router_id(cfg):
+    """Fingerprint of the router settings and the key in use (hashed: commands, headers and keys are secrets).
+    A session with a different key (fixed, or still stale) keeps its own count."""
+    name = str(cfg.get("MODEL_PICKER_ROUTER") or "").lower()
+    key_env = str(cfg.get("MODEL_PICKER_ROUTER_API_KEY_ENV") or routers.DEFAULT_KEY_ENV.get(name, ""))
+    key = os.environ.get(key_env, "") if key_env and key_env.lower() != "none" else ""
+    raw = "|".join([*(str(cfg.get(k) or "") for k in ROUTER_ID_KEYS), key])
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _router_label(cfg):
+    name = str(cfg.get("MODEL_PICKER_ROUTER") or "heuristic").lower()
+    model = cfg.get("MODEL_PICKER_ROUTER_MODEL")
+    return str(model).split("/")[-1] if model and name != "command" else f"{name} router"
+
+
+def _pause_seconds(cfg):
+    try:
+        minutes = _num(cfg, "MODEL_PICKER_ROUTER_PAUSE", 10)
+    except (TypeError, ValueError):
+        minutes = 10.0
+    if minutes != minutes:  # NaN
+        minutes = 10.0
+    return min(max(0.0, minutes), MAX_PAUSE_MINUTES) * 60
+
+
+def _health_path(cfg):
+    return ledger.state_dir(cfg) / "router-health.json"
+
+
+def _health_all(cfg):
+    try:
+        data = json.loads(_health_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    entries = data.get("routers") if isinstance(data, dict) else None
+    return {k: v for k, v in entries.items() if isinstance(v, dict)} if isinstance(entries, dict) else {}
+
+
+def _health_read(cfg):
+    """This router's state. Shared across sessions, so one session's failures spare the others the wait;
+    kept per fingerprint, so sessions with different keys or settings don't overwrite each other."""
+    return dict(_health_all(cfg).get(_router_id(cfg)) or {})
+
+
+def _entry_last(e):
+    vals = []
+    for k in ("last", "paused_until", "prompt_last", "prompt_paused_until"):
+        try:
+            vals.append(float(e.get(k) or 0))
+        except (TypeError, ValueError):
+            pass
+    return max(vals or [0.0])
+
+
+def _health_write(cfg, entry, now=None):
+    """Atomic (readers never see a half-written file). Entries idle for a day are dropped."""
+    tmp = None
+    try:
+        now = now or time.time()
+        entries = {k: v for k, v in _health_all(cfg).items() if now - _entry_last(v) < MAX_PAUSE_MINUTES * 60}
+        if entry:
+            entries[_router_id(cfg)] = entry
+        else:
+            entries.pop(_router_id(cfg), None)
+        path = _health_path(cfg)
+        fd, tmp = tempfile.mkstemp(prefix=".router-health.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"routers": entries}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _health_lock(cfg):
+    """flock serializing read-modify-write across parallel hooks (parallel launches run their hooks at once).
+    Returns (proceed, fd): fd to unlock; (True, None) where the filesystem has no flock (a lost update there
+    only delays a pause); (False, None) when another hook holds the lock too long or the dir is unusable."""
+    try:
+        d = ledger.state_dir(cfg)
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(d / ".router-health.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return False, None
+    deadline = time.monotonic() + HEALTH_LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True, fd
+        except BlockingIOError:  # held by another hook
+            if time.monotonic() > deadline:
+                os.close(fd)
+                return False, None
+            time.sleep(0.01)
+        except OSError:  # no flock here (ENOLCK, EOPNOTSUPP): go on without it
+            os.close(fd)
+            return True, None
+
+
+def _num_field(h, key):
+    try:
+        return float(h.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _paused_until(h, prefix=""):
+    return _num_field(h, prefix + "paused_until")
+
+
+def router_paused(cfg, now=None, scope="launch"):
+    """Why router calls are paused right now, or None. scope="prompt" also honors the prompt line's own pause.
+    A pause ending further ahead than one pause from now (clock moved back, hand-edited file) is ignored."""
+    pause = _pause_seconds(cfg)
+    if pause <= 0:
+        return None
+    h = _health_read(cfg)
+    now = now or time.time()
+    for prefix in ("", "prompt_") if scope == "prompt" else ("",):
+        if now < _paused_until(h, prefix) <= now + pause:
+            return str(h.get(prefix + "reason") or "failing")
+    return None
+
+
+def _failure(res):
+    """(reason, rejected, slow) when the router could not be reached or refused the call; None when it answered;
+    "other" for any other error (a malformed or unusable answer means the router is up and fast).
+    slow: the call ran out of time (after connecting, or we can't tell), so a longer budget might have worked."""
+    if isinstance(res, dict):
+        return None
+    if res is None:
+        return "timed out", False, True
+    if isinstance(res, urllib.error.HTTPError):  # before URLError: it is a subclass
+        return f"HTTP {res.code}", res.code in REJECTED_CODES, False
+    if isinstance(res, urllib.error.URLError):  # never connected: DNS, refused, no route, connect timeout
+        timed_out = isinstance(res.reason, (TimeoutError, socket.timeout))
+        return ("connect timed out" if timed_out else "unreachable"), False, False
+    if isinstance(res, (TimeoutError, socket.timeout, subprocess.TimeoutExpired)):  # socket.timeout: Python < 3.10
+        return "timed out", False, True
+    if isinstance(res, OSError):
+        return "unreachable", False, False
+    if isinstance(res, subprocess.CalledProcessError):
+        # The router or key command failed; its exit code says nothing about why (a wrapped curl that
+        # can't reach the gateway looks the same), so it counts like a connection error.
+        return f"command exit {res.returncode}", False, False
+    return "other"
+
+
+def _clear(h, prefix):
+    changed = False
+    for k in ("fails", "reason", "rejected", "last", "paused_until"):
+        changed = h.pop(prefix + k, None) is not None or changed
+    return changed
+
+
+def record_router(cfg, res, now=None, scope="launch"):
+    """Count this router call in the shared state. Returns a one-line notice when it starts a pause.
+
+    Two counts per router: the main one (connection failures and rejections from both hooks, and launch
+    timeouts) pauses every router call; the prompt line's own count (prompt timeouts: prompts get 3 s,
+    launches more) pauses only the prompt line, which shows nothing on a timeout anyway. A retry that fails
+    right after a pause, for the same kind of reason, pauses again quietly (the user was told)."""
+    pause = _pause_seconds(cfg)
+    if pause <= 0:
+        return None
+    fail = _failure(res)
+    if fail == "other":
+        return None  # no sign either way: leave the count alone
+    proceed, fd = _health_lock(cfg)
+    if not proceed:
+        return None
+    try:
+        now = now or time.time()
+        h = _health_read(cfg)
+        before = dict(h)
+        for pre in ("", "prompt_"):  # old failures, or a pause that ended long ago (overnight): start over
+            last = max(_paused_until(h, pre), _num_field(h, pre + "last"))
+            if last and now > last + pause:
+                _clear(h, pre)
+        if fail is None:
+            _clear(h, "")
+            if scope == "prompt":
+                _clear(h, "prompt_")  # answered inside the prompt budget
+            if h != before:
+                _health_write(cfg, h, now)
+            return None
+        reason, rejected, slow = fail
+        pre = "prompt_" if scope == "prompt" and slow else ""
+        until = _paused_until(h, pre)
+        fails = h[pre + "fails"] + 1 if isinstance(h.get(pre + "fails"), int) else 1
+        h.update({pre + "fails": fails, pre + "reason": reason, pre + "rejected": rejected, pre + "last": now})
+        if not rejected and fails < ROUTER_FAILS_TO_PAUSE:
+            h.pop(pre + "paused_until", None)
+            _health_write(cfg, h, now)
+            return None
+        # Same kind (can't reach vs rejected): "timed out" and "unreachable" alternating isn't news.
+        told = bool(until) and bool(before.get(pre + "rejected")) == rejected
+        h[pre + "paused_until"] = now + pause
+        _health_write(cfg, h, now)
+    finally:
+        if fd is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    if told:
+        return None
+    mins = f"{pause / 60:g} min"
+    label = _router_label(cfg)
+    reset = f"delete {_health_path(cfg)} to retry sooner"
+    if pre:
+        return (f"model-picker: {label} didn't answer 3 prompts in a row in time ({reason}); the prompt line is paused "
+                f"for {mins}, agent launches still ask it ({reset}).")
+    if rejected:
+        return (f"model-picker: {label} rejected the call ({reason}), which a retry won't fix; router calls paused "
+                f"for {mins}. Check the router URL, key (MODEL_PICKER_ROUTER_API_KEY_ENV / _API_KEY_CMD) and "
+                f"headers, then {reset}.")
+    return (f"model-picker: {label} failed {fails}× in a row ({reason}); router calls paused for {mins}, "
+            f"agent launches use the keyword rules meanwhile ({reset}).")
 
 
 def describe(rec, cfg):
@@ -534,7 +789,7 @@ def handle_agent(payload, mode, cfg):
                else "explicit" if model else "missing")
     log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,
                  pinned=pinned)
-    note = verbose_note(cfg, label, model, rec)
+    note = "\n".join(n for n in (rec.get("notice"), verbose_note(cfg, label, model, rec)) if n) or None
     if model:
         chosen = tier_of(model)
         if chosen and chosen not in available_tiers(cfg):
@@ -652,6 +907,8 @@ def prompt_route(payload, cfg):
     prompt = str(payload.get("prompt") or "").strip()
     if not router or not prompt or prompt[0] in "/<!" or len(prompt.split()) < 3:
         return None
+    if router_paused(cfg, scope="prompt"):
+        return None  # don't make every prompt wait on a router that is down
     # Only the first 200 characters, whatever MODEL_PICKER_ROUTER_INPUT says (that setting is for launches).
     inp = {"description": _short(prompt, 200), "subagent_type": "main-session"}
     # Router subprocesses (command router, key command) must finish inside the deadline, not be orphaned.
@@ -662,6 +919,9 @@ def prompt_route(payload, cfg):
     worker.start()
     worker.join(PROMPT_ROUTE_DEADLINE)
     res = box.get("res")
+    notice = record_router(cfg, res, scope="prompt")
+    if notice:
+        return notice
     if not isinstance(res, dict) or res.get("tier") not in TIERS:
         return None
     ms = int((time.monotonic() - started) * 1000)
@@ -804,7 +1064,7 @@ def main():
     cfg = load_config()
     if event == "route":
         task = (" ".join(sys.argv[2:3]) or sys.stdin.read()).strip()
-        print(json.dumps(decide({"description": task[:200], "prompt": task}, cfg), indent=2))
+        print(json.dumps(decide({"description": task[:200], "prompt": task}, cfg, track=False), indent=2))
         return
     if event == "report":
         args = sys.argv[2:]

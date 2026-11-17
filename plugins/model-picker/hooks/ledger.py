@@ -37,7 +37,9 @@ KEEP_ROTATED = 10
 
 
 def state_dir(cfg):
-    return Path(cfg.get("MODEL_PICKER_STATE_DIR") or Path.home() / ".config/model-picker")
+    # The environment also counts: in-process callers may pass a config dict without the key.
+    return Path(cfg.get("MODEL_PICKER_STATE_DIR") or os.environ.get("MODEL_PICKER_STATE_DIR")
+                or Path.home() / ".config/model-picker")
 
 
 def log_path(cfg):

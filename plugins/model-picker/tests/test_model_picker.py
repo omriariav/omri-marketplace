@@ -1086,5 +1086,69 @@ results += [
     check("prompt route: report counts routed prompts", prep["prompts_routed"] == len(plog) and "Prompts routed" in ledger.format_report(prep)),
 ]
 
+# --- v0.4.7 router pause ---------------------------------------------------------
+import urllib.error  # noqa: E402
+
+DOWN = {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": "http://127.0.0.1:9",
+        "MODEL_PICKER_ROUTER_MODEL": "team/jev-latest", "MODEL_PICKER_ROUTER_API_KEY_ENV": "none"}
+bst = {**fresh_state(), **DOWN}
+n1, n2, n3 = (mp.record_router(bst, None) for _ in range(3))
+health = json.loads((Path(bst["MODEL_PICKER_STATE_DIR"]) / "router-health.json").read_text())
+results += [
+    check("pause: first two failures are quiet, the third pauses with one notice",
+          n1 is None and n2 is None and n3 and "jev-latest failed 3× in a row (timed out)" in n3 and "10 min" in n3),
+    check("pause: router_paused reports the reason", mp.router_paused(bst) == "timed out"),
+    check("pause: the shared state holds no router settings in clear", "127.0.0.1" not in json.dumps(health)),
+    check("pause: a launch while paused skips the router at once",
+          mp.decide({"description": "debug the flaky test"}, bst)["source"] == "heuristic (router paused: timed out)"),
+    check("pause: other router settings start a fresh count",
+          mp.router_paused({**bst, "MODEL_PICKER_ROUTER_MODEL": "team/jev-next"}) is None),
+    check("pause: MODEL_PICKER_ROUTER_PAUSE=0 never pauses", mp.router_paused({**bst, "MODEL_PICKER_ROUTER_PAUSE": "0"}) is None),
+]
+later = time.time() + 601
+results += [
+    check("pause: ends after 10 minutes", mp.router_paused(bst, now=later) is None),
+    check("pause: a failed retry after the pause pauses again, quietly",
+          mp.record_router(bst, None, now=later) is None and mp.router_paused(bst, now=later + 1) == "timed out"),
+    check("pause: one success clears the count",
+          mp.record_router(bst, {"tier": "opus"}) is None and mp.router_paused(bst) is None
+          and mp.record_router(bst, None) is None),
+]
+rst = {**fresh_state(), **DOWN}
+e401 = urllib.error.HTTPError("http://x", 401, "Unauthorized", {}, None)
+e503 = urllib.error.HTTPError("http://x", 503, "Unavailable", {}, None)
+note401 = mp.record_router(rst, e401)
+ost = {**fresh_state(), **DOWN}
+results += [
+    check("pause: a rejected request (HTTP 401) pauses at once and points at the config",
+          note401 and "HTTP 401" in note401 and "retry won't fix" in note401 and mp.router_paused(rst) == "HTTP 401"),
+    check("pause: HTTP 503 and connection errors count toward three",
+          mp.record_router(ost, e503) is None and mp.record_router(ost, urllib.error.URLError(ConnectionRefusedError())) is None
+          and "unreachable" in (mp.record_router(ost, urllib.error.URLError(OSError())) or "")),
+]
+gst = {**fresh_state(), **DOWN}
+for _ in range(5):
+    mp.record_router(gst, ValueError("no usable tier answer"))
+results.append(check("pause: a malformed answer doesn't count (the router is up)", mp.router_paused(gst) is None))
+(Path(gst["MODEL_PICKER_STATE_DIR"]) / "router-health.json").write_text("{not json")
+results.append(check("pause: a corrupt state file means not paused", mp.router_paused(gst) is None
+                     and mp.record_router(gst, None) is None))
+
+# End to end: the prompt hook and the launch hook share one count.
+est = {**fresh_state(), **DOWN, "MODEL_PICKER_PROMPT_ROUTE": "1"}
+p1 = prompt_hook("debug the flaky login test in CI", est)
+p2 = prompt_hook("debug the flaky login test in CI", est)
+l3 = run(agent(description="debug the flaky login test", prompt="p"), "advise", est)
+p4 = prompt_hook("debug the flaky login test in CI", est)
+fails_after = json.loads((Path(est["MODEL_PICKER_STATE_DIR"]) / "router-health.json").read_text()).get("fails")
+l5 = run(agent(description="debug the flaky login test", prompt="p"), "advise", est)
+results += [
+    check("pause e2e: prompts and launches share the count; the third failure tells the user",
+          p1 is None and p2 is None and "failed 3× in a row (unreachable)" in (l3 or {}).get("systemMessage", "")),
+    check("pause e2e: while paused a prompt shows nothing and calls no router", p4 is None and fails_after == 3),
+    check("pause e2e: while paused a launch still gets a recommendation, no repeat notice",
+          "router paused: unreachable" in json.dumps(l5) and "systemMessage" not in (l5 or {})),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

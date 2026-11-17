@@ -1,5 +1,11 @@
 # Releases
 
+## model-picker v0.4.7 (2026-11-17)
+
+- **Router pause.** A router that can't be reached no longer slows every prompt and launch. After 3 failures in a row (timeouts, connection errors, HTTP errors) router calls pause for 10 minutes (`MODEL_PICKER_ROUTER_PAUSE`, minutes; `0` never pauses), with one line telling you so. A rejected request that a retry can't fix (HTTP 400/401/403/404/405/407, no API key) pauses at once and points at the config. While paused, launches use the keyword heuristic (`source: heuristic (router paused: …)`) and the prompt line isn't shown. After the pause one call tries again: a success clears the count, a failure pauses again without a new message. A malformed answer doesn't count (the router is up). The count is shared by all sessions and both hooks, in `router-health.json` in the state dir; it stores a hash of the router settings, not the settings, and changing them starts a fresh count.
+- The ledger's state dir now also honors `MODEL_PICKER_STATE_DIR` from the environment when the config passed in lacks it.
+- Tests: 242.
+
 ## model-picker v0.4.6 (2026-11-16)
 
 - **Followed, by direction.** `/model-picker:report` splits launches that didn't follow the recommendation into "went to a stronger model" and "went to a cheaper one". Going stronger is often deliberate (a stated reason, a user rule) and costs money; going cheaper saves money but is the risky direction. A low follow rate made mostly of deliberate upgrades no longer reads like ignored advice.

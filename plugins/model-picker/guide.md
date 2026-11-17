@@ -11,7 +11,7 @@ Pick the starting model by task:
 When a task fits more than one row, pick the row for its hardest part: slides rendered and checked by eye are a vision loop (opus), not just slides (sonnet). Going stronger than the table for a concrete reason, or because the user set a rule, is fine; say why.
 
 Rules:
-1. Always pass an explicit `model` when launching an Agent, teammate, or workflow agent(). Never rely on inheriting the session model for side work.
+1. Always pass an explicit `model` and `effort` when launching an Agent, teammate, or workflow agent(): the recommended ones, unless the user asked for a model or effort for this work, in which case theirs win. Never rely on inheriting the session model or effort for side work.
 2. Keep code edits and judgment on the main model; delegate verbose reading to cheaper subagents so the expensive context stays lean.
 3. Adjust effort before switching models: low → medium → high. Past high, try the next model up at a lower effort instead.
 4. If a model falls short: (a) give it a way to verify its own work (test, build, script), (b) raise effort one level, (c) move up one model, starting at lower effort.

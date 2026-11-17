@@ -1,5 +1,13 @@
 # Releases
 
+## model-picker v0.4.9 (2026-11-17)
+
+- **You asked for it.** When your prompt names a model or effort (`run the search on haiku`, `use opus at high effort`), launches in that turn that use it are your call: no advice, the stamp ends `· your call (opus/high effort); gpt-6-luna said sonnet/medium`, the report lists them as your picks (outside the follow rate, savings not credited to model-picker), and the prompt line ends `· you asked for opus`. A launch on something else, or with no model, is reminded what you asked for. Detection is narrow, skips negations and gives up when two models are named; it only labels and never changes which model runs. Stored per session in `asked.json` (no prompt text); the next prompt replaces it, agent notifications don't.
+- **Guide: pass `effort` too.** Rule 1 now says to pass an explicit `model` and `effort` (the recommended ones, or what the user asked for). Claude Code only lets Claude set a subagent's effort when instructions ask for it, so without this rule subagents inherited the session's effort.
+- Labels: the prompt line and the verbose launch note name the recommender the way the stamp does (`gpt-6-luna`, `command router`, `keyword rules`).
+- Docs: by default a launch that sets a model is judged by the keyword rules; the router judges it only with `MODEL_PICKER_ROUTER_ON_EXPLICIT=1`.
+- Tests: 299.
+
 ## model-picker v0.4.8 (2026-11-17)
 
 Follow-ups to the v0.4.7 router pause. Each kind of call now keeps its own count, so "3 in a row" is true for what it pauses:

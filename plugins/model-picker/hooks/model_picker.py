@@ -726,6 +726,94 @@ def record_router(cfg, res, now=None, scope="launch"):
             f"agent launches use the keyword rules meanwhile ({reset}).")
 
 
+# --- "you asked for": a model or effort the user named in their prompt -----------------------------------
+ASK_TIERS = "haiku|sonnet|opus|fable"
+ASK_EFFORTS = "low|medium|high|xhigh|max"
+_ASK_TIER_RX = [
+    re.compile(r"\b(?:use|using|run|running|on|with|via|switch(?:ing)?\s+to|launch|spawn|pick|go\s+with|try)\s+"
+               r"(?:the\s+|a\s+|an\s+)?(?:claude[- ])?(" + ASK_TIERS + r")\b", re.I),
+    re.compile(r"\b(?:claude[- ])?(" + ASK_TIERS + r")(?:[- ]?\d(?:\.\d)?)?\s+(?:agents?|subagents?|model)\b", re.I),
+]
+_ASK_EFFORT_RX = [
+    re.compile(r"\b(" + ASK_EFFORTS + r")[- ]effort\b", re.I),
+    re.compile(r"\beffort\s*(?:[:=]|of|at|to)?\s*(" + ASK_EFFORTS + r")\b", re.I),
+]
+_NEGATION = re.compile(r"\b(?:don'?t|do\s+not|not|never|no|avoid|instead\s+of|rather\s+than|without|except)\b[^.!?\n]{0,20}$",
+                       re.I)
+ASK_TTL = 86400
+
+
+def _asked_values(text, patterns):
+    found = set()
+    for rx in patterns:
+        for m in rx.finditer(text):
+            if not _NEGATION.search(text[max(0, m.start() - 40):m.start()]):
+                found.add(m.group(1).lower())
+    return found
+
+
+def detect_ask(prompt):
+    """{"tier", "effort"} the user asked for in this prompt, or None. Labels only, never routing: a wrong
+    guess changes a stamp, not a model. Two different models (or efforts) named means no pick."""
+    text = str(prompt or "")[:2000]
+    tiers, efforts = _asked_values(text, _ASK_TIER_RX), _asked_values(text, _ASK_EFFORT_RX)
+    ask = {"tier": tiers.pop() if len(tiers) == 1 else None, "effort": efforts.pop() if len(efforts) == 1 else None}
+    return ask if ask["tier"] or ask["effort"] else None
+
+
+def _ask_path(cfg):
+    return ledger.state_dir(cfg) / "asked.json"
+
+
+def _asks_read(cfg):
+    try:
+        data = json.loads(_ask_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def remember_ask(cfg, session, ask, now=None):
+    """Keep this turn's ask for the session's launches until the next prompt (an ask-free prompt clears it)."""
+    if not session:
+        return
+    now = now or time.time()
+    data = {k: v for k, v in _asks_read(cfg).items() if isinstance(v, dict) and now - _num_field(v, "ts") < ASK_TTL}
+    if ask:
+        data[str(session)] = {**ask, "ts": now}
+    elif str(session) not in data:
+        return
+    else:
+        data.pop(str(session))
+    tmp = None
+    try:
+        path = _ask_path(cfg)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".asked.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except OSError:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def current_ask(cfg, session, now=None):
+    ask = _asks_read(cfg).get(str(session)) if session else None
+    if not isinstance(ask, dict) or (now or time.time()) - _num_field(ask, "ts") >= ASK_TTL:
+        return None
+    tier = ask.get("tier") if ask.get("tier") in CLAUDE_TIERS else None
+    effort = ask.get("effort") if isinstance(ask.get("effort"), str) else None
+    return {"tier": tier, "effort": effort} if tier or effort else None
+
+
+def ask_text(ask):
+    return "/".join(x for x in (ask.get("tier"), ask.get("effort") and f"{ask['effort']} effort") if x)
+
+
 def describe(rec, cfg):
     target = f"`{rec['tier']}`"
     if rec["tier"] == "local":
@@ -738,7 +826,7 @@ def _short(text, n=120):
     return text if len(text) <= n else text[:n - 1] + "…"
 
 
-def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_model=None, pinned=None):
+def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_model=None, pinned=None, user_pick=None):
     """One ledger line per checked launch. Description only (local file); never the prompt."""
     chosen_tier = ledger.tier_of(chosen) if chosen else None
     entry = {
@@ -748,6 +836,8 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
         "chosen": chosen, "chosen_tier": chosen_tier, "session_model": session_model, "pinned": pinned,
         "chosen_effort": inp.get("effort") if isinstance(inp.get("effort"), str) else None,
     }
+    if user_pick:
+        entry["user_pick"] = user_pick
     if rec:
         entry.update({"rec_tier": rec["tier"], "rec_effort": rec["effort"], "source": rec["source"],
                       "confidence": rec.get("confidence"), "router_ms": rec.get("router_ms"),
@@ -763,7 +853,7 @@ def verbose_note(cfg, label, chosen, rec):
         return None
     conf = f" {rec['confidence']:.2f}" if isinstance(rec.get("confidence"), (int, float)) else ""
     ms = f", {rec['router_ms']} ms" if rec.get("router_ms") is not None else ""
-    src = str(rec["source"]).split(" (")[0].split(":")[-1]
+    src = ledger._rec_label(rec["source"])
     picked = f"on {chosen}" if chosen else "no model set"
     return f"model-picker: {label} {picked} → recommends {rec['tier']}/{rec['effort']} ({src}{conf}{ms})"
 
@@ -802,8 +892,13 @@ def handle_agent(payload, mode, cfg):
     session_model = ledger.last_model(payload.get("transcript_path"))
     outcome = ("denied" if mode == "enforce" and (not model or chosen_unavailable)
                else "explicit" if model else "missing")
+    # The user named a model or effort in their prompt: their call, not a deviation from the recommendation.
+    ask = current_ask(cfg, payload.get("session_id"))
+    launch_effort = inp.get("effort") if isinstance(inp.get("effort"), str) else None
+    honored = bool(ask) and bool(model) and (not ask["tier"] or tier_of(model) == ask["tier"]) and (
+        not ask["effort"] or launch_effort == ask["effort"])
     log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,
-                 pinned=pinned)
+                 pinned=pinned, user_pick=ask if honored else None)
     note = "\n".join(n for n in (rec.get("notice"), verbose_note(cfg, label, model, rec)) if n) or None
     if model:
         chosen = tier_of(model)
@@ -815,7 +910,13 @@ def handle_agent(payload, mode, cfg):
             else:
                 emit(context=msg, system=note)
             return
-        if chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
+        if ask and not honored:
+            emit(context=f"model-picker: the user asked for {ask_text(ask)} in their last message; `{label}` was "
+                         f"launched on {chosen or model}{f' at {launch_effort} effort' if launch_effort else ''}. "
+                         "Use what the user asked for unless they said otherwise.", system=note)
+        elif honored:
+            emit(system=note)
+        elif chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
             emit(context=f"model-picker: `{label}` launched on {chosen}, but the task reads as "
                          f"{describe(rec, cfg)}. Prefer that for similar launches unless you have a specific reason.",
                  system=note)
@@ -823,6 +924,9 @@ def handle_agent(payload, mode, cfg):
             emit(system=note)
         return
 
+    if ask and ask["tier"]:
+        rec = {**rec, "tier": ask["tier"], "effort": ask["effort"] or rec["effort"],
+               "reason": "the user asked for it in their last message", "source": "user"}
     if mode == "enforce":
         emit("deny", f"model-picker: launch `{label}` with an explicit `model`. Recommended: {describe(rec, cfg)}. "
                      "Re-issue the same call with that model, or pick another tier if you have a reason.", system=note)
@@ -945,17 +1049,33 @@ def prompt_route(payload, cfg):
     ledger.append(cfg, {"kind": "prompt", "session": payload.get("session_id"), "rec_tier": res["tier"],
                         "rec_effort": res.get("effort"), "source": res.get("source"), "confidence": res.get("confidence"),
                         "router_ms": ms, "session_tier": ledger.tier_of(ledger.last_model(payload.get("transcript_path")))})
-    label = str(res.get("source") or name).split(":")[-1].split("/")[-1]
+    label = ledger._rec_label(res.get("source") or name)
     conf = f"{res['confidence']:.2f}, " if isinstance(res.get("confidence"), (int, float)) else ""
     return f"model-picker: {label} → {res['tier']}/{res.get('effort') or 'medium'} ({conf}{ms} ms)"
+
+
+def _human_prompt(payload):
+    """The prompt if a person typed it: not a slash command, harness message (agent notification) or shell line."""
+    prompt = str(payload.get("prompt") or "").strip()
+    return prompt if prompt and prompt[0] not in "/<!" else None
 
 
 def handle_prompt(payload, cfg):
     """UserPromptSubmit: show the router's pick for this prompt (opt-in), and deliver stamps of background
     agents that finished since the last turn (reads only the small stamp queue, never the whole ledger)."""
     shown, context = [], None
+    ask = None
+    try:
+        prompt = _human_prompt(payload)
+        if prompt is not None:
+            ask = detect_ask(prompt)
+            remember_ask(cfg, payload.get("session_id"), ask)
+    except Exception:
+        pass
     try:
         line = prompt_route(payload, cfg)
+        if ask and _enabled(cfg, "MODEL_PICKER_PROMPT_ROUTE", default=False):
+            line = (line or "model-picker:") + f" · you asked for {ask_text(ask)}"
         if line:
             shown.append(line)
     except Exception:

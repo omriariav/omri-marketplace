@@ -50,7 +50,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_STATE_DIR` | Where the ledger lives | `~/.config/model-picker` |
 | `MODEL_PICKER_VERBOSE` | `1` shows a one-line note per launch and per finished subagent | `0` |
 | `MODEL_PICKER_PRICES` | JSON price overrides per tier, $ per million tokens | built-in list prices |
-| `MODEL_PICKER_STAMP` | `1` stamps subagent results with the model and effort that actually ran, and whether that followed the recommendation | `0` |
+| `MODEL_PICKER_STAMP` | `1` stamps subagent results with the model and effort that actually ran, and whether that followed the recommendation (a launch that sets a model is judged by the router only with `MODEL_PICKER_ROUTER_ON_EXPLICIT=1`; otherwise by the keyword rules, which name a model but no effort) | `0` |
 | `MODEL_PICKER_STAMP_REPLIES` | `1` asks Claude to end every reply with its model id | `0` |
 | `MODEL_PICKER_OLLAMA_MODEL` | Ollama model for `ask_local`; also turns on the `local` tier | unset |
 | `MODEL_PICKER_OLLAMA_URL` | Ollama base URL | `http://localhost:11434` |
@@ -155,3 +155,15 @@ Without a configured model the tools still list but return a clear error naming 
 Claude Code sends every request to one Anthropic-format endpoint, so beyond `ask_local` a local model is reached either through a gateway that routes by model name (set `ANTHROPIC_BASE_URL` to the gateway and `ANTHROPIC_DEFAULT_HAIKU_MODEL` to the local model's name, so `model: haiku` runs locally) or through an MCP tool that wraps the local server. Set `MODEL_PICKER_LOCAL_HINT` to describe whichever you use. The session rules and `/model-picker:model-picker` then offer `local` for pure text work on text already in hand (summarize, classify, extract, translate); agent launches and workflow steps are never routed to it, since a local model has no tools.
 
 Tests: `python3 plugins/model-picker/tests/test_model_picker.py`. Requires `python3` (stdlib only); hooks exit silently without it.
+
+## You asked for it
+
+When your prompt names a model or effort (`run the search on haiku`, `use opus at high effort`, `spawn a sonnet agent`), model-picker treats it as your call for the launches in that turn:
+
+- The guide tells Claude to use what you asked for; it overrides the recommendation.
+- A launch on what you asked for gets no advice, and its stamp ends `· your call (opus/high effort); gpt-6-luna said sonnet/medium`. A launch on something else, or with no model, is reminded what you asked for.
+- The report lists those launches as your picks: they leave the follow rate, and their savings are listed under you, not credited to model-picker.
+- With `MODEL_PICKER_PROMPT_ROUTE=1` the prompt line ends `· you asked for opus`.
+
+Detection is deliberately narrow (a model name after a verb like use/run/on/with, or before agent/model; `<level> effort`), ignores negations (`don't use opus`, `instead of opus`), and gives up when two models are named. It only labels: it never changes which model runs. The pick lasts until your next prompt; agent notifications don't clear it. It is stored per session in `asked.json` in the state dir (no prompt text).
+

@@ -1544,5 +1544,30 @@ results += [
           "you asked" not in (prompt_hook("please use opus for the code review", off2) or {}).get("systemMessage", "")),
 ]
 
+# v0.4.10: floors can set a minimum effort ("opus/high").
+FE = {"MODEL_PICKER_FLOORS": json.dumps({"review": "opus/high", "docs": "sonnet", "bad": "opus/extreme"})}
+base_rec = {"tier": "opus", "effort": "medium", "reason": "r", "source": "x", "unsure": False}
+r_eff = mp.apply_floors(base_rec, {"description": "Review PR 60"}, FE)
+r_both = mp.apply_floors({**base_rec, "tier": "haiku", "effort": "low"}, {"description": "review the diff"}, FE)
+r_keep = mp.apply_floors({**base_rec, "effort": "high"}, {"description": "review the diff"}, {"MODEL_PICKER_FLOORS": '{"review": "opus/medium"}'})
+results += [
+    check("floor effort: parsed; an unknown effort level skips the entry",
+          [(f[1], f[2], f[3]) for f in mp._floors(FE)] == [("review", "opus", "high"), ("docs", "sonnet", None)]),
+    check("floor effort: raises effort alone when the model already meets the floor",
+          r_eff["tier"] == "opus" and r_eff["effort"] == "high" and r_eff["floor"] == "review"
+          and "at least opus/high effort" in r_eff["reason"]),
+    check("floor effort: raises model and effort together", (r_both["tier"], r_both["effort"]) == ("opus", "high")),
+    check("floor effort: never lowers effort", r_keep["effort"] == "high" and not r_keep.get("floor")),
+]
+fst2 = {**fresh_state(), **FE}
+below = run(agent(description="Review PR 60 for bugs", prompt="p", model="opus"), "advise", fst2)
+at = run(agent(description="Review PR 60 for bugs", prompt="p", model="opus", effort="high"), "advise", fst2)
+results += [
+    check("floor effort: a launch under the floor (no effort set) is reminded of the rule",
+          "matches your MODEL_PICKER_FLOORS rule (at least opus/high effort)" in json.dumps(below)
+          and "with no effort set" in json.dumps(below)),
+    check("floor effort: a launch that meets the floor gets no reminder", "MODEL_PICKER_FLOORS" not in json.dumps(at)),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

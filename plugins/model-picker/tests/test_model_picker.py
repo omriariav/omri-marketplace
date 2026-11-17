@@ -1150,5 +1150,78 @@ results += [
           "router paused: unreachable" in json.dumps(l5) and "systemMessage" not in (l5 or {})),
 ]
 
+# Review round 1 of v0.4.7.
+import socket  # noqa: E402
+
+def _paused_after(errs):
+    st = {**fresh_state(), **DOWN}
+    for e in errs:
+        mp.record_router(st, e)
+    return mp.router_paused(st)
+
+results += [
+    check("pause: real exception shapes count (TimeoutError, socket.timeout, TimeoutExpired, URLError(timeout))",
+          _paused_after([TimeoutError(), socket.timeout(), subprocess.TimeoutExpired("x", 1)]) == "timed out"
+          and _paused_after([urllib.error.URLError(TimeoutError())] * 3) == "timed out"),
+    check("pause: a failing router/key command counts (a wrapped curl that can't connect exits non-zero)",
+          _paused_after([subprocess.CalledProcessError(28, "curl")] * 3) == "command exit 28"),
+    check("pause: no API key never pauses (it costs no time, and another session may have the key)",
+          _paused_after([ValueError("no API key")] * 5) is None),
+    check("pause: the key source and headers are part of the fingerprint",
+          mp._router_id(DOWN) != mp._router_id({**DOWN, "MODEL_PICKER_ROUTER_API_KEY_ENV": "OTHER_KEY"})
+          and mp._router_id(DOWN) != mp._router_id({**DOWN, "MODEL_PICKER_ROUTER_HEADERS": '{"a": "b"}'})),
+    check("pause: an absurd MODEL_PICKER_ROUTER_PAUSE is capped at a day",
+          mp._pause_seconds({"MODEL_PICKER_ROUTER_PAUSE": "inf"}) == 86400
+          and mp._pause_seconds({"MODEL_PICKER_ROUTER_PAUSE": "nan"}) == 600
+          and mp._pause_seconds({"MODEL_PICKER_ROUTER_PAUSE": "soon"}) == 600),
+]
+sst = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(sst, None)
+stale_now = time.time() + 600 + 600 + 5   # the pause ended more than one pause ago
+results.append(check("pause: after a long-expired pause one blip doesn't re-pause; three do, with a new notice",
+                     mp.record_router(sst, None, now=stale_now) is None and mp.router_paused(sst, now=stale_now + 1) is None
+                     and mp.record_router(sst, None, now=stale_now) is None
+                     and "3× in a row" in (mp.record_router(sst, None, now=stale_now) or "")))
+cst = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(cst, None)
+results += [
+    check("pause: a new reason (HTTP 401 after timeouts) gets its own notice",
+          "HTTP 401" in (mp.record_router(cst, e401) or "")),
+    check("pause: prompt-only timeouts don't count when launches get more time",
+          [mp.record_router(fst := {**fresh_state(), **DOWN}, None, count_timeouts=False) for _ in range(4)]
+          and mp.router_paused(fst) is None),
+]
+# Parallel hooks: one notice, no lost counts.
+par = {**fresh_state(), **DOWN}
+code = ("import json,sys; sys.path.insert(0, %r); import model_picker as mp; "
+        "print(json.dumps(mp.record_router(json.loads(sys.argv[1]), None)))") % str(ROOT / "hooks")
+procs = [subprocess.Popen([sys.executable, "-I", "-c", code, json.dumps(par)], stdout=subprocess.PIPE, text=True)
+         for _ in range(6)]
+outs = [json.loads(p.communicate()[0] or "null") for p in procs]
+pfails = json.loads((Path(par["MODEL_PICKER_STATE_DIR"]) / "router-health.json").read_text())["fails"]
+results.append(check("pause: 6 parallel failures count 6 and give exactly one notice",
+                     pfails == 6 and sum(1 for o in outs if o) == 1))
+# The route CLI (the /model-picker skill) honors a pause but never starts one: its notice would reach Claude, not you.
+rcli = {**fresh_state(), **DOWN}
+for _ in range(3):
+    subprocess.run([sys.executable, "-I", str(HOOK), "route", "debug the flaky login test"], capture_output=True, text=True,
+                   env={**{k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")}, **rcli,
+                        "MODEL_PICKER_CONFIG": "/nonexistent"})
+results.append(check("pause: the route CLI doesn't count toward a pause",
+                     not (Path(rcli["MODEL_PICKER_STATE_DIR"]) / "router-health.json").exists()))
+# A paused launch really makes no call.
+spst = fresh_state()
+hit = Path(spst["MODEL_PICKER_STATE_DIR"]) / "called"
+SPY = {**spst, "MODEL_PICKER_ROUTER": "command",
+       "MODEL_PICKER_ROUTER_CMD": f"touch {hit}; {sys.executable} -c \"print('{{}}')\""}
+for _ in range(3):
+    mp.record_router(SPY, None)
+hit.unlink(missing_ok=True)
+paused_src = mp.decide({"description": "debug the flaky test"}, SPY)["source"]
+results.append(check("pause: a launch while paused never calls the router",
+                     paused_src.startswith("heuristic (router paused") and not hit.exists()))
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

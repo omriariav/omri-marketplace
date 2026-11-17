@@ -43,7 +43,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_ROUTER_CMD` | Executable for `command`: JSON `{task, tiers, efforts}` on stdin, JSON `{tier, effort, confidence}` on stdout | unset |
 | `MODEL_PICKER_ROUTER_INPUT` | What task text leaves the machine: `description` (agent's short description), `brief` (+ first 500 prompt chars), `full` (+ up to 8000) | `description` |
 | `MODEL_PICKER_ROUTER_TIMEOUT` | Seconds | `3` |
-| `MODEL_PICKER_ROUTER_PAUSE` | Minutes to skip router calls after 3 failures in a row (timeouts, connection or HTTP errors) or one rejected request (HTTP 400/401/403/404/405/407, missing key). One line tells you when a pause starts; launches use the keyword heuristic meanwhile and the prompt line stays off. Shared by all sessions (`router-health.json` in the state dir). `0` never pauses | `10` |
+| `MODEL_PICKER_ROUTER_PAUSE` | Minutes to skip router calls after 3 failures in a row (timeouts, connection or HTTP errors, a router/key command exiting non-zero) or one rejected request (HTTP 400/401/403/404/405/407). One line tells you when a pause starts; launches use the keyword heuristic meanwhile and the prompt line stays off. Shared by all sessions (`router-health.json` in the state dir; delete it to retry at once). `0` never pauses | `10` |
 | `MODEL_PICKER_ROUTER_MIN_CONFIDENCE` | Below this, the heuristic decides | `0.5` |
 | `MODEL_PICKER_ROUTER_ON_EXPLICIT` | `1` also asks the router about launches that already set a model, so every launch gets a real verdict (follow rate and credited savings depend on it). Costs one router call (~0.7 s) per launch | `0` |
 | `MODEL_PICKER_LOG` | `0` turns off the local ledger | `1` |

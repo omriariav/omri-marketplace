@@ -1119,6 +1119,7 @@ for _ in range(3):
     mp.record_router(pz, urllib.error.URLError(ConnectionRefusedError()), scope="prompt")
 prompt_hook("debug the flaky login test in CI", pz, session="s-pz")
 pz_pending = json.loads(mp._session_file(pz, "prompt-breaks", "s-pz").read_text())["pending"]
+pz_fails = mp._health_read(pz).get("prompt_fails")  # still 3: the paused router was not called
 # A corrupt state file counts as a break; mixed-case values.
 cf = mp._session_file(nb, "prompt-breaks", "s-corrupt")
 cf.parent.mkdir(parents=True, exist_ok=True)
@@ -1144,7 +1145,7 @@ results += [
     check("breaks: a router failure keeps the break open for the next eligible prompt, which closes it",
           pending_after_fail is True and bool(recovered) and closed_after is None),
     check("breaks: an unusable reply (local, malformed, unknown tier) closes the break", bad_calls == [1, 1, 1]),
-    check("breaks: a paused router keeps the break open", pz_pending is True),
+    check("breaks: a paused router keeps the break open without calling it", pz_pending is True and pz_fails == 3),
     check("breaks: a corrupt state file counts as a break", bool(corrupt_routed)),
     check("breaks: ALWAYS any case is always; other on values mean breaks",
           modes == ["always", "breaks", "breaks", "breaks", None, None, None]),

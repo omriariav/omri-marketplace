@@ -536,7 +536,7 @@ def _health_read(cfg):
 
 def _entry_last(e):
     vals = []
-    for k in ("last", "paused_until", "prompt_last", "prompt_paused_until"):
+    for k in ("last", "paused_until", "prompt_last", "prompt_paused_until", "launch_last", "launch_paused_until"):
         try:
             vals.append(float(e.get(k) or 0))
         except (TypeError, ValueError):
@@ -604,14 +604,15 @@ def _paused_until(h, prefix=""):
 
 
 def router_paused(cfg, now=None, scope="launch"):
-    """Why router calls are paused right now, or None. scope="prompt" also honors the prompt line's own pause.
+    """Why router calls are paused right now, or None: the main pause, plus the prompt line's own pause
+    (scope="prompt") or the launches' own pause (scope="launch").
     A pause ending further ahead than one pause from now (clock moved back, hand-edited file) is ignored."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
     h = _health_read(cfg)
     now = now or time.time()
-    for prefix in ("", "prompt_") if scope == "prompt" else ("",):
+    for prefix in ("", "prompt_" if scope == "prompt" else "launch_"):
         if now < _paused_until(h, prefix) <= now + pause:
             return str(h.get(prefix + "reason") or "failing")
     return None
@@ -643,7 +644,7 @@ def _failure(res):
 
 def _clear(h, prefix):
     changed = False
-    for k in ("fails", "reason", "rejected", "last", "paused_until") + (() if prefix else ("slow",)):
+    for k in ("fails", "reason", "rejected", "last", "paused_until"):
         changed = h.pop(prefix + k, None) is not None or changed
     return changed
 
@@ -651,12 +652,13 @@ def _clear(h, prefix):
 def record_router(cfg, res, now=None, scope="launch"):
     """Count this router call in the shared state. Returns a one-line notice when it starts a pause.
 
-    Two counts per router. The main one (connection failures and rejections from both hooks, and launch
-    timeouts) pauses every router call. The prompt line's own count (every prompt failure, timeouts included:
-    prompts get less time than launches can) pauses only the prompt line, which shows nothing on a failure
-    anyway. A prompt that answers proves nothing about launch timeouts, so it clears the main count only
-    when that count has none. A retry that fails right after a pause, for the same kind of reason, pauses
-    again quietly (the user was told)."""
+    Three counts per router, each "in a row" for what it measures:
+    - main: connection failures and rejections from either hook; pauses every router call; any answer clears it.
+    - prompt_: every prompt failure, timeouts included (prompts get only 3 s); pauses only the prompt line,
+      which shows nothing on a failure anyway; a prompt answer clears it.
+    - launch_: every launch failure; pauses only launches; a launch answer clears it (a short prompt answering
+      in time says nothing about a long launch input).
+    A retry that fails right after a pause, for the same kind of reason, pauses again quietly (the user was told)."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
@@ -667,27 +669,24 @@ def record_router(cfg, res, now=None, scope="launch"):
     if not proceed:
         return None
     notices = {}
+    own = "prompt_" if scope == "prompt" else "launch_"
     try:
         now = now or time.time()
         h = _health_read(cfg)
+        h.pop("slow", None)  # written by a 0.4.8 pre-release build
         before = dict(h)
-        for pre in ("", "prompt_"):  # old failures, or a pause that ended long ago (overnight): start over
+        for pre in ("", "prompt_", "launch_"):  # old failures, or a pause that ended long ago (overnight): start over
             last = max(_paused_until(h, pre), _num_field(h, pre + "last"))
             if last and now > last + pause:
                 _clear(h, pre)
         if fail is None:
-            if scope != "prompt" or not h.get("slow"):
-                _clear(h, "")
-            if scope == "prompt":
-                _clear(h, "prompt_")  # answered inside the prompt budget
+            _clear(h, "")
+            _clear(h, own)
             if h != before:
                 _health_write(cfg, h, now)
             return None
         reason, rejected, slow = fail
-        counts = ["prompt_"] if scope == "prompt" else []
-        if scope != "prompt" or not slow:
-            counts.append("")
-            h["slow"] = bool(h.get("slow")) or slow
+        counts = [own] + ([] if slow else [""])
         for pre in counts:
             until = _paused_until(h, pre)
             fails = h[pre + "fails"] + 1 if isinstance(h.get(pre + "fails"), int) else 1
@@ -706,11 +705,14 @@ def record_router(cfg, res, now=None, scope="launch"):
             os.close(fd)
     if not notices:
         return None
-    pre = "" if "" in notices else "prompt_"  # a main pause covers the prompt line too: one line is enough
+    pre = "" if "" in notices else own  # a main pause covers the prompt line too: one line is enough
     fails = notices[pre]
     mins = f"{pause / 60:g} min"
     label = _router_label(cfg)
     reset = f"delete {_health_path(cfg)} to retry sooner"
+    if pre == "launch_":
+        return (f"model-picker: {label} failed {fails}× in a row ({reason}) on agent launches; launches use the "
+                f"keyword rules for {mins}, the prompt line still asks it ({reset}).")
     if pre:
         return (f"model-picker: {label} failed on {fails} prompts in a row ({reason}); the prompt line is paused "
                 f"for {mins}, agent launches still ask it ({reset}).")

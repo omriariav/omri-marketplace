@@ -1202,7 +1202,7 @@ code = ("import json,sys; sys.path.insert(0, %r); import model_picker as mp; "
 procs = [subprocess.Popen([sys.executable, "-I", "-c", code, json.dumps(par)], stdout=subprocess.PIPE, text=True)
          for _ in range(6)]
 outs = [json.loads(p.communicate()[0] or "null") for p in procs]
-pfails = mp._health_read(par)["fails"]
+pfails = mp._health_read(par)["launch_fails"]
 results.append(check("pause: 6 parallel failures count 6 and give exactly one notice",
                      pfails == 6 and sum(1 for o in outs if o) == 1))
 # The route CLI (the /model-picker skill) honors a pause but never starts one: its notice would reach Claude, not you.
@@ -1252,7 +1252,7 @@ ost2 = {**fresh_state(), **DOWN}
 mp.record_router(ost2, None, now=time.time() - 700)
 mp.record_router(ost2, None, now=time.time() - 690)
 results.append(check("pause: failures from long ago (never paused) expire", mp.record_router(ost2, None) is None
-                     and mp._health_read(ost2)["fails"] == 1))
+                     and mp._health_read(ost2)["launch_fails"] == 1))
 fut = {**fresh_state(), **DOWN}
 mp._health_write(fut, {"fails": 3, "reason": "timed out", "paused_until": time.time() + 10 ** 9})
 results.append(check("pause: a pause ending implausibly far ahead is ignored", mp.router_paused(fut) is None))
@@ -1321,6 +1321,38 @@ results += [
     check("pause: 3 prompt connection failures pause everything, with one notice (not two)",
           conn[:2] == [None, None] and "router calls paused" in (conn[2] or "") and "prompt line" not in conn[2]
           and mp.router_paused(cn) == "unreachable"),
+]
+
+# v0.4.8 review: no false "3× in a row" from mixing old launch timeouts with later blips.
+t0 = time.time()
+sa = {**fresh_state(), **DOWN}
+mp.record_router(sa, None, now=t0)                                                   # 1 launch timeout
+mp.record_router(sa, urllib.error.URLError(OSError()), now=t0 + 300, scope="prompt")  # a prompt blip
+for k in range(30):
+    mp.record_router(sa, {"tier": "haiku"}, now=t0 + 310 + k, scope="prompt")         # prompts answer
+blip = mp.record_router(sa, urllib.error.URLError(OSError()), now=t0 + 840, scope="prompt")
+sb = {**fresh_state(), **DOWN}
+for k in range(3):
+    mp.record_router(sb, None, now=t0 + k)                                           # launches time out: paused
+mp.record_router(sb, {"tier": "haiku"}, now=t0 + 610, scope="prompt")
+blip_b = mp.record_router(sb, urllib.error.URLError(OSError()), now=t0 + 700, scope="prompt")
+lm = {**fresh_state(), **DOWN}
+lmix = [mp.record_router(lm, e) for e in (None, urllib.error.URLError(OSError()), None)]
+lcn = {**fresh_state(), **DOWN}
+lconn = [mp.record_router(lcn, urllib.error.URLError(OSError())) for _ in range(3)]
+results += [
+    check("pause: one old launch timeout + two later blips isn't '3 in a row'",
+          blip is None and mp.router_paused(sa, now=t0 + 841) is None
+          and mp.router_paused(sa, now=t0 + 841, scope="prompt") is None),
+    check("pause: after a launch-timeout pause, one prompt blip pauses nothing",
+          blip_b is None and mp.router_paused(sb, now=t0 + 701) is None
+          and mp.router_paused(sb, now=t0 + 701, scope="prompt") is None),
+    check("pause: mixed launch failures pause launches on the 3rd; the prompt line keeps asking",
+          lmix[:2] == [None, None] and "on agent launches" in (lmix[2] or "")
+          and mp.router_paused(lm) and mp.router_paused(lm, scope="prompt") is None),
+    check("pause: 3 launch connection failures pause everything, with one notice",
+          lconn[:2] == [None, None] and "router calls paused" in (lconn[2] or "")
+          and mp.router_paused(lcn, scope="prompt") == "unreachable"),
 ]
 
 print(f"\n{sum(results)}/{len(results)} passed")

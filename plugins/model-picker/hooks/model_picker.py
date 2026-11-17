@@ -36,8 +36,12 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
                                  Fable isn't enabled; others are never recommended (default: all)
   MODEL_PICKER_FLOORS            JSON {"pattern": "tier"}: your own minimum model per kind of task, e.g.
                                  {"review": "opus"}; matched against the launch description and agent type
-  MODEL_PICKER_PROMPT_ROUTE      0 (default) | 1   after each prompt, show the decisions API's raw pick for
-                                 it (needs a router; the prompt's first 200 characters are sent)
+  MODEL_PICKER_PROMPT_ROUTE      0 (default) | 1 | always   show the decisions API's raw pick for a prompt
+                                 (needs a router; the prompt's first 200 characters are sent). 1: only at
+                                 natural breaks (a session's first prompt, after /compact or resume, after an
+                                 idle gap), when switching the session model is cheap; always: every prompt
+  MODEL_PICKER_PROMPT_ROUTE_IDLE minutes (default 60; 0 = off): with PROMPT_ROUTE=1, a prompt after this long
+                                 without one counts as a natural break
   MODEL_PICKER_ASK               1 (default) | 0   label launches that use the model the user named in the prompt
   MODEL_PICKER_ROUTER_PAUSE      minutes (default 10; 0 = never pause): after 3 router failures in a row
                                  (or one rejected request, e.g. HTTP 401), skip router calls for this long
@@ -843,7 +847,7 @@ def _asks_enabled(cfg):
 
 
 def _ask_file(cfg, session):
-    return ledger.state_dir(cfg) / "asked" / (hashlib.sha256(str(session).encode()).hexdigest()[:24] + ".json")
+    return _session_file(cfg, "asked", session)
 
 
 def remember_ask(cfg, session, ask, now=None):
@@ -860,26 +864,35 @@ def remember_ask(cfg, session, ask, now=None):
             except FileNotFoundError:
                 pass
             return
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        for old in path.parent.glob("*.json"):
-            try:
-                if now - old.stat().st_mtime > ASK_TTL:
-                    old.unlink()
-            except OSError:
-                pass
-        fd, tmp = tempfile.mkstemp(prefix=".ask.", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({**ask, "ts": now}, fh)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _write_session_file(path, {**ask, "ts": now}, now)
     except OSError:
         pass
+
+
+def _session_file(cfg, kind, session):
+    return ledger.state_dir(cfg) / kind / (hashlib.sha256(str(session).encode()).hexdigest()[:24] + ".json")
+
+
+def _write_session_file(path, obj, now):
+    """Atomically write one small per-session JSON file; files in the same folder idle over a day are removed."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for old in path.parent.glob("*.json"):
+        try:
+            if now - old.stat().st_mtime > ASK_TTL:
+                old.unlink()
+        except OSError:
+            pass
+    fd, tmp = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def current_ask(cfg, session, now=None):
@@ -1115,21 +1128,83 @@ def handle_posttool(payload, cfg):
 PROMPT_ROUTE_DEADLINE = 3.0  # seconds: the user is waiting for their turn to start
 
 
-def prompt_route(payload, cfg):
+def _prompt_route_mode(cfg):
+    """None (off), "breaks" (1: natural breaks only) or "always" (every prompt)."""
+    if str(cfg.get("MODEL_PICKER_PROMPT_ROUTE") or "").strip().lower() == "always":
+        return "always"
+    return "breaks" if _enabled(cfg, "MODEL_PICKER_PROMPT_ROUTE", default=False) else None
+
+
+def mark_break(cfg, session, now=None):
+    """SessionStart (startup, resume, /clear, /compact): the session's next prompt is a natural break."""
+    if not session or _prompt_route_mode(cfg) != "breaks":
+        return
+    now = now or time.time()
+    path = _session_file(cfg, "prompt-breaks", session)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = None
+    last = _num_field(state, "last") if isinstance(state, dict) else 0.0
+    try:
+        _write_session_file(path, {"last": last or now, "pending": True}, now)
+    except OSError:
+        pass
+
+
+def _break_pending(cfg, state, now):
+    """True when this prompt is a natural break: the session's first, one marked by SessionStart, one whose
+    break hasn't been answered yet, or the first after MODEL_PICKER_PROMPT_ROUTE_IDLE minutes without a prompt."""
+    if not isinstance(state, dict) or state.get("pending") is not False:
+        return True
+    try:
+        idle = _num(cfg, "MODEL_PICKER_PROMPT_ROUTE_IDLE", 60) * 60
+    except (TypeError, ValueError):
+        idle = 3600.0
+    return idle > 0 and now - _num_field(state, "last") >= idle
+
+
+def prompt_route(payload, cfg, now=None):
     """MODEL_PICKER_PROMPT_ROUTE: the router's raw answer for this prompt, as one user-visible line.
 
-    Only the configured decisions API's own answer: no heuristic fallback, no floors, no confidence cut.
-    Nothing is shown when no router is configured or it doesn't answer in time. Skips slash commands,
-    harness messages (agent notifications), and very short replies ("ok", "merge")."""
-    if not _enabled(cfg, "MODEL_PICKER_PROMPT_ROUTE", default=False):
+    With 1, only at natural breaks, where switching the session model is cheap (guide rule 7): mid-task
+    prompts are never sent, so the router isn't paid for picks nobody would act on. A break stays open
+    until the router answers an eligible prompt. With always, every eligible prompt."""
+    mode = _prompt_route_mode(cfg)
+    if not mode:
         return None
+    session = payload.get("session_id")
+    if mode == "always" or not session:
+        return _prompt_route_call(payload, cfg)[0]
+    now = now or time.time()
+    path = _session_file(cfg, "prompt-breaks", session)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = None
+    pending = _break_pending(cfg, state, now)
+    # Any prompt (agent notifications and slash commands too: each runs a model turn) restarts the idle clock.
+    # If the state can't be written, every prompt looks like a session's first (the always behavior).
+    line, answered = _prompt_route_call(payload, cfg) if pending else (None, False)
+    try:
+        _write_session_file(path, {"last": now, "pending": pending and not answered}, now)
+    except OSError:
+        pass
+    return line
+
+
+def _prompt_route_call(payload, cfg):
+    """(line or None, whether the router answered). Only the configured decisions API's own answer: no
+    heuristic fallback, no floors, no confidence cut. Nothing is shown when no router is configured or it
+    doesn't answer in time. Skips slash commands, harness messages (agent notifications), and very short
+    replies ("ok", "merge")."""
     name = str(cfg.get("MODEL_PICKER_ROUTER") or "heuristic").lower()
     router = routers.ROUTERS.get(name)
     prompt = str(payload.get("prompt") or "").strip()
     if not router or not prompt or prompt[0] in "/<!" or len(prompt.split()) < 3:
-        return None
+        return None, False
     if router_paused(cfg, scope="prompt"):
-        return None  # don't make every prompt wait on a router that is down
+        return None, False  # don't make every prompt wait on a router that is down
     # Only the first 200 characters, whatever MODEL_PICKER_ROUTER_INPUT says (that setting is for launches).
     inp = {"description": _short(prompt, 200), "subagent_type": "main-session"}
     # Router subprocesses (command router, key command) must finish inside the deadline, not be orphaned.
@@ -1142,16 +1217,19 @@ def prompt_route(payload, cfg):
     res = box.get("res")
     notice = record_router(cfg, res, scope="prompt")
     if notice:
-        return notice
+        return notice, False
     if not isinstance(res, dict) or res.get("tier") not in TIERS:
-        return None
+        # The router was reached and replied, just not usably (malformed, a tier it wasn't offered): that
+        # still closes the break, or a billed-but-unusable gateway would be called on every prompt.
+        # Connection failures, timeouts and rejections keep it open.
+        return None, isinstance(res, dict) or _failure(res) == "other"
     ms = int((time.monotonic() - started) * 1000)
     ledger.append(cfg, {"kind": "prompt", "session": payload.get("session_id"), "rec_tier": res["tier"],
                         "rec_effort": res.get("effort"), "source": res.get("source"), "confidence": res.get("confidence"),
                         "router_ms": ms, "session_tier": ledger.tier_of(ledger.last_model(payload.get("transcript_path")))})
     label = ledger._rec_label(res.get("source") or name)
     conf = f"{res['confidence']:.2f}, " if isinstance(res.get("confidence"), (int, float)) else ""
-    return f"model-picker: {label} → {res['tier']}/{res.get('effort') or 'medium'} ({conf}{ms} ms)"
+    return f"model-picker: {label} → {res['tier']}/{res.get('effort') or 'medium'} ({conf}{ms} ms)", True
 
 
 def _human_prompt(payload):
@@ -1338,7 +1416,12 @@ def main():
     if mode == "off":
         return
     if event == "session":
-        handle_session(root, cfg)
+        handle_session(root, cfg)  # the rules first: break bookkeeping must never cost a session its guide
+        try:
+            start = json.loads(raw or "{}")
+            mark_break(cfg, start.get("session_id") if isinstance(start, dict) else None)
+        except Exception:
+            pass
         return
     payload = json.loads(raw or "{}")
     if event == "subagentstop":

@@ -1357,7 +1357,8 @@ results += [
 
 # v0.4.8: the stamp shows the effort the agent ran at and whether it followed the recommendation.
 JEV = "openai-decisions:team/jev-latest (0.88)"
-dec = lambda **k: {"rec_tier": "opus", "rec_effort": "high", "source": JEV, "chosen_tier": "opus", **k}  # noqa: E731
+dec = lambda **k: {"rec_tier": "opus", "rec_effort": "high", "source": JEV, "chosen_tier": "opus",  # noqa: E731
+                   "outcome": "explicit", **k}
 results += [
     check("stamp verdict: followed", ledger.stamp_verdict(dec(), "high") == " · ✓ followed jev-latest (opus/high)"),
     check("stamp verdict: model followed, effort differs",
@@ -1366,7 +1367,7 @@ results += [
           ledger.stamp_verdict(dec(chosen_tier="sonnet"), "high") == " · ✗ jev-latest recommended opus/high"),
     check("stamp verdict: keyword-rule fallback and floors are named as such",
           ledger.stamp_verdict(dec(source="heuristic (router paused: unreachable)", unsure=True), None)
-          == " · keyword rules only guessed opus/high"
+          == " · keyword rules only guessed opus"
           and "jev-latest + your floor" in ledger.stamp_verdict(dec(source=JEV + " + floor", floor="review"), "high")),
     check("stamp verdict: nothing to compare (pinned agent, no launch record)",
           ledger.stamp_verdict({"outcome": "pinned"}, "high") == "" and ledger.stamp_verdict(None, "high") == ""),
@@ -1403,6 +1404,19 @@ first = [mp.record_router(both, None, scope="prompt") for _ in range(3)][-1]
 second = [mp.record_router(both, None) for _ in range(3)][-1]
 results.append(check("pause notice: says when the other kind of call is already paused",
                      "agent launches still ask it" in (first or "") and "the prompt line is paused too" in (second or "")))
+
+results += [
+    check("stamp verdict: a launch with no model isn't judged (it inherited the session model)",
+          ledger.stamp_verdict(dec(outcome="missing"), "high") == " · no model set; jev-latest recommended opus/high"),
+    check("stamp verdict: unknown chosen model with a confident router isn't called a guess",
+          ledger.stamp_verdict(dec(chosen_tier=None), "high") == " · jev-latest recommended opus/high"),
+    check("stamp verdict: keyword-rule effort (always medium) isn't compared",
+          ledger.stamp_verdict(dec(source="heuristic (router timed out)", rec_effort="medium"), "high")
+          == " · ✓ followed keyword rules (opus)"),
+    check("stamp label: model ids with ':' and the command router",
+          ledger._rec_label("openai-decisions:ft:gpt-4.1-mini:acme::abc123 (0.9)") == "ft:gpt-4.1-mini:acme::abc123"
+          and ledger._rec_label("command (1.00)") == "command router"),
+]
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

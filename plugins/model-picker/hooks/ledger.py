@@ -370,22 +370,31 @@ def _rec_label(source):
     if not src or src.startswith("heuristic"):
         return "keyword rules"
     head = src.split(" (")[0].split(" + ")[0]
-    return head.split(":")[-1].split("/")[-1] or "router"
+    if head == "command":
+        return "command router"
+    return head.split(":", 1)[-1].split("/")[-1] or "router"  # model ids may contain ":" themselves
 
 
 def stamp_verdict(decision, effort):
-    """Did the launch follow model-picker's recommendation? "" when there was none to compare (pinned agent,
-    no launch record). Model and effort are judged separately; the ledger's "followed" counts the model only."""
+    """Did the launch follow model-picker's recommendation? Same rules as the ledger's "followed": only explicit
+    launches are judged, a fallback guess judges nothing. Effort is compared only when a router chose it (the
+    keyword rules always say "medium"). "" when there was nothing to compare (pinned agent, no launch record)."""
     if not decision or not decision.get("rec_tier"):
         return ""
-    rec = f"{decision['rec_tier']}/{decision.get('rec_effort') or 'medium'}"
+    by_router = not str(decision.get("source") or "heuristic").startswith("heuristic")
+    rec_effort = decision.get("rec_effort") or "medium"
+    rec = f"{decision['rec_tier']}/{rec_effort}" if by_router else decision["rec_tier"]
     who = _rec_label(decision.get("source")) + (" + your floor" if decision.get("floor") else "")
     chosen = decision.get("chosen_tier")
-    if decision.get("unsure") or not chosen:
+    if decision.get("unsure"):
         return f" · {who} only guessed {rec}"
+    if decision.get("outcome") != "explicit":
+        return f" · no model set; {who} recommended {rec}"
+    if not chosen:
+        return f" · {who} recommended {rec}"
     if chosen != decision["rec_tier"] and not (decision["rec_tier"] == "local" and chosen == "haiku"):
         return f" · ✗ {who} recommended {rec}"
-    if effort and decision.get("rec_effort") and effort != decision["rec_effort"]:
+    if by_router and effort and effort != rec_effort:
         return f" · ✓ model as {who} recommended ({rec}), effort differs"
     return f" · ✓ followed {who} ({rec})"
 

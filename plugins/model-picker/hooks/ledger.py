@@ -290,8 +290,9 @@ def last_model(transcript_path):
 def transcript_usage(path):
     """Per-message usage from a transcript, deduplicated by message id (streamed chunks repeat it).
 
-    Returns a list of {"model", "input", "output", "cache_read", "cache_write", "cache_write_1h"} dicts,
-    where cache_write counts all cache writes and cache_write_1h the 1-hour share of them.
+    Returns a list of {"model", "input", "output", "cache_read", "cache_write", "cache_write_1h", "effort"} dicts,
+    where cache_write counts all cache writes and cache_write_1h the 1-hour share of them, and effort is the
+    reasoning effort the turn ran at (None when the transcript doesn't record it).
     """
     by_id, order = {}, []
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -319,6 +320,7 @@ def transcript_usage(path):
                 "cache_read": int(usage.get("cache_read_input_tokens") or 0),
                 "cache_write": int(usage.get("cache_creation_input_tokens") or 0),
                 "cache_write_1h": int(split.get("ephemeral_1h_input_tokens") or 0),
+                "effort": rec.get("effort") if isinstance(rec.get("effort"), str) else None,
             }
     return [by_id[k] for k in order]
 
@@ -353,15 +355,62 @@ def find_subagent(parent_transcript, tool_use_id):
     return None, {}
 
 
-def stamp_text(agent_type, model, totals, baseline_tier):
-    """One-line ground-truth stamp: which model actually answered, tokens, cost."""
+def run_effort(messages):
+    """The effort most of the subagent's turns ran at, from the transcript; None if not recorded."""
+    counts = {}
+    for m in messages:
+        if m.get("effort"):
+            counts[m["effort"]] = counts.get(m["effort"], 0) + 1
+    return max(counts, key=counts.get) if counts else None
+
+
+def _rec_label(source):
+    """Who made a recommendation, for people: the router model ("jev-latest") or "keyword rules"."""
+    src = str(source or "")
+    if not src or src.startswith("heuristic"):
+        return "keyword rules"
+    head = src.split(" (")[0].split(" + ")[0]
+    if head == "command":
+        return "command router"
+    return head.split(":", 1)[-1].split("/")[-1] or "router"  # model ids may contain ":" themselves
+
+
+def stamp_verdict(decision, effort):
+    """Did the launch follow model-picker's recommendation? Same rules as the ledger's "followed": only explicit
+    launches are judged, a fallback guess judges nothing. Effort is compared only when a router chose it (the
+    keyword rules always say "medium"). "" when there was nothing to compare (pinned agent, no launch record)."""
+    if not decision or not decision.get("rec_tier"):
+        return ""
+    by_router = not str(decision.get("source") or "heuristic").startswith("heuristic")
+    rec_effort = decision.get("rec_effort") or "medium"
+    rec = f"{decision['rec_tier']}/{rec_effort}" if by_router else decision["rec_tier"]
+    who = _rec_label(decision.get("source")) + (" + your floor" if decision.get("floor") else "")
+    chosen = decision.get("chosen_tier")
+    if decision.get("unsure"):
+        return f" · {who} only guessed {rec}"
+    if decision.get("outcome") != "explicit":
+        return f" · no model set; {who} recommended {rec}"
+    if not chosen:
+        return f" · {who} recommended {rec}"
+    if chosen != decision["rec_tier"] and not (decision["rec_tier"] == "local" and chosen == "haiku"):
+        return f" · ✗ {who} recommended {rec}"
+    if by_router and effort and effort != rec_effort:
+        return f" · ✓ model as {who} recommended ({rec}), effort differs"
+    return f" · ✓ followed {who} ({rec})"
+
+
+def stamp_text(agent_type, model, totals, baseline_tier, effort=None, decision=None):
+    """One-line ground-truth stamp: which model actually answered (and at what effort), tokens, cost, and
+    whether that matched the recommendation."""
     tokens = totals["input"] + totals["output"] + totals["cache_read"] + totals["cache_write"]
     size = f"{tokens / 1e6:.2f}M" if tokens >= 1e6 else f"{tokens / 1e3:.0f}K" if tokens >= 1e3 else str(tokens)
     cost = "$0 (local)" if totals.get("local") else f"~${totals['cost']:.3f}"
     vs = ""
     if baseline_tier and totals["baseline_cost"] and totals["saving"] > 0:
         vs = f" (~${totals['baseline_cost']:.3f} on {baseline_tier})"
-    return f"[model-picker] {agent_type or 'subagent'} ran on {model} · {size} tokens · {cost}{vs}"
+    at = f" at {effort} effort" if effort else ""
+    return (f"[model-picker] {agent_type or 'subagent'} ran on {model}{at} · {size} tokens · {cost}{vs}"
+            f"{stamp_verdict(decision, effort)}")
 
 
 def subagent_transcript(payload):

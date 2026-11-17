@@ -536,7 +536,7 @@ def _health_read(cfg):
 
 def _entry_last(e):
     vals = []
-    for k in ("last", "paused_until", "prompt_last", "prompt_paused_until"):
+    for k in ("last", "paused_until", "prompt_last", "prompt_paused_until", "launch_last", "launch_paused_until"):
         try:
             vals.append(float(e.get(k) or 0))
         except (TypeError, ValueError):
@@ -604,14 +604,15 @@ def _paused_until(h, prefix=""):
 
 
 def router_paused(cfg, now=None, scope="launch"):
-    """Why router calls are paused right now, or None. scope="prompt" also honors the prompt line's own pause.
+    """Why router calls are paused right now, or None: the main pause, plus the prompt line's own pause
+    (scope="prompt") or the launches' own pause (scope="launch").
     A pause ending further ahead than one pause from now (clock moved back, hand-edited file) is ignored."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
     h = _health_read(cfg)
     now = now or time.time()
-    for prefix in ("", "prompt_") if scope == "prompt" else ("",):
+    for prefix in ("", "prompt_" if scope == "prompt" else "launch_"):
         if now < _paused_until(h, prefix) <= now + pause:
             return str(h.get(prefix + "reason") or "failing")
     return None
@@ -651,10 +652,13 @@ def _clear(h, prefix):
 def record_router(cfg, res, now=None, scope="launch"):
     """Count this router call in the shared state. Returns a one-line notice when it starts a pause.
 
-    Two counts per router: the main one (connection failures and rejections from both hooks, and launch
-    timeouts) pauses every router call; the prompt line's own count (prompt timeouts: prompts get 3 s,
-    launches more) pauses only the prompt line, which shows nothing on a timeout anyway. A retry that fails
-    right after a pause, for the same kind of reason, pauses again quietly (the user was told)."""
+    Three counts per router, each "in a row" for what it measures:
+    - main: connection failures and rejections from either hook; pauses every router call; any answer clears it.
+    - prompt_: every prompt failure, timeouts included (prompts get only 3 s); pauses only the prompt line,
+      which shows nothing on a failure anyway; a prompt answer clears it.
+    - launch_: every launch failure; pauses only launches; a launch answer clears it (a short prompt answering
+      in time says nothing about a long launch input).
+    A retry that fails right after a pause, for the same kind of reason, pauses again quietly (the user was told)."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
@@ -664,46 +668,56 @@ def record_router(cfg, res, now=None, scope="launch"):
     proceed, fd = _health_lock(cfg)
     if not proceed:
         return None
+    notices = {}
+    own = "prompt_" if scope == "prompt" else "launch_"
     try:
         now = now or time.time()
         h = _health_read(cfg)
         before = dict(h)
-        for pre in ("", "prompt_"):  # old failures, or a pause that ended long ago (overnight): start over
+        for pre in ("", "prompt_", "launch_"):  # old failures, or a pause that ended long ago (overnight): start over
             last = max(_paused_until(h, pre), _num_field(h, pre + "last"))
             if last and now > last + pause:
                 _clear(h, pre)
         if fail is None:
             _clear(h, "")
-            if scope == "prompt":
-                _clear(h, "prompt_")  # answered inside the prompt budget
+            _clear(h, own)
             if h != before:
                 _health_write(cfg, h, now)
             return None
         reason, rejected, slow = fail
-        pre = "prompt_" if scope == "prompt" and slow else ""
-        until = _paused_until(h, pre)
-        fails = h[pre + "fails"] + 1 if isinstance(h.get(pre + "fails"), int) else 1
-        h.update({pre + "fails": fails, pre + "reason": reason, pre + "rejected": rejected, pre + "last": now})
-        if not rejected and fails < ROUTER_FAILS_TO_PAUSE:
-            h.pop(pre + "paused_until", None)
-            _health_write(cfg, h, now)
-            return None
-        # Same kind (can't reach vs rejected): "timed out" and "unreachable" alternating isn't news.
-        told = bool(until) and bool(before.get(pre + "rejected")) == rejected
-        h[pre + "paused_until"] = now + pause
+        counts = [own] + ([] if slow else [""])
+        for pre in counts:
+            until = _paused_until(h, pre)
+            fails = h[pre + "fails"] + 1 if isinstance(h.get(pre + "fails"), int) else 1
+            h.update({pre + "fails": fails, pre + "reason": reason, pre + "rejected": rejected, pre + "last": now})
+            if not rejected and fails < ROUTER_FAILS_TO_PAUSE:
+                h.pop(pre + "paused_until", None)
+                continue
+            h[pre + "paused_until"] = now + pause
+            # Same kind (can't reach vs rejected): "timed out" and "unreachable" alternating isn't news.
+            if not (until and bool(before.get(pre + "rejected")) == rejected):
+                notices[pre] = fails
         _health_write(cfg, h, now)
     finally:
         if fd is not None:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
-    if told:
+    if not notices:
         return None
+    pre = "" if "" in notices else own  # a main pause covers the prompt line too: one line is enough
+    fails = notices[pre]
     mins = f"{pause / 60:g} min"
     label = _router_label(cfg)
     reset = f"delete {_health_path(cfg)} to retry sooner"
+    other_paused = pre and now < max(_paused_until(h, "launch_" if pre == "prompt_" else "prompt_"), _paused_until(h, ""))
+    if pre == "launch_":
+        rest = "the prompt line is paused too" if other_paused else "the prompt line still asks it"
+        return (f"model-picker: {label} failed {fails}× in a row ({reason}) on agent launches; launches use the "
+                f"keyword rules for {mins}, {rest} ({reset}).")
     if pre:
-        return (f"model-picker: {label} didn't answer 3 prompts in a row in time ({reason}); the prompt line is paused "
-                f"for {mins}, agent launches still ask it ({reset}).")
+        rest = "agent launches are paused too" if other_paused else "agent launches still ask it"
+        return (f"model-picker: {label} failed on {fails} prompts in a row ({reason}); the prompt line is paused "
+                f"for {mins}, {rest} ({reset}).")
     if rejected:
         return (f"model-picker: {label} rejected the call ({reason}), which a retry won't fix; router calls paused "
                 f"for {mins}. Check the router URL, key (MODEL_PICKER_ROUTER_API_KEY_ENV / _API_KEY_CMD) and "
@@ -732,6 +746,7 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
         "tool": payload.get("tool_name"), "agent_type": str(inp.get("subagent_type") or "general-purpose"),
         "description": _short(inp.get("description") or inp.get("name")), "outcome": outcome,
         "chosen": chosen, "chosen_tier": chosen_tier, "session_model": session_model, "pinned": pinned,
+        "chosen_effort": inp.get("effort") if isinstance(inp.get("effort"), str) else None,
     }
     if rec:
         entry.update({"rec_tier": rec["tier"], "rec_effort": rec["effort"], "source": rec["source"],
@@ -846,7 +861,8 @@ def handle_subagent_stop(payload, cfg):
     # Foreground agents are stamped at PostToolUse (where Claude also sees it). Everything else
     # (background, or a meta with no requestShape) is stamped here, once, to the user.
     if _enabled(cfg, "MODEL_PICKER_STAMP", default=False) and meta.get("requestShape") != "foreground":
-        line = ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline)
+        line = ledger.stamp_text(meta.get("agentType"), main_model, totals, baseline,
+                                 ledger.run_effort(messages) or launch.get("chosen_effort"), launch)
         if not ledger.logging_enabled(cfg):
             # Delivery needs the ledger; without it, the user-facing line is the best we can do.
             print(json.dumps({"systemMessage": line}))
@@ -881,7 +897,8 @@ def handle_posttool(payload, cfg):
     baseline = ledger.tier_of(session_model)
     totals = ledger.summarize_usage(messages, baseline, ledger.price_table(cfg))
     model = max(totals["models"], key=totals["models"].get)
-    line = ledger.stamp_text(meta.get("agentType"), model, totals, baseline)
+    line = ledger.stamp_text(meta.get("agentType"), model, totals, baseline,
+                             ledger.run_effort(messages) or launch.get("chosen_effort"), launch)
     out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": line}}
     already = any(r.get("kind") == "stamp" and r.get("tool_use_id") == payload.get("tool_use_id")
                   for r in ledger.read(cfg, time.time() - 86400))

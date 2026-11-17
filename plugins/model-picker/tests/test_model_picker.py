@@ -1202,7 +1202,7 @@ code = ("import json,sys; sys.path.insert(0, %r); import model_picker as mp; "
 procs = [subprocess.Popen([sys.executable, "-I", "-c", code, json.dumps(par)], stdout=subprocess.PIPE, text=True)
          for _ in range(6)]
 outs = [json.loads(p.communicate()[0] or "null") for p in procs]
-pfails = mp._health_read(par)["fails"]
+pfails = mp._health_read(par)["launch_fails"]
 results.append(check("pause: 6 parallel failures count 6 and give exactly one notice",
                      pfails == 6 and sum(1 for o in outs if o) == 1))
 # The route CLI (the /model-picker skill) honors a pause but never starts one: its notice would reach Claude, not you.
@@ -1252,7 +1252,7 @@ ost2 = {**fresh_state(), **DOWN}
 mp.record_router(ost2, None, now=time.time() - 700)
 mp.record_router(ost2, None, now=time.time() - 690)
 results.append(check("pause: failures from long ago (never paused) expire", mp.record_router(ost2, None) is None
-                     and mp._health_read(ost2)["fails"] == 1))
+                     and mp._health_read(ost2)["launch_fails"] == 1))
 fut = {**fresh_state(), **DOWN}
 mp._health_write(fut, {"fails": 3, "reason": "timed out", "paused_until": time.time() + 10 ** 9})
 results.append(check("pause: a pause ending implausibly far ahead is ignored", mp.router_paused(fut) is None))
@@ -1296,6 +1296,127 @@ with um.patch.object(mp.fcntl, "flock", side_effect=OSError(45, "Operation not s
     nolock_s = time.monotonic() - t0
 results.append(check("pause: works without flock (network filesystems), with no lock wait",
                      mp.router_paused(nl) == "timed out" and nolock_s < 0.5))
+
+# v0.4.8: follow-ups from the v0.4.7 review.
+lt = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(lt, None)                                   # a launch times out
+    mp.record_router(lt, {"tier": "haiku"}, scope="prompt")      # a short prompt answers in time
+lc = {**fresh_state(), **DOWN}
+mp.record_router(lc, urllib.error.URLError(OSError()))
+mp.record_router(lc, {"tier": "haiku"}, scope="prompt")
+results += [
+    check("pause: prompt successes don't reset launch timeouts (3 launch timeouts still pause)",
+          mp.router_paused(lt) == "timed out"),
+    check("pause: a prompt success still clears connection failures", mp._health_read(lc).get("fails") is None),
+]
+mx = {**fresh_state(), **DOWN}
+mixed = [mp.record_router(mx, e, scope="prompt") for e in (None, urllib.error.URLError(TimeoutError()), None)]
+cn = {**fresh_state(), **DOWN}
+conn = [mp.record_router(cn, urllib.error.URLError(OSError()), scope="prompt") for _ in range(3)]
+results += [
+    check("pause: mixed prompt failures (timeout, connect timeout, timeout) pause the prompt line on the 3rd",
+          mixed[:2] == [None, None] and "prompt line is paused" in (mixed[2] or "")
+          and mp.router_paused(mx, scope="prompt") and mp.router_paused(mx) is None),
+    check("pause: 3 prompt connection failures pause everything, with one notice (not two)",
+          conn[:2] == [None, None] and "router calls paused" in (conn[2] or "") and "prompt line" not in conn[2]
+          and mp.router_paused(cn) == "unreachable"),
+]
+
+# v0.4.8 review: no false "3× in a row" from mixing old launch timeouts with later blips.
+t0 = time.time()
+sa = {**fresh_state(), **DOWN}
+mp.record_router(sa, None, now=t0)                                                   # 1 launch timeout
+mp.record_router(sa, urllib.error.URLError(OSError()), now=t0 + 300, scope="prompt")  # a prompt blip
+for k in range(30):
+    mp.record_router(sa, {"tier": "haiku"}, now=t0 + 310 + k, scope="prompt")         # prompts answer
+blip = mp.record_router(sa, urllib.error.URLError(OSError()), now=t0 + 840, scope="prompt")
+sb = {**fresh_state(), **DOWN}
+for k in range(3):
+    mp.record_router(sb, None, now=t0 + k)                                           # launches time out: paused
+mp.record_router(sb, {"tier": "haiku"}, now=t0 + 610, scope="prompt")
+blip_b = mp.record_router(sb, urllib.error.URLError(OSError()), now=t0 + 700, scope="prompt")
+lm = {**fresh_state(), **DOWN}
+lmix = [mp.record_router(lm, e) for e in (None, urllib.error.URLError(OSError()), None)]
+lcn = {**fresh_state(), **DOWN}
+lconn = [mp.record_router(lcn, urllib.error.URLError(OSError())) for _ in range(3)]
+results += [
+    check("pause: one old launch timeout + two later blips isn't '3 in a row'",
+          blip is None and mp.router_paused(sa, now=t0 + 841) is None
+          and mp.router_paused(sa, now=t0 + 841, scope="prompt") is None),
+    check("pause: after a launch-timeout pause, one prompt blip pauses nothing",
+          blip_b is None and mp.router_paused(sb, now=t0 + 701) is None
+          and mp.router_paused(sb, now=t0 + 701, scope="prompt") is None),
+    check("pause: mixed launch failures pause launches on the 3rd; the prompt line keeps asking",
+          lmix[:2] == [None, None] and "on agent launches" in (lmix[2] or "")
+          and mp.router_paused(lm) and mp.router_paused(lm, scope="prompt") is None),
+    check("pause: 3 launch connection failures pause everything, with one notice",
+          lconn[:2] == [None, None] and "router calls paused" in (lconn[2] or "")
+          and mp.router_paused(lcn, scope="prompt") == "unreachable"),
+]
+
+# v0.4.8: the stamp shows the effort the agent ran at and whether it followed the recommendation.
+JEV = "openai-decisions:team/jev-latest (0.88)"
+dec = lambda **k: {"rec_tier": "opus", "rec_effort": "high", "source": JEV, "chosen_tier": "opus",  # noqa: E731
+                   "outcome": "explicit", **k}
+results += [
+    check("stamp verdict: followed", ledger.stamp_verdict(dec(), "high") == " · ✓ followed jev-latest (opus/high)"),
+    check("stamp verdict: model followed, effort differs",
+          ledger.stamp_verdict(dec(), "low") == " · ✓ model as jev-latest recommended (opus/high), effort differs"),
+    check("stamp verdict: not followed",
+          ledger.stamp_verdict(dec(chosen_tier="sonnet"), "high") == " · ✗ jev-latest recommended opus/high"),
+    check("stamp verdict: keyword-rule fallback and floors are named as such",
+          ledger.stamp_verdict(dec(source="heuristic (router paused: unreachable)", unsure=True), None)
+          == " · keyword rules only guessed opus"
+          and "jev-latest + your floor" in ledger.stamp_verdict(dec(source=JEV + " + floor", floor="review"), "high")),
+    check("stamp verdict: nothing to compare (pinned agent, no launch record)",
+          ledger.stamp_verdict({"outcome": "pinned"}, "high") == "" and ledger.stamp_verdict(None, "high") == ""),
+    check("stamp: run effort is the most common recorded effort",
+          ledger.run_effort([{"effort": "high"}, {"effort": "high"}, {"effort": "low"}, {}]) == "high"
+          and ledger.run_effort([{}]) is None),
+]
+with tempfile.TemporaryDirectory() as d:
+    sess = Path(d) / "sess.jsonl"
+    write_transcript(sess, [amsg("m0", "claude-opus-5-5", inp=10, out=10)])
+    sub_dir = Path(d) / "sess" / "subagents"
+    write_transcript(sub_dir / "agent-ef.jsonl", [{**amsg(f"e{i}", "claude-opus-5-5", inp=1000, out=200), "effort": "high"}
+                                                  for i in range(2)])
+    (sub_dir / "agent-ef.meta.json").write_text(json.dumps(
+        {"agentType": "general-purpose", "toolUseId": "toolu_ef", "requestShape": "foreground"}))
+    est2 = {**fresh_state(), "MODEL_PICKER_STAMP": "1"}
+    ledger.append(est2, {"kind": "decision", "tool_use_id": "toolu_ef", "outcome": "explicit", "chosen": "opus",
+                         "chosen_tier": "opus", "rec_tier": "opus", "rec_effort": "high", "source": JEV,
+                         "followed": True, "chosen_effort": "high"})
+    r = subprocess.run([sys.executable, "-I", str(HOOK), "posttool", str(ROOT)], capture_output=True, text=True,
+                       input=json.dumps({"tool_name": "Agent", "tool_use_id": "toolu_ef", "transcript_path": str(sess)}),
+                       env={**os.environ, **est2})
+    stamp = json.loads(r.stdout).get("systemMessage", "") if r.stdout.strip() else ""
+    results.append(check("stamp e2e: effort and verdict in the line",
+                         "general-purpose ran on claude-opus-5-5 at high effort" in stamp
+                         and stamp.endswith("· ✓ followed jev-latest (opus/high)")))
+st0 = fresh_state()
+run(agent(description="find x", prompt="p", model="haiku", effort="low"), "advise", st0)
+results.append(check("decision log: the launch's effort is recorded",
+                     any(r.get("chosen_effort") == "low" for r in ledger.read(st0))))
+
+both = {**fresh_state(), **DOWN}
+first = [mp.record_router(both, None, scope="prompt") for _ in range(3)][-1]
+second = [mp.record_router(both, None) for _ in range(3)][-1]
+results.append(check("pause notice: says when the other kind of call is already paused",
+                     "agent launches still ask it" in (first or "") and "the prompt line is paused too" in (second or "")))
+
+results += [
+    check("stamp verdict: a launch with no model isn't judged (it inherited the session model)",
+          ledger.stamp_verdict(dec(outcome="missing"), "high") == " · no model set; jev-latest recommended opus/high"),
+    check("stamp verdict: unknown chosen model with a confident router isn't called a guess",
+          ledger.stamp_verdict(dec(chosen_tier=None), "high") == " · jev-latest recommended opus/high"),
+    check("stamp verdict: keyword-rule effort (always medium) isn't compared",
+          ledger.stamp_verdict(dec(source="heuristic (router timed out)", rec_effort="medium"), "high")
+          == " · ✓ followed keyword rules (opus)"),
+    check("stamp label: model ids with ':' and the command router",
+          ledger._rec_label("openai-decisions:ft:gpt-4.1-mini:acme::abc123 (0.9)") == "ft:gpt-4.1-mini:acme::abc123"
+          and ledger._rec_label("command (1.00)") == "command router"),
+]
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

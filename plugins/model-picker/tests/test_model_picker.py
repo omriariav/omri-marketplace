@@ -1024,12 +1024,25 @@ def FAKE_ROUTER(tier, conf):
             f"{sys.executable} -c \"print('{{\\\"tier\\\": \\\"{tier}\\\", \\\"effort\\\": \\\"medium\\\", \\\"confidence\\\": {conf}}}')\""}
 
 
-def prompt_hook(prompt, env):
+_prompt_n = [0]
+
+
+def prompt_hook(prompt, env, session=None):
+    """Each call is its own session (a first prompt) unless a session id is given."""
     e = {k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")}
     e.update({"MODEL_PICKER_CONFIG": "/nonexistent/model-picker.json", **env})
+    _prompt_n[0] += 1
+    sid = session or f"s-prompt-{_prompt_n[0]}"
     out = subprocess.run([sys.executable, "-I", str(HOOK), "prompt", str(ROOT)], capture_output=True, text=True, env=e,
-                         input=json.dumps({"session_id": "s-prompt", "prompt": prompt, "transcript_path": "/nonexistent"})).stdout
+                         input=json.dumps({"session_id": sid, "prompt": prompt, "transcript_path": "/nonexistent"})).stdout
     return json.loads(out) if out.strip() else None
+
+
+def session_hook(env, session, source="compact"):
+    e = {k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")}
+    e.update({"MODEL_PICKER_CONFIG": "/nonexistent/model-picker.json", **env})
+    subprocess.run([sys.executable, "-I", str(HOOK), "session", str(ROOT)], capture_output=True, text=True, env=e,
+                   input=json.dumps({"session_id": session, "source": source}))
 
 
 pst = fresh_state()
@@ -1052,6 +1065,51 @@ results += [
     check("prompt route: shows the router's raw pick, not floors",
           "→ sonnet" in (prompt_hook("review PR 55 for bugs please", {**ON, **FL, **FAKE_ROUTER("sonnet", 0.4)}) or {}).get("systemMessage", "")),
 ]
+# 0.5.0: with PROMPT_ROUTE=1 the router is called only at natural breaks.
+cnt = Path(fresh_state()["MODEL_PICKER_STATE_DIR"]) / "calls.txt"
+counter = Path(cnt.parent) / "count.py"
+counter.write_text("import sys, json\nopen(%r, 'a').write('x')\nprint(json.dumps({'tier': 'sonnet', 'effort': 'medium', 'confidence': 0.9}))\n" % str(cnt))
+nb = {"MODEL_PICKER_STATE_DIR": str(cnt.parent), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "command",
+      "MODEL_PICKER_ROUTER_CMD": f"{sys.executable} {counter}"}
+calls = lambda: len(cnt.read_text()) if cnt.exists() else 0  # noqa: E731
+first = prompt_hook("debug the flaky login test in CI", nb, session="s-nb")
+second = prompt_hook("also add a retry to the upload step", nb, session="s-nb")
+short_first = prompt_hook("ok", nb, session="s-nb2")
+after_short = prompt_hook("debug the flaky login test in CI", nb, session="s-nb2")
+c1 = calls()
+session_hook(nb, "s-nb")
+after_compact = prompt_hook("now write the migration for the users table", nb, session="s-nb")
+again = prompt_hook("and the rollback too please", nb, session="s-nb")
+c2 = calls()
+bf = mp._session_file(nb, "prompt-breaks", "s-nb")
+st = json.loads(bf.read_text())
+bf.write_text(json.dumps({**st, "last": st["last"] - 3601}))
+after_idle = prompt_hook("start on the billing export feature", nb, session="s-nb")
+bf.write_text(json.dumps({**json.loads(bf.read_text()), "last": json.loads(bf.read_text())["last"] - 3601}))
+no_idle = prompt_hook("start on the billing export feature", {**nb, "MODEL_PICKER_PROMPT_ROUTE_IDLE": "0"}, session="s-nb")
+alw = {**nb, "MODEL_PICKER_PROMPT_ROUTE": "always"}
+c3 = calls()
+always = [prompt_hook("debug the flaky login test in CI", alw, session="s-alw") for _ in range(2)]
+c4 = calls()
+down = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "false"}
+prompt_hook("debug the flaky login test in CI", down, session="s-down")
+pending_after_fail = json.loads(mp._session_file(down, "prompt-breaks", "s-down").read_text())["pending"]
+results += [
+    check("breaks: the session's first prompt is routed, a mid-task follow-up is not",
+          bool(first) and second is None and c1 == 2),
+    check("breaks: a short or slash first prompt leaves the break open for the next real prompt",
+          short_first is None and bool(after_short)),
+    check("breaks: /compact (SessionStart) reopens the break, once",
+          bool(after_compact) and again is None and c2 == 3),
+    check("breaks: a prompt after an idle hour is routed", bool(after_idle)),
+    check("breaks: PROMPT_ROUTE_IDLE=0 turns the idle break off", no_idle is None),
+    check("breaks: PROMPT_ROUTE=always routes every prompt", all(always) and c4 - c3 == 2),
+    check("breaks: a router failure keeps the break open", pending_after_fail is True),
+    check("breaks: SessionStart writes nothing when the prompt line is off or always",
+          (mp.mark_break({"MODEL_PICKER_STATE_DIR": str(cnt.parent)}, "s-off") or True)
+          and not mp._session_file(nb, "prompt-breaks", "s-off").exists()),
+]
+
 capture = Path(pst["MODEL_PICKER_STATE_DIR"]) / "router-saw.json"
 spy = Path(pst["MODEL_PICKER_STATE_DIR"]) / "spy.py"
 spy.write_text("import sys, json\nopen(%r, 'w').write(sys.stdin.read())\nprint(json.dumps({'tier': 'haiku', 'effort': 'low', 'confidence': 0.9}))\n" % str(capture))
@@ -1432,11 +1490,11 @@ results += [
           da("Opus is expensive and haiku is cheap") is None and da("write a haiku about spring") is None and da("write a haiku for my mom") is None),
 ]
 ast = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", **FAKE_ROUTER("sonnet", 0.82)}
-seen_line = prompt_hook("please use opus for the code review", ast)
+seen_line = prompt_hook("please use opus for the code review", ast, session="s-prompt")
 asked_now = mp.current_ask(ast, "s-prompt")
-notif = prompt_hook("<task-notification>agent done</task-notification>", ast)
+notif = prompt_hook("<task-notification>agent done</task-notification>", ast, session="s-prompt")
 kept = mp.current_ask(ast, "s-prompt")
-prompt_hook("thanks, now fix the failing test", ast)
+prompt_hook("thanks, now fix the failing test", ast, session="s-prompt")
 cleared = mp.current_ask(ast, "s-prompt")
 results += [
     check("ask: the prompt line says what you asked for",
@@ -1501,11 +1559,11 @@ results.append(check("ask: an effort-only ask is not a model pick (normal verdic
                      not eo_dec.get("user_pick") and "reads as" in json.dumps(eo_out)))
 # Clearing: slash commands and pasted markup clear the ask; notifications keep it; MODEL_PICKER_ASK=0 and LOG=0 turn it off.
 cl = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", **FAKE_ROUTER("sonnet", 0.82)}
-prompt_hook("use opus for the review please", cl)
-prompt_hook("/code-review high", cl)
+prompt_hook("use opus for the review please", cl, session="s-prompt")
+prompt_hook("/code-review high", cl, session="s-prompt")
 after_slash = mp.current_ask(cl, "s-prompt")
-prompt_hook("use opus for the review please", cl)
-prompt_hook("<div>pasted html here</div>", cl)
+prompt_hook("use opus for the review please", cl, session="s-prompt")
+prompt_hook("<div>pasted html here</div>", cl, session="s-prompt")
 after_html = mp.current_ask(cl, "s-prompt")
 off_ask = {**fresh_state(), "MODEL_PICKER_ASK": "0"}
 mp.remember_ask(off_ask, "S3", {"tier": "opus", "effort": None})

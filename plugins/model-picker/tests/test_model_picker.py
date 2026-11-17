@@ -1162,7 +1162,7 @@ def _paused_after(errs):
 results += [
     check("pause: real exception shapes count (TimeoutError, socket.timeout, TimeoutExpired, URLError(timeout))",
           _paused_after([TimeoutError(), socket.timeout(), subprocess.TimeoutExpired("x", 1)]) == "timed out"
-          and _paused_after([urllib.error.URLError(TimeoutError())] * 3) == "timed out"),
+          and _paused_after([urllib.error.URLError(TimeoutError())] * 3) == "connect timed out"),
     check("pause: a failing router/key command counts (a wrapped curl that can't connect exits non-zero)",
           _paused_after([subprocess.CalledProcessError(28, "curl")] * 3) == "command exit 28"),
     check("pause: no API key never pauses (it costs no time, and another session may have the key)",
@@ -1222,6 +1222,42 @@ hit.unlink(missing_ok=True)
 paused_src = mp.decide({"description": "debug the flaky test"}, SPY)["source"]
 results.append(check("pause: a launch while paused never calls the router",
                      paused_src.startswith("heuristic (router paused") and not hit.exists()))
+
+# Review round 2 of v0.4.7.
+pp = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "command",
+      "MODEL_PICKER_ROUTER_CMD": "sleep 2.7; echo '{\"tier\": \"haiku\", \"effort\": \"low\", \"confidence\": 1}'"}
+slow_prompts = [prompt_hook("debug the flaky login test in CI", pp) for _ in range(3)]
+saved_deadline, mp.ROUTER_DEADLINE = mp.ROUTER_DEADLINE, 7.0  # real launch budget (an earlier test lowers it)
+launch_src = mp.decide({"description": "debug the flaky test"}, pp)["source"]
+mp.ROUTER_DEADLINE = saved_deadline
+cp = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(cp, urllib.error.URLError(ConnectionRefusedError()), count_timeouts=False)
+results += [
+    check("pause: a router slower than the prompt budget (2.7 s) never pauses, at default settings",
+          not any(slow_prompts) and mp.router_paused(pp) is None and launch_src == "command (1.00)"),
+    check("pause: on the prompt path, failing to connect still counts", mp.router_paused(cp) == "unreachable"),
+]
+os.environ["KEY_FOR_TEST"] = "old-key"
+KEYED = {**DOWN, "MODEL_PICKER_ROUTER_API_KEY_ENV": "KEY_FOR_TEST"}
+before = mp._router_id(KEYED)
+os.environ["KEY_FOR_TEST"] = "new-key"
+results.append(check("pause: a different key value starts a fresh count", mp._router_id(KEYED) != before))
+del os.environ["KEY_FOR_TEST"]
+ost2 = {**fresh_state(), **DOWN}
+mp.record_router(ost2, None, now=time.time() - 700)
+mp.record_router(ost2, None, now=time.time() - 690)
+results.append(check("pause: failures from long ago (never paused) expire", mp.record_router(ost2, None) is None
+                     and json.loads((Path(ost2["MODEL_PICKER_STATE_DIR"]) / "router-health.json").read_text())["fails"] == 1))
+fut = {**fresh_state(), **DOWN}
+mp._health_write(fut, {"fails": 3, "reason": "timed out", "paused_until": time.time() + 10 ** 9})
+results.append(check("pause: a pause ending implausibly far ahead is ignored", mp.router_paused(fut) is None))
+alt = {**fresh_state(), **DOWN}
+for _ in range(3):
+    mp.record_router(alt, None)
+results.append(check("pause: 'unreachable' right after a 'timed out' pause re-pauses quietly",
+                     mp.record_router(alt, urllib.error.URLError(OSError()), now=time.time() + 601) is None
+                     and mp.router_paused(alt, now=time.time() + 602) == "unreachable"))
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

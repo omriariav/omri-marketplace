@@ -490,8 +490,12 @@ ROUTER_ID_KEYS = ("MODEL_PICKER_ROUTER", "MODEL_PICKER_ROUTER_URL", "MODEL_PICKE
 
 
 def _router_id(cfg):
-    """Fingerprint of the router settings (hashed: a command or header may hold secrets)."""
-    raw = "|".join(str(cfg.get(k) or "") for k in ROUTER_ID_KEYS)
+    """Fingerprint of the router settings and the key in use (hashed: commands, headers and keys are secrets).
+    A session with a different key (fixed, or still stale) keeps its own count."""
+    name = str(cfg.get("MODEL_PICKER_ROUTER") or "").lower()
+    key_env = str(cfg.get("MODEL_PICKER_ROUTER_API_KEY_ENV") or routers.DEFAULT_KEY_ENV.get(name, ""))
+    key = os.environ.get(key_env, "") if key_env and key_env.lower() != "none" else ""
+    raw = "|".join([*(str(cfg.get(k) or "") for k in ROUTER_ID_KEYS), key])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -555,11 +559,14 @@ def _health_lock(cfg):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return fd
-        except OSError:
+        except BlockingIOError:  # held by another hook; any other error (no flock on this filesystem) won't pass
             if time.monotonic() > deadline:
                 os.close(fd)
                 return None
             time.sleep(0.01)
+        except OSError:
+            os.close(fd)
+            return None
 
 
 def _paused_until(h):
@@ -570,44 +577,50 @@ def _paused_until(h):
 
 
 def router_paused(cfg, now=None):
-    """Why router calls are paused right now, or None."""
-    if _pause_seconds(cfg) <= 0:
+    """Why router calls are paused right now, or None. A pause ending further ahead than one pause from now
+    (clock moved back, hand-edited file) is ignored."""
+    pause = _pause_seconds(cfg)
+    if pause <= 0:
         return None
     h = _health_read(cfg)
-    return str(h.get("reason") or "failing") if (now or time.time()) < _paused_until(h) else None
+    now = now or time.time()
+    return str(h.get("reason") or "failing") if now < _paused_until(h) <= now + pause else None
 
 
 def _failure(res):
-    """(reason, pause_now) when the router could not be reached or refused the call; None when it answered;
-    "other" for any other error (a malformed or unusable answer means the router is up and fast)."""
+    """(reason, rejected, slow) when the router could not be reached or refused the call; None when it answered;
+    "other" for any other error (a malformed or unusable answer means the router is up and fast).
+    slow: the call ran out of time after connecting (or we can't tell), so a longer budget might have worked."""
     if isinstance(res, dict):
         return None
     if res is None:
-        return "timed out", False
+        return "timed out", False, True
     if isinstance(res, urllib.error.HTTPError):  # before URLError: it is a subclass
-        return f"HTTP {res.code}", res.code in REJECTED_CODES
-    if isinstance(res, urllib.error.URLError):
-        return ("timed out" if isinstance(res.reason, (TimeoutError, socket.timeout)) else "unreachable"), False
+        return f"HTTP {res.code}", res.code in REJECTED_CODES, False
+    if isinstance(res, urllib.error.URLError):  # never connected: DNS, refused, no route, connect timeout
+        timed_out = isinstance(res.reason, (TimeoutError, socket.timeout))
+        return ("connect timed out" if timed_out else "unreachable"), False, False
     if isinstance(res, (TimeoutError, socket.timeout, subprocess.TimeoutExpired)):  # socket.timeout: Python < 3.10
-        return "timed out", False
+        return "timed out", False, True
     if isinstance(res, OSError):
-        return "unreachable", False
+        return "unreachable", False, False
     if isinstance(res, subprocess.CalledProcessError):
         # The router or key command failed; its exit code says nothing about why (a wrapped curl that
         # can't reach the gateway looks the same), so it counts like a connection error.
-        return f"command exit {res.returncode}", False
+        return f"command exit {res.returncode}", False, False
     return "other"
 
 
 def record_router(cfg, res, now=None, count_timeouts=True):
     """Count this router call in the shared state. Returns a one-line notice when it starts a pause.
-    A retry that fails right after a pause, for the same reason, pauses again quietly (the user was told).
-    count_timeouts=False: a timeout under a shorter budget than launches get says nothing about launches."""
+    A retry that fails right after a pause, for the same kind of reason, pauses again quietly (the user was told).
+    count_timeouts=False: the call had less time than launches get, so running out of time after connecting
+    says nothing about launches; failing to connect at all still counts."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
     fail = _failure(res)
-    if fail == "other" or (fail and not count_timeouts and fail[0] == "timed out"):
+    if fail == "other" or (fail and not count_timeouts and fail[2]):
         return None  # no sign either way: leave the count alone
     fd = _health_lock(cfg)
     if fd is None:
@@ -616,19 +629,25 @@ def record_router(cfg, res, now=None, count_timeouts=True):
         now = now or time.time()
         h = _health_read(cfg)
         until = _paused_until(h)
-        if until and now > until + pause:
-            h = {}  # a pause that ended long ago (overnight): start over, and tell the user again
+        try:
+            last = max(until, float(h.get("last") or 0))
+        except (TypeError, ValueError):
+            last = until
+        if last and now > last + pause:
+            h, until = {}, 0.0  # old failures or a pause that ended long ago (overnight): start over, tell again
         if fail is None:
             if h.get("fails") or until:
                 _health_write(cfg, {})
             return None
-        reason, pause_now = fail
+        reason, pause_now, _ = fail
         fails = h["fails"] + 1 if isinstance(h.get("fails"), int) else 1
         if not pause_now and fails < ROUTER_FAILS_TO_PAUSE:
-            _health_write(cfg, {"fails": fails, "reason": reason})
+            _health_write(cfg, {"fails": fails, "reason": reason, "rejected": False, "last": now})
             return None
-        told = bool(h.get("paused_until")) and h.get("reason") == reason
-        _health_write(cfg, {"fails": fails, "reason": reason, "paused_until": now + pause})
+        # Same kind (can't reach vs rejected): "timed out" and "unreachable" alternating isn't news.
+        told = bool(until) and bool(h.get("rejected")) == pause_now
+        _health_write(cfg, {"fails": fails, "reason": reason, "rejected": pause_now, "last": now,
+                            "paused_until": now + pause})
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -852,8 +871,10 @@ def prompt_route(payload, cfg):
     worker.start()
     worker.join(PROMPT_ROUTE_DEADLINE)
     res = box.get("res")
-    # Prompts give the router less time than launches; their timeouts count only when launches wouldn't do better.
-    notice = record_router(cfg, res, count_timeouts=_num(cfg, "MODEL_PICKER_ROUTER_TIMEOUT", 3) <= PROMPT_ROUTE_DEADLINE)
+    # Prompts give the router less time than launches (2.5 s socket timeout, 3 s overall): failing to connect
+    # counts, running out of time after connecting only when launches wouldn't get more time.
+    notice = record_router(cfg, res, count_timeouts=_num(cfg, "MODEL_PICKER_ROUTER_TIMEOUT", 3) <= PROMPT_ROUTE_DEADLINE - 0.5
+                           and not cfg.get("MODEL_PICKER_ROUTER_API_KEY_CMD"))
     if notice:
         return notice
     if not isinstance(res, dict) or res.get("tier") not in TIERS:

@@ -1183,6 +1183,8 @@ def prompt_route(payload, cfg, now=None):
     except (OSError, ValueError):
         state = None
     pending = _break_pending(cfg, state, now)
+    # Any prompt (agent notifications and slash commands too: each runs a model turn) restarts the idle clock.
+    # If the state can't be written, every prompt looks like a session's first (the always behavior).
     line, answered = _prompt_route_call(payload, cfg) if pending else (None, False)
     try:
         _write_session_file(path, {"last": now, "pending": pending and not answered}, now)
@@ -1217,7 +1219,10 @@ def _prompt_route_call(payload, cfg):
     if notice:
         return notice, False
     if not isinstance(res, dict) or res.get("tier") not in TIERS:
-        return None, isinstance(res, dict)  # an answer the session can't use (e.g. local) still closes the break
+        # The router was reached and replied, just not usably (malformed, a tier it wasn't offered): that
+        # still closes the break, or a billed-but-unusable gateway would be called on every prompt.
+        # Connection failures, timeouts and rejections keep it open.
+        return None, isinstance(res, dict) or _failure(res) == "other"
     ms = int((time.monotonic() - started) * 1000)
     ledger.append(cfg, {"kind": "prompt", "session": payload.get("session_id"), "rec_tier": res["tier"],
                         "rec_effort": res.get("effort"), "source": res.get("source"), "confidence": res.get("confidence"),
@@ -1411,12 +1416,12 @@ def main():
     if mode == "off":
         return
     if event == "session":
+        handle_session(root, cfg)  # the rules first: break bookkeeping must never cost a session its guide
         try:
             start = json.loads(raw or "{}")
             mark_break(cfg, start.get("session_id") if isinstance(start, dict) else None)
-        except ValueError:
+        except Exception:
             pass
-        handle_session(root, cfg)
         return
     payload = json.loads(raw or "{}")
     if event == "subagentstop":

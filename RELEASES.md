@@ -2,9 +2,9 @@
 
 ## model-picker v0.5.0 (2026-11-17)
 
-- **The prompt line calls the router only at natural breaks.** With `MODEL_PICKER_PROMPT_ROUTE=1` the decisions API is called for a session's first prompt, the first after `/compact` or a resume, and the first after `MODEL_PICKER_PROMPT_ROUTE_IDLE` minutes (default 60) without a prompt, and not for mid-task prompts. Guide rule 7 says to switch the session model only at such breaks, so a mid-task pick was paid for and not acted on. In one working session the old behavior made 106 router calls, and the pick changed on 70 of 105 consecutive prompts. A break stays open until the router answers an eligible prompt, so a short reply, a slash command or a router failure doesn't use it up. `MODEL_PICKER_PROMPT_ROUTE=always` keeps the old every-prompt behavior. Launch routing is unchanged.
+- **The prompt line calls the router only at natural breaks.** With `MODEL_PICKER_PROMPT_ROUTE=1` the decisions API is called for a session's first prompt, the first after `/compact` or a resume, and the first after `MODEL_PICKER_PROMPT_ROUTE_IDLE` minutes (default 60) without a prompt, and not for mid-task prompts. Guide rule 7 says to switch the session model only at such breaks, so a mid-task pick was paid for and not acted on. In one working session the old behavior made 106 router calls, and the pick changed on 70 of 105 consecutive prompts. A break stays open until the router replies to an eligible prompt (an unusable reply also closes it), so a short reply, a slash command, a paused router or a connection failure doesn't use it up. `MODEL_PICKER_PROMPT_ROUTE=always` keeps the old every-prompt behavior. Launch routing is unchanged.
 - Break state is stored per session under `prompt-breaks/` in the state dir (a timestamp and a flag, no prompt text). It is removed after a day idle.
-- Tests: 333.
+- Tests: 338.
 
 ## model-picker v0.4.10 (2026-11-17)
 

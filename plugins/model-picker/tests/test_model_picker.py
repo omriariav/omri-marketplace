@@ -1066,6 +1066,9 @@ results += [
           "→ sonnet" in (prompt_hook("review PR 55 for bugs please", {**ON, **FL, **FAKE_ROUTER("sonnet", 0.4)}) or {}).get("systemMessage", "")),
 ]
 # 0.5.0: with PROMPT_ROUTE=1 the router is called only at natural breaks.
+import urllib.error  # noqa: E402
+DOWN_EARLY = {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_URL": "http://127.0.0.1:9",
+              "MODEL_PICKER_ROUTER_MODEL": "team/jev-latest", "MODEL_PICKER_ROUTER_API_KEY_ENV": "none"}
 cnt = Path(fresh_state()["MODEL_PICKER_STATE_DIR"]) / "calls.txt"
 counter = Path(cnt.parent) / "count.py"
 counter.write_text("import sys, json\nopen(%r, 'a').write('x')\nprint(json.dumps({'tier': 'sonnet', 'effort': 'medium', 'confidence': 0.9}))\n" % str(cnt))
@@ -1086,7 +1089,9 @@ st = json.loads(bf.read_text())
 bf.write_text(json.dumps({**st, "last": st["last"] - 3601}))
 after_idle = prompt_hook("start on the billing export feature", nb, session="s-nb")
 bf.write_text(json.dumps({**json.loads(bf.read_text()), "last": json.loads(bf.read_text())["last"] - 3601}))
+c_idle = calls()
 no_idle = prompt_hook("start on the billing export feature", {**nb, "MODEL_PICKER_PROMPT_ROUTE_IDLE": "0"}, session="s-nb")
+no_idle_calls = calls() - c_idle
 alw = {**nb, "MODEL_PICKER_PROMPT_ROUTE": "always"}
 c3 = calls()
 always = [prompt_hook("debug the flaky login test in CI", alw, session="s-alw") for _ in range(2)]
@@ -1094,6 +1099,38 @@ c4 = calls()
 down = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "false"}
 prompt_hook("debug the flaky login test in CI", down, session="s-down")
 pending_after_fail = json.loads(mp._session_file(down, "prompt-breaks", "s-down").read_text())["pending"]
+# A router that comes back after failing: the next eligible prompt is routed, then the break closes.
+recovered = prompt_hook("debug the flaky login test in CI", {**down, **FAKE_ROUTER("sonnet", 0.9)}, session="s-down")
+closed_after = prompt_hook("debug the flaky login test in CI", {**down, **FAKE_ROUTER("sonnet", 0.9)}, session="s-down")
+# An unusable reply (local, garbage) closes the break: never a billed call on every prompt.
+def _bad_reply_calls(body):
+    st = fresh_state()
+    c = Path(st["MODEL_PICKER_STATE_DIR"]) / "calls.txt"
+    sc = Path(st["MODEL_PICKER_STATE_DIR"]) / "bad.py"
+    sc.write_text("import sys\nopen(%r, 'a').write('x')\nprint(%r)\n" % (str(c), body))
+    env = {**st, "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": f"{sys.executable} {sc}"}
+    for _ in range(3):
+        prompt_hook("debug the flaky login test in CI", env, session="s-bad")
+    return len(c.read_text()) if c.exists() else 0
+bad_calls = [_bad_reply_calls(b) for b in ('{"tier": "local", "effort": "low", "confidence": 0.9}', "not json", '{"tier": "gpt"}')]
+# A paused router keeps the break open without calling it.
+pz = {**fresh_state(), **DOWN_EARLY, "MODEL_PICKER_PROMPT_ROUTE": "1"}
+for _ in range(3):
+    mp.record_router(pz, urllib.error.URLError(ConnectionRefusedError()), scope="prompt")
+prompt_hook("debug the flaky login test in CI", pz, session="s-pz")
+pz_pending = json.loads(mp._session_file(pz, "prompt-breaks", "s-pz").read_text())["pending"]
+# A corrupt state file counts as a break; mixed-case values.
+cf = mp._session_file(nb, "prompt-breaks", "s-corrupt")
+cf.parent.mkdir(parents=True, exist_ok=True)
+cf.write_bytes(b"\xff{not json")
+corrupt_routed = prompt_hook("debug the flaky login test in CI", nb, session="s-corrupt")
+modes = [mp._prompt_route_mode({"MODEL_PICKER_PROMPT_ROUTE": v}) for v in (" ALWAYS ", "true", True, "1", "0", "off", None)]
+mp.mark_break({**nb, "MODEL_PICKER_PROMPT_ROUTE": "always"}, "s-always-mark")
+# Resume keeps the idle clock (last) while marking the break.
+rs = mp._session_file(nb, "prompt-breaks", "s-nb")
+before_last = json.loads(rs.read_text())["last"]
+session_hook(nb, "s-nb", source="resume")
+resumed = json.loads(rs.read_text())
 results += [
     check("breaks: the session's first prompt is routed, a mid-task follow-up is not",
           bool(first) and second is None and c1 == 2),
@@ -1102,12 +1139,20 @@ results += [
     check("breaks: /compact (SessionStart) reopens the break, once",
           bool(after_compact) and again is None and c2 == 3),
     check("breaks: a prompt after an idle hour is routed", bool(after_idle)),
-    check("breaks: PROMPT_ROUTE_IDLE=0 turns the idle break off", no_idle is None),
+    check("breaks: PROMPT_ROUTE_IDLE=0 turns the idle break off", no_idle is None and no_idle_calls == 0),
     check("breaks: PROMPT_ROUTE=always routes every prompt", all(always) and c4 - c3 == 2),
-    check("breaks: a router failure keeps the break open", pending_after_fail is True),
+    check("breaks: a router failure keeps the break open for the next eligible prompt, which closes it",
+          pending_after_fail is True and bool(recovered) and closed_after is None),
+    check("breaks: an unusable reply (local, malformed, unknown tier) closes the break", bad_calls == [1, 1, 1]),
+    check("breaks: a paused router keeps the break open", pz_pending is True),
+    check("breaks: a corrupt state file counts as a break", bool(corrupt_routed)),
+    check("breaks: ALWAYS any case is always; other on values mean breaks",
+          modes == ["always", "breaks", "breaks", "breaks", None, None, None]),
     check("breaks: SessionStart writes nothing when the prompt line is off or always",
           (mp.mark_break({"MODEL_PICKER_STATE_DIR": str(cnt.parent)}, "s-off") or True)
-          and not mp._session_file(nb, "prompt-breaks", "s-off").exists()),
+          and not mp._session_file(nb, "prompt-breaks", "s-off").exists()
+          and not mp._session_file(nb, "prompt-breaks", "s-always-mark").exists()),
+    check("breaks: resume marks a break and keeps the idle clock", resumed == {"last": before_last, "pending": True}),
 ]
 
 capture = Path(pst["MODEL_PICKER_STATE_DIR"]) / "router-saw.json"

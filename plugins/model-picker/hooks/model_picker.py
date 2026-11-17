@@ -38,6 +38,7 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
                                  {"review": "opus"}; matched against the launch description and agent type
   MODEL_PICKER_PROMPT_ROUTE      0 (default) | 1   after each prompt, show the decisions API's raw pick for
                                  it (needs a router; the prompt's first 200 characters are sent)
+  MODEL_PICKER_ASK               1 (default) | 0   label launches that use the model the user named in the prompt
   MODEL_PICKER_ROUTER_PAUSE      minutes (default 10; 0 = never pause): after 3 router failures in a row
                                  (or one rejected request, e.g. HTTP 401), skip router calls for this long
 
@@ -727,82 +728,109 @@ def record_router(cfg, res, now=None, scope="launch"):
 
 
 # --- "you asked for": a model or effort the user named in their prompt -----------------------------------
+# Labels only. Claude reads the prompt itself and the guide tells it the user's ask wins; the hooks never steer
+# a launch from this guess, they only record and label a launch that used what the user asked for.
 ASK_TIERS = "haiku|sonnet|opus|fable"
 ASK_EFFORTS = "low|medium|high|xhigh|max"
-_ASK_TIER_RX = [
-    re.compile(r"\b(?:use|using|run|running|on|with|via|switch(?:ing)?\s+to|launch|spawn|pick|go\s+with|try)\s+"
-               r"(?:the\s+|a\s+|an\s+)?(?:claude[- ])?(" + ASK_TIERS + r")\b", re.I),
-    re.compile(r"\b(?:claude[- ])?(" + ASK_TIERS + r")(?:[- ]?\d(?:\.\d)?)?\s+(?:agents?|subagents?|model)\b", re.I),
-]
+_VERB = r"\b(?:use|run|launch|spawn|start|switch\s+to|go\s+with|try|pick|do)\b"
+_ASK_TIER_RX = re.compile(
+    _VERB + r"[^.;:!?\n]{0,30}?"
+    r"(?:\b(?:the|a|an)\s+(?:claude[- ])?(?P<t1>" + ASK_TIERS + r")(?:[- ]?\d(?:\.\d)?)?\s+(?:agents?|subagents?|model)\b(?!\s+(?:definition|file|config))"
+    r"|(?<![\w-])(?:claude[- ])?(?P<t2>" + ASK_TIERS + r")\b(?!\s+(?:poem|poems|about))(?![- ](?:agent\s+)?definition))", re.I)
 _ASK_EFFORT_RX = [
-    re.compile(r"\b(" + ASK_EFFORTS + r")[- ]effort\b", re.I),
-    re.compile(r"\beffort\s*(?:[:=]|of|at|to)?\s*(" + ASK_EFFORTS + r")\b", re.I),
+    re.compile(r"\b(?:use|run|at|with|on)\s+(" + ASK_EFFORTS + r")[- ]effort\b", re.I),
+    re.compile(r"\beffort\s*[:=]\s*(" + ASK_EFFORTS + r")\b", re.I),
+    re.compile(r"\bset\s+(?:the\s+)?effort\s+to\s+(" + ASK_EFFORTS + r")\b", re.I),
 ]
-_NEGATION = re.compile(r"\b(?:don'?t|do\s+not|not|never|no|avoid|instead\s+of|rather\s+than|without|except)\b[^.!?\n]{0,20}$",
-                       re.I)
+_NEGATION = re.compile(r"\b(?:don'?t|do\s+not|not|never|no|avoid|instead\s+of|rather\s+than|without|except)\b"
+                       r"[^.!?;,\n]{0,25}$", re.I)
+_QUOTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”", re.S)
+_ASK_ARTICLE_POEM = re.compile(r"\b(?:a|an|the)\s+$", re.I)
 ASK_TTL = 86400
 
 
-def _asked_values(text, patterns):
-    found = set()
-    for rx in patterns:
-        for m in rx.finditer(text):
-            if not _NEGATION.search(text[max(0, m.start() - 40):m.start()]):
-                found.add(m.group(1).lower())
-    return found
+def _ask_text_body(prompt):
+    """The parts of a prompt a person wrote as an instruction: no code, quotes, quoted lines or pasted
+    model-picker output, and no questions."""
+    text = _QUOTED.sub(" ", str(prompt or "")[:4000])
+    lines = [ln for ln in text.splitlines()
+             if not re.match(r"\s*(?:>|\[?model-picker\b|\$ )", ln, re.I)]
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", "\n".join(lines))
+    return "\n".join(x for x in sentences if not x.rstrip().endswith("?"))[:2000]
 
 
 def detect_ask(prompt):
-    """{"tier", "effort"} the user asked for in this prompt, or None. Labels only, never routing: a wrong
-    guess changes a stamp, not a model. Two different models (or efforts) named means no pick."""
-    text = str(prompt or "")[:2000]
-    tiers, efforts = _asked_values(text, _ASK_TIER_RX), _asked_values(text, _ASK_EFFORT_RX)
+    """{"tier", "effort"} the user asked for in this prompt, or None. Narrow on purpose (an imperative verb
+    before the model; "<level> effort" after use/run/at/with/on, "effort: <level>", "set effort to <level>");
+    negations, questions, code and quotes are skipped; two different models (or efforts) named means no pick."""
+    text = _ask_text_body(prompt)
+    tiers, efforts = set(), set()
+    for m in _ASK_TIER_RX.finditer(text):
+        tier = (m.group("t1") or m.group("t2")).lower()
+        start = m.start("t1") if m.group("t1") else m.start("t2")
+        if m.group("t2") and _ASK_ARTICLE_POEM.search(text[max(0, start - 6):start]):
+            continue  # "try a haiku", "pick a sonnet": a poem, not a model (models with an article need "agent"/"model")
+        if not _NEGATION.search(text[max(0, start - 45):start]):
+            tiers.add(tier)
+    for rx in _ASK_EFFORT_RX:
+        for m in rx.finditer(text):
+            if not _NEGATION.search(text[max(0, m.start() - 45):m.start()]):
+                efforts.add(m.group(1).lower())
     ask = {"tier": tiers.pop() if len(tiers) == 1 else None, "effort": efforts.pop() if len(efforts) == 1 else None}
     return ask if ask["tier"] or ask["effort"] else None
 
 
-def _ask_path(cfg):
-    return ledger.state_dir(cfg) / "asked.json"
+def _asks_enabled(cfg):
+    return _enabled(cfg, "MODEL_PICKER_ASK", default=True) and ledger.logging_enabled(cfg)
 
 
-def _asks_read(cfg):
-    try:
-        data = json.loads(_ask_path(cfg).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+def _ask_file(cfg, session):
+    return ledger.state_dir(cfg) / "asked" / (hashlib.sha256(str(session).encode()).hexdigest()[:24] + ".json")
 
 
 def remember_ask(cfg, session, ask, now=None):
-    """Keep this turn's ask for the session's launches until the next prompt (an ask-free prompt clears it)."""
-    if not session:
+    """Keep this turn's ask for the session's launches until the next prompt. One small file per session (no
+    cross-session lost updates); files older than a day are removed."""
+    if not session or not _asks_enabled(cfg):
         return
     now = now or time.time()
-    data = {k: v for k, v in _asks_read(cfg).items() if isinstance(v, dict) and now - _num_field(v, "ts") < ASK_TTL}
-    if ask:
-        data[str(session)] = {**ask, "ts": now}
-    elif str(session) not in data:
-        return
-    else:
-        data.pop(str(session))
-    tmp = None
+    path = _ask_file(cfg, session)
     try:
-        path = _ask_path(cfg)
+        if not ask:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".asked.", suffix=".tmp", dir=path.parent)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-        os.replace(tmp, path)
-    except OSError:
-        if tmp:
+        for old in path.parent.glob("*.json"):
+            try:
+                if now - old.stat().st_mtime > ASK_TTL:
+                    old.unlink()
+            except OSError:
+                pass
+        fd, tmp = tempfile.mkstemp(prefix=".ask.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({**ask, "ts": now}, fh)
+            os.replace(tmp, path)
+        except BaseException:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+            raise
+    except OSError:
+        pass
 
 
 def current_ask(cfg, session, now=None):
-    ask = _asks_read(cfg).get(str(session)) if session else None
+    if not session or not _asks_enabled(cfg):
+        return None
+    try:
+        ask = json.loads(_ask_file(cfg, session).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
     if not isinstance(ask, dict) or (now or time.time()) - _num_field(ask, "ts") >= ASK_TTL:
         return None
     tier = ask.get("tier") if ask.get("tier") in CLAUDE_TIERS else None
@@ -892,11 +920,12 @@ def handle_agent(payload, mode, cfg):
     session_model = ledger.last_model(payload.get("transcript_path"))
     outcome = ("denied" if mode == "enforce" and (not model or chosen_unavailable)
                else "explicit" if model else "missing")
-    # The user named a model or effort in their prompt: their call, not a deviation from the recommendation.
+    # The user named a model in their prompt and this launch used it: their call, not a deviation from the
+    # recommendation (an omitted effort doesn't count against it). Labels only: nothing here steers a launch.
     ask = current_ask(cfg, payload.get("session_id"))
     launch_effort = inp.get("effort") if isinstance(inp.get("effort"), str) else None
-    honored = bool(ask) and bool(model) and (not ask["tier"] or tier_of(model) == ask["tier"]) and (
-        not ask["effort"] or launch_effort == ask["effort"])
+    honored = bool(ask and ask["tier"]) and bool(model) and tier_of(model) == ask["tier"] and (
+        not ask["effort"] or not launch_effort or launch_effort == ask["effort"])
     log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,
                  pinned=pinned, user_pick=ask if honored else None)
     note = "\n".join(n for n in (rec.get("notice"), verbose_note(cfg, label, model, rec)) if n) or None
@@ -910,11 +939,7 @@ def handle_agent(payload, mode, cfg):
             else:
                 emit(context=msg, system=note)
             return
-        if ask and not honored:
-            emit(context=f"model-picker: the user asked for {ask_text(ask)} in their last message; `{label}` was "
-                         f"launched on {chosen or model}{f' at {launch_effort} effort' if launch_effort else ''}. "
-                         "Use what the user asked for unless they said otherwise.", system=note)
-        elif honored:
+        if honored:
             emit(system=note)
         elif chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
             emit(context=f"model-picker: `{label}` launched on {chosen}, but the task reads as "
@@ -924,9 +949,6 @@ def handle_agent(payload, mode, cfg):
             emit(system=note)
         return
 
-    if ask and ask["tier"]:
-        rec = {**rec, "tier": ask["tier"], "effort": ask["effort"] or rec["effort"],
-               "reason": "the user asked for it in their last message", "source": "user"}
     if mode == "enforce":
         emit("deny", f"model-picker: launch `{label}` with an explicit `model`. Recommended: {describe(rec, cfg)}. "
                      "Re-issue the same call with that model, or pick another tier if you have a reason.", system=note)
@@ -1066,16 +1088,17 @@ def handle_prompt(payload, cfg):
     shown, context = [], None
     ask = None
     try:
-        prompt = _human_prompt(payload)
-        if prompt is not None:
-            ask = detect_ask(prompt)
+        raw = str(payload.get("prompt") or "").lstrip()
+        if not raw.startswith("<task-notification"):  # an agent finishing isn't a new request: keep the ask
+            prompt = _human_prompt(payload)
+            ask = detect_ask(prompt) if prompt is not None else None  # slash commands, shell lines: clear it
             remember_ask(cfg, payload.get("session_id"), ask)
     except Exception:
         pass
     try:
         line = prompt_route(payload, cfg)
-        if ask and _enabled(cfg, "MODEL_PICKER_PROMPT_ROUTE", default=False):
-            line = (line or "model-picker:") + f" · you asked for {ask_text(ask)}"
+        if ask and line and " → " in line:  # on the router's pick line only, never on a pause notice
+            line += f" · you asked for {ask_text(ask)}"
         if line:
             shown.append(line)
     except Exception:

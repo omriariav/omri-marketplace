@@ -158,12 +158,11 @@ Tests: `python3 plugins/model-picker/tests/test_model_picker.py`. Requires `pyth
 
 ## You asked for it
 
-When your prompt names a model or effort (`run the search on haiku`, `use opus at high effort`, `spawn a sonnet agent`), model-picker treats it as your call for the launches in that turn:
+When your prompt names a model or effort (`run the search on haiku`, `use opus at high effort`, `spawn a sonnet agent`), Claude reads it and the guide tells it your ask beats the recommendation. model-picker only labels the result; it never steers a launch from its own reading of your prompt:
 
-- The guide tells Claude to use what you asked for; it overrides the recommendation.
-- A launch on what you asked for gets no advice, and its stamp ends `· your call (opus/high effort); gpt-6-luna said sonnet/medium`. A launch on something else, or with no model, is reminded what you asked for.
+- A launch on the model you asked for gets no advice, and its stamp ends `· your call (opus/high effort); gpt-6-luna said sonnet/medium`.
 - The report lists those launches as your picks: they leave the follow rate, and their savings are listed under you, not credited to model-picker.
-- With `MODEL_PICKER_PROMPT_ROUTE=1` the prompt line ends `· you asked for opus`.
+- With `MODEL_PICKER_PROMPT_ROUTE=1` the router's line ends `· you asked for opus`.
+- Launches on anything else are judged as usual. An ask that names only an effort is shown on the prompt line but doesn't mark launches.
 
-Detection is deliberately narrow (a model name after a verb like use/run/on/with, or before agent/model; `<level> effort`), ignores negations (`don't use opus`, `instead of opus`), and gives up when two models are named. It only labels: it never changes which model runs. The pick lasts until your next prompt; agent notifications don't clear it. It is stored per session in `asked.json` in the state dir (no prompt text).
-
+Detection is deliberately narrow: a model after an imperative verb (use, run, launch, spawn, switch to, try, pick), or `a/the <model> agent`; `<level> effort` after use/run/at/with/on, `effort: <level>`, `set effort to <level>`. It skips questions, negations (`don't use opus`), code, quotes, quoted lines and pasted model-picker output, and gives up when two models are named. The ask lasts until your next prompt; agent notifications keep it, slash commands clear it. It is stored per session under `asked/` in the state dir (model and effort only, no prompt text), and not at all with `MODEL_PICKER_ASK=0` or `MODEL_PICKER_LOG=0`.

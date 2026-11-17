@@ -1459,16 +1459,65 @@ rep_ask = ledger.report(lst, "all")
 results += [
     check("ask: a launch on the asked model and effort gets no advice and is logged as your pick",
           (ok_launch or {}).get("hookSpecificOutput") is None and honored_rec.get("user_pick") == {"tier": "opus", "effort": "high"}),
-    check("ask: a launch on another model is told what the user asked for",
-          "the user asked for opus/high effort" in json.dumps(off_launch)),
-    check("ask: a launch with no model is told to use the asked model",
-          "`opus`, effort high" in json.dumps(none_launch) and "asked for it" in json.dumps(none_launch)),
+    check("ask: labels only: a launch on another model isn't steered toward the ask",
+          "asked" not in json.dumps(off_launch) and "opus" not in json.dumps(off_launch)),
+    check("ask: labels only: a no-model launch gets the router's recommendation, not the ask",
+          "`haiku`" in json.dumps(none_launch) and "asked" not in json.dumps(none_launch)),
     check("ask: your picks leave the follow rate and are counted separately",
           rep_ask["user_picks"] == 1 and rep_ask["compared"] == 1 and "1 more used the model you asked for" in ledger.format_report(rep_ask)),
     check("ask: savings on your picks are yours, not model-picker's",
           ledger.attribute({**honored_rec}) == "user"),
     check("ask: the stamp says it was your call and what the router said",
           ledger.stamp_verdict(honored_rec, "high").startswith(" · your call (opus/high effort); command router said haiku")),
+]
+
+# v0.4.9 review: false positives from realistic prompts.
+NOT_ASKS = [
+    "is it running on opus?", "why did the subagent run on opus instead of haiku?", "I'm on opus right now and it's slow",
+    "the opus model is too pricey", "try a haiku for the release notes", "use a haiku as the epigraph",
+    "pick a sonnet from the anthology", "fix the bug with fable characters", "use the opus agent definition",
+    "a low-effort fix", "this is a high effort change", "put max effort into this", "the effort to high-quality docs",
+    "model-picker: `Explore` launched on opus, but the task reads as `haiku`, effort low.",
+    "[model-picker] general-purpose ran on claude-opus-5-5 · your call (opus/high effort)",
+    "see this:\n```\nclaude --model opus -p 'run on haiku'\n```",
+    "> use opus for everything\nwhat do you think of that quote",
+]
+misfires = [p for p in NOT_ASKS if da(p) is not None]
+results += [
+    check(f"ask: no pick from questions, poems, prose, pasted output and code ({len(NOT_ASKS)} cases)", not misfires),
+    check("ask: negation stays in its clause",
+          da("no, run it on haiku") == {"tier": "haiku", "effort": None}
+          and da("Don't use opus; use sonnet") == {"tier": "sonnet", "effort": None}),
+    check("ask: effort forms", da("run it with high effort") == {"tier": None, "effort": "high"}
+          and da("effort: low") == {"tier": None, "effort": "low"} and da("set effort to max") == {"tier": None, "effort": "max"}),
+]
+# Effort-only asks never mark a launch as the user's pick.
+eo = {**fresh_state(), **FAKE_ROUTER("haiku", 0.9), "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+mp.remember_ask(eo, "S2", {"tier": None, "effort": "low"})
+eo_out = run({**agent(description="find the config file", prompt="p", model="fable", effort="low"), "session_id": "S2",
+              "tool_use_id": "t-eo"}, "advise", eo)
+eo_dec = next((r for r in ledger.read(eo) if r.get("kind") == "decision"), {})
+results.append(check("ask: an effort-only ask is not a model pick (normal verdict and advice stay)",
+                     not eo_dec.get("user_pick") and "reads as" in json.dumps(eo_out)))
+# Clearing: slash commands and pasted markup clear the ask; notifications keep it; MODEL_PICKER_ASK=0 and LOG=0 turn it off.
+cl = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", **FAKE_ROUTER("sonnet", 0.82)}
+prompt_hook("use opus for the review please", cl)
+prompt_hook("/code-review high", cl)
+after_slash = mp.current_ask(cl, "s-prompt")
+prompt_hook("use opus for the review please", cl)
+prompt_hook("<div>pasted html here</div>", cl)
+after_html = mp.current_ask(cl, "s-prompt")
+off_ask = {**fresh_state(), "MODEL_PICKER_ASK": "0"}
+mp.remember_ask(off_ask, "S3", {"tier": "opus", "effort": None})
+nolog = {**fresh_state(), "MODEL_PICKER_LOG": "0"}
+mp.remember_ask(nolog, "S3", {"tier": "opus", "effort": None})
+short = prompt_hook("use opus", {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", **FAKE_ROUTER("sonnet", 0.82)})
+results += [
+    check("ask: slash commands and pasted markup clear the ask", after_slash is None and after_html is None),
+    check("ask: MODEL_PICKER_ASK=0 and MODEL_PICKER_LOG=0 store nothing",
+          mp.current_ask(off_ask, "S3") is None and not (Path(off_ask["MODEL_PICKER_STATE_DIR"]) / "asked").exists()
+          and mp.current_ask(nolog, "S3") is None),
+    check("ask: no bare 'you asked for' line when the router didn't answer (2-word prompt)", short is None),
 ]
 
 print(f"\n{sum(results)}/{len(results)} passed")

@@ -1271,6 +1271,54 @@ results += [
     check("unavailable label: a router that answered unsure is not labeled", "unavailable" not in json.dumps(lu)),
 ]
 
+# 0.5.1 review: the prompt label shows once per break, not on every prompt of an outage.
+once = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "command",
+        "MODEL_PICKER_ROUTER_CMD": "false", "MODEL_PICKER_ROUTER_PAUSE": "0"}
+o = [prompt_hook("debug the flaky login test in CI", once, session="s-once") for _ in range(3)]
+session_hook(once, "s-once")
+o_compact = prompt_hook("debug the flaky login test in CI", once, session="s-once")
+of = mp._session_file(once, "prompt-breaks", "s-once")
+of.write_text(json.dumps({**json.loads(of.read_text()), "last": time.time() - 3601}))
+o_idle = prompt_hook("debug the flaky login test in CI", once, session="s-once")
+o_still = json.loads(of.read_text())
+o_alw = [prompt_hook("debug the flaky login test in CI", {**once, "MODEL_PICKER_PROMPT_ROUTE": "always"}, session="s-once-a")
+         for _ in range(2)]
+o_back = prompt_hook("debug the flaky login test in CI", {**once, **FAKE_ROUTER("sonnet", 0.9)}, session="s-once")
+o_closed = json.loads(of.read_text())
+LBL = "model-picker: command router unavailable (command exit 1)"
+asked = prompt_hook("use opus to debug the flaky login test", {**once, "MODEL_PICKER_ROUTER_PAUSE": "0"})
+# A missing key: labeled on launches and prompts, and the prompt break stays open (nothing was asked).
+nokey = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "openai-decisions",
+         "MODEL_PICKER_ROUTER_MODEL": "team/jev-latest", "MODEL_PICKER_ROUTER_API_KEY_ENV": "MP_TEST_NO_SUCH_KEY"}
+nk_launch = run(agent(description="debug the flaky login test", prompt="p"), "advise", nokey)
+nk_prompt = prompt_hook("debug the flaky login test in CI", nokey, session="s-nokey")
+nk_pending = json.loads(mp._session_file(nokey, "prompt-breaks", "s-nokey").read_text())["pending"]
+# Launches that answered badly, or never asked the router, get no label.
+bad_launch = run(agent(description="debug the flaky login test", prompt="p"), "advise",
+                 {**fresh_state(), "MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "echo nope"})
+explore_down = run(agent(description="find where the parser lives", prompt="p", subagent_type="Explore"), "advise",
+                   {**fresh_state(), **DOWN})
+explicit_down = run(agent(description="debug the flaky login test", prompt="p", model="opus"), "advise",
+                    {**fresh_state(), **DOWN, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "0"})
+results += [
+    check("unavailable label: once per break with PROMPT_ROUTE=1, not on every prompt",
+          (o[0] or {}).get("systemMessage") == LBL and o[1] is None and o[2] is None),
+    check("unavailable label: a new break (compact) or an idle gap says it again",
+          (o_compact or {}).get("systemMessage") == LBL and (o_idle or {}).get("systemMessage") == LBL
+          and o_still["pending"] is True and o_still["labeled"] is True),
+    check("unavailable label: PROMPT_ROUTE=always labels every prompt",
+          all((x or {}).get("systemMessage") == LBL for x in o_alw)),
+    check("unavailable label: when the router is back the pick shows and the break closes",
+          "→ sonnet" in (o_back or {}).get("systemMessage", "") and o_closed == {**o_closed, "pending": False, "labeled": False}),
+    check("unavailable label: 'you asked for' is never appended to it", (asked or {}).get("systemMessage") == LBL),
+    check("unavailable label: a missing API key is labeled on launches and prompts and keeps the break open",
+          (nk_launch or {}).get("systemMessage") == "model-picker: jev-latest unavailable (no API key); keyword rules used"
+          and (nk_prompt or {}).get("systemMessage") == "model-picker: jev-latest unavailable (no API key)"
+          and nk_pending is True),
+    check("unavailable label: none on a launch the router answered badly, or that never asked it",
+          all("unavailable" not in json.dumps(x) for x in (bad_launch, explore_down, explicit_down))),
+]
+
 # Review round 1 of v0.4.7.
 import socket  # noqa: E402
 

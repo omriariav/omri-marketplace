@@ -2,8 +2,9 @@
 
 ## model-picker v0.5.1 (2026-11-18)
 
-- **A label when the router can't be used.** If the decisions API can't be reached or refuses the call (a gateway behind a VPN that is off, a timeout, an HTTP error) or is paused after failing, a launch shows `model-picker: gpt-6-luna unavailable (timed out); keyword rules used`, and a prompt that would have been routed shows `model-picker: gpt-6-luna unavailable (unreachable, paused)`. Before, a failed call showed nothing until the third failure started a pause, and nothing during the pause, so a missing pick looked like a skipped one. The line that starts a pause still replaces the label. A router that answered, even unsure or unusably, gets no label. With `MODEL_PICKER_PROMPT_ROUTE=1` the prompt label appears only at a natural break, which stays open until the router answers.
-- Tests: 341.
+- **A label when the router can't be used.** If the decisions API can't be reached or refuses the call (a gateway behind a VPN that is off, a timeout, an HTTP error), has no API key, or is paused after failing, a launch shows `model-picker: gpt-6-luna unavailable (timed out); keyword rules used`, and a prompt that would have been routed shows `model-picker: gpt-6-luna unavailable (unreachable, paused)`. Before, a failed call showed nothing until the third failure started a pause, and nothing during the pause, so a missing pick looked like a skipped one. The line that starts a pause still replaces the label. A router that answered, even unsure or unusably, gets no label. With `MODEL_PICKER_PROMPT_ROUTE=1` the prompt label shows once per natural break (the break stays open until the router answers, so mid-task prompts stay quiet); with `always`, on every prompt.
+- A missing API key now keeps a prompt break open, like a connection failure, instead of closing it as if the router had answered.
+- Tests: 348.
 
 ## model-picker v0.5.0 (2026-11-17)
 

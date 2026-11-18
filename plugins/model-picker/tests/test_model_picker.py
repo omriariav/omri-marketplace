@@ -1058,10 +1058,14 @@ results += [
     check("prompt route: line format", bool(shown) and re.search(r"model-picker: command router → sonnet/medium \(0\.82, \d+ ms\)$", shown["systemMessage"])),
     check("prompt route: skips slash commands, notifications and short replies",
           all(prompt_hook(p, ON) is None for p in ("/model-picker:report 7d", "<task-notification>done</task-notification>", "ok merge"))),
-    check("prompt route: nothing shown when the router fails or none is configured",
-          prompt_hook("debug the flaky login test in CI", {**ON, "MODEL_PICKER_ROUTER": "command",
-                                                           "MODEL_PICKER_ROUTER_CMD": "false"}) is None
+    check("prompt route: a failing router is labeled unavailable; nothing shown when none is configured",
+          (prompt_hook("debug the flaky login test in CI", {**ON, "MODEL_PICKER_ROUTER": "command",
+                                                            "MODEL_PICKER_ROUTER_CMD": "false"}) or {}).get("systemMessage")
+          == "model-picker: command router unavailable (command exit 1)"
           and prompt_hook("debug the flaky login test in CI", ON) is None),
+    check("prompt route: a bad answer (router up) is not labeled unavailable",
+          prompt_hook("debug the flaky login test in CI", {**ON, "MODEL_PICKER_ROUTER": "command",
+                                                           "MODEL_PICKER_ROUTER_CMD": "echo nope"}) is None),
     check("prompt route: shows the router's raw pick, not floors",
           "→ sonnet" in (prompt_hook("review PR 55 for bugs please", {**ON, **FL, **FAKE_ROUTER("sonnet", 0.4)}) or {}).get("systemMessage", "")),
 ]
@@ -1248,10 +1252,71 @@ fails_after = mp._health_read(est).get("fails")
 l5 = run(agent(description="debug the flaky login test", prompt="p"), "advise", est)
 results += [
     check("pause e2e: prompts and launches share the count; the third failure tells the user",
-          p1 is None and p2 is None and "failed 3× in a row (unreachable)" in (l3 or {}).get("systemMessage", "")),
-    check("pause e2e: while paused a prompt shows nothing and calls no router", p4 is None and fails_after == 3),
-    check("pause e2e: while paused a launch still gets a recommendation, no repeat notice",
-          "router paused: unreachable" in json.dumps(l5) and "systemMessage" not in (l5 or {})),
+          all((p or {}).get("systemMessage") == "model-picker: jev-latest unavailable (unreachable)" for p in (p1, p2))
+          and "failed 3× in a row (unreachable)" in (l3 or {}).get("systemMessage", "")
+          and "unavailable" not in (l3 or {}).get("systemMessage", "")),  # the notice replaces the label
+    check("pause e2e: while paused a prompt is labeled and calls no router",
+          (p4 or {}).get("systemMessage") == "model-picker: jev-latest unavailable (unreachable, paused)" and fails_after == 3),
+    check("pause e2e: while paused a launch still gets a recommendation and a short label, no repeat notice",
+          "router paused: unreachable" in json.dumps(l5) and (l5 or {}).get("systemMessage")
+          == "model-picker: jev-latest unavailable (unreachable, paused); keyword rules used"),
+]
+
+# A launch whose router call fails gets a label before any pause starts; an unsure router (it answered) gets none.
+lf = run(agent(description="debug the flaky login test", prompt="p"), "advise", {**fresh_state(), **DOWN})
+lu = run(agent(description="debug the flaky login test", prompt="p"), "advise", {**fresh_state(), **FAKE_ROUTER("haiku", 0.2)})
+results += [
+    check("unavailable label: a launch that can't reach the router says so",
+          (lf or {}).get("systemMessage") == "model-picker: jev-latest unavailable (unreachable); keyword rules used"),
+    check("unavailable label: a router that answered unsure is not labeled", "unavailable" not in json.dumps(lu)),
+]
+
+# 0.5.1 review: the prompt label shows once per break, not on every prompt of an outage.
+once = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "command",
+        "MODEL_PICKER_ROUTER_CMD": "false", "MODEL_PICKER_ROUTER_PAUSE": "0"}
+o = [prompt_hook("debug the flaky login test in CI", once, session="s-once") for _ in range(3)]
+session_hook(once, "s-once")
+o_compact = prompt_hook("debug the flaky login test in CI", once, session="s-once")
+of = mp._session_file(once, "prompt-breaks", "s-once")
+of.write_text(json.dumps({**json.loads(of.read_text()), "last": time.time() - 3601}))
+o_idle = prompt_hook("debug the flaky login test in CI", once, session="s-once")
+o_still = json.loads(of.read_text())
+o_alw = [prompt_hook("debug the flaky login test in CI", {**once, "MODEL_PICKER_PROMPT_ROUTE": "always"}, session="s-once-a")
+         for _ in range(2)]
+o_back = prompt_hook("debug the flaky login test in CI", {**once, **FAKE_ROUTER("sonnet", 0.9)}, session="s-once")
+o_closed = json.loads(of.read_text())
+LBL = "model-picker: command router unavailable (command exit 1)"
+asked = prompt_hook("use opus to debug the flaky login test", {**once, "MODEL_PICKER_ROUTER_PAUSE": "0"})
+# A missing key: labeled on launches and prompts, and the prompt break stays open (nothing was asked).
+nokey = {**fresh_state(), "MODEL_PICKER_PROMPT_ROUTE": "1", "MODEL_PICKER_ROUTER": "openai-decisions",
+         "MODEL_PICKER_ROUTER_MODEL": "team/jev-latest", "MODEL_PICKER_ROUTER_API_KEY_ENV": "MP_TEST_NO_SUCH_KEY"}
+nk_launch = run(agent(description="debug the flaky login test", prompt="p"), "advise", nokey)
+nk_prompt = prompt_hook("debug the flaky login test in CI", nokey, session="s-nokey")
+nk_pending = json.loads(mp._session_file(nokey, "prompt-breaks", "s-nokey").read_text())["pending"]
+# Launches that answered badly, or never asked the router, get no label.
+bad_launch = run(agent(description="debug the flaky login test", prompt="p"), "advise",
+                 {**fresh_state(), "MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "echo nope"})
+explore_down = run(agent(description="find where the parser lives", prompt="p", subagent_type="Explore"), "advise",
+                   {**fresh_state(), **DOWN})
+explicit_down = run(agent(description="debug the flaky login test", prompt="p", model="opus"), "advise",
+                    {**fresh_state(), **DOWN, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "0"})
+results += [
+    check("unavailable label: once per break with PROMPT_ROUTE=1, not on every prompt",
+          (o[0] or {}).get("systemMessage") == LBL and o[1] is None and o[2] is None),
+    check("unavailable label: a new break (compact) or an idle gap says it again",
+          (o_compact or {}).get("systemMessage") == LBL and (o_idle or {}).get("systemMessage") == LBL
+          and o_still["pending"] is True and o_still["labeled"] is True),
+    check("unavailable label: PROMPT_ROUTE=always labels every prompt",
+          all((x or {}).get("systemMessage") == LBL for x in o_alw)),
+    check("unavailable label: when the router is back the pick shows and the break closes",
+          "→ sonnet" in (o_back or {}).get("systemMessage", "") and o_closed == {**o_closed, "pending": False, "labeled": False}),
+    check("unavailable label: 'you asked for' is never appended to it", (asked or {}).get("systemMessage") == LBL),
+    check("unavailable label: a missing API key is labeled on launches and prompts and keeps the break open",
+          (nk_launch or {}).get("systemMessage") == "model-picker: jev-latest unavailable (no API key); keyword rules used"
+          and (nk_prompt or {}).get("systemMessage") == "model-picker: jev-latest unavailable (no API key)"
+          and nk_pending is True),
+    check("unavailable label: none on a launch the router answered badly, or that never asked it",
+          all("unavailable" not in json.dumps(x) for x in (bad_launch, explore_down, explicit_down))),
 ]
 
 # Review round 1 of v0.4.7.
@@ -1341,7 +1406,8 @@ for _ in range(3):
     mp.record_router(cp, urllib.error.URLError(ConnectionRefusedError()), scope="prompt")
 results += [
     check("pause: a router slower than the prompt budget (2.7 s) pauses only the prompt line; launches still use it",
-          not any(slow_prompts[:2]) and "prompt line is paused" in (slow_prompts[2] or {}).get("systemMessage", "")
+          all((p or {}).get("systemMessage") == "model-picker: command router unavailable (timed out)"
+              for p in slow_prompts[:2]) and "prompt line is paused" in (slow_prompts[2] or {}).get("systemMessage", "")
           and mp.router_paused(pp) is None and mp.router_paused(pp, scope="prompt") == "timed out"
           and launch_src == "command (1.00)"),
     check("pause: on the prompt path, failing to connect pauses everything", mp.router_paused(cp) == "unreachable"),

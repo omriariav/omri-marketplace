@@ -484,6 +484,7 @@ def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
     paused = router_paused(cfg)
     if paused:
         fallback["source"] = f"heuristic (router paused: {paused})"
+        fallback["unavailable"] = f"{paused}, paused"
         return fallback
     box = {}
     worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, local)), daemon=True)
@@ -495,6 +496,9 @@ def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
     notice = record_router(cfg, res) if track else None
     if notice:
         fallback["notice"] = notice
+    why = _unavailable(res)
+    if why:  # a bad or unsure answer means it is up: no label
+        fallback["unavailable"] = why
     if res is None:
         fallback["source"] = "heuristic (router timed out)"
     elif isinstance(res, Exception):
@@ -506,6 +510,19 @@ def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
                 "source": f"{res['source']} ({res['confidence']:.2f})", "confidence": res["confidence"],
                 "router_ms": fallback["router_ms"], "unsure": False}
     return fallback
+
+
+class NoApiKey(ValueError):
+    """The router needs a key and none was found: it can't be used, but a retry costs nothing (no pause)."""
+
+
+def _unavailable(res):
+    """Why the router couldn't be used for this call (unreachable, refused, timed out, no key), or None when it
+    answered, even unsure or unusably."""
+    fail = _failure(res)
+    if isinstance(fail, tuple):
+        return fail[0]
+    return "no API key" if isinstance(res, NoApiKey) else None
 
 
 def _route(router, name, inp, cfg, local):
@@ -523,7 +540,7 @@ def _route(router, name, inp, cfg, local):
             if not key and cfg.get("MODEL_PICKER_ROUTER_API_KEY_CMD"):
                 key = routers.run_shell(cfg["MODEL_PICKER_ROUTER_API_KEY_CMD"], min(rcfg["_timeout"], 2)).strip()
             if not key:
-                raise ValueError("no API key")
+                raise NoApiKey("no API key")
             rcfg["_api_key"] = key
         tiers = [t for t in available_tiers(cfg) if local or t != "local"]
         return router(task_text(inp, cfg), tiers, rcfg)
@@ -556,6 +573,12 @@ def _router_label(cfg):
     name = str(cfg.get("MODEL_PICKER_ROUTER") or "heuristic").lower()
     model = cfg.get("MODEL_PICKER_ROUTER_MODEL")
     return str(model).split("/")[-1] if model and name != "command" else f"{name} router"
+
+
+def unavailable_label(cfg, why, fallback=True):
+    """One line saying the router couldn't be used, so the user knows its pick is missing, not skipped."""
+    tail = "; keyword rules used" if fallback else ""
+    return f"model-picker: {_router_label(cfg)} unavailable ({why}){tail}"
 
 
 def _pause_seconds(cfg):
@@ -708,7 +731,7 @@ def record_router(cfg, res, now=None, scope="launch"):
     Three counts per router, each "in a row" for what it measures:
     - main: connection failures and rejections from either hook; pauses every router call; any answer clears it.
     - prompt_: every prompt failure, timeouts included (prompts get only 3 s); pauses only the prompt line,
-      which shows nothing on a failure anyway; a prompt answer clears it.
+      which shows a one-line label on a failure anyway; a prompt answer clears it.
     - launch_: every launch failure; pauses only launches; a launch answer clears it (a short prompt answering
       in time says nothing about a long launch input).
     A retry that fails right after a pause, for the same kind of reason, pauses again quietly (the user was told)."""
@@ -1014,7 +1037,9 @@ def handle_agent(payload, mode, cfg):
     user_pick = {"tier": ask["tier"], "effort": ask["effort"] if launch_effort == ask["effort"] else None} if honored else None
     log_decision(cfg, payload, inp, outcome, chosen=model or session_model, rec=rec, session_model=session_model,
                  pinned=pinned, user_pick=user_pick)
-    note = "\n".join(n for n in (rec.get("notice"), verbose_note(cfg, label, model, rec)) if n) or None
+    # The pause notice already says the router is down; otherwise a short label does.
+    down = rec.get("notice") or (unavailable_label(cfg, rec["unavailable"]) if rec.get("unavailable") else None)
+    note = "\n".join(n for n in (down, verbose_note(cfg, label, model, rec)) if n) or None
     if model:
         chosen = tier_of(model)
         if chosen and chosen not in available_tiers(cfg):
@@ -1157,6 +1182,11 @@ def _break_pending(cfg, state, now):
     break hasn't been answered yet, or the first after MODEL_PICKER_PROMPT_ROUTE_IDLE minutes without a prompt."""
     if not isinstance(state, dict) or state.get("pending") is not False:
         return True
+    return _idle_gap(cfg, state, now)
+
+
+def _idle_gap(cfg, state, now):
+    """MODEL_PICKER_PROMPT_ROUTE_IDLE minutes or more passed since the session's last prompt."""
     try:
         idle = _num(cfg, "MODEL_PICKER_PROMPT_ROUTE_IDLE", 60) * 60
     except (TypeError, ValueError):
@@ -1169,7 +1199,8 @@ def prompt_route(payload, cfg, now=None):
 
     With 1, only at natural breaks, where switching the session model is cheap (guide rule 7): mid-task
     prompts are never sent, so the router isn't paid for picks nobody would act on. A break stays open
-    until the router answers an eligible prompt. With always, every eligible prompt."""
+    until the router answers an eligible prompt; if it can't be used, the "unavailable" label shows once per
+    break (the line that starts a pause always shows). With always, every eligible prompt, labels included."""
     mode = _prompt_route_mode(cfg)
     if not mode:
         return None
@@ -1185,26 +1216,36 @@ def prompt_route(payload, cfg, now=None):
     pending = _break_pending(cfg, state, now)
     # Any prompt (agent notifications and slash commands too: each runs a model turn) restarts the idle clock.
     # If the state can't be written, every prompt looks like a session's first (the always behavior).
-    line, answered = _prompt_route_call(payload, cfg) if pending else (None, False)
+    line, status = _prompt_route_call(payload, cfg) if pending else (None, None)
+    # This break already said the router is down: don't repeat it on every prompt until the router is back.
+    # A new break (SessionStart writes no flag) or an idle gap says it again.
+    told = (isinstance(state, dict) and state.get("labeled") is True and state.get("pending") is not False
+            and not _idle_gap(cfg, state, now))
+    if status == "down" and told:
+        line = None
+    keep = pending and status != "answered"
     try:
-        _write_session_file(path, {"last": now, "pending": pending and not answered}, now)
+        _write_session_file(path, {"last": now, "pending": keep,
+                                   "labeled": keep and (told or status in ("down", "notice"))}, now)
     except OSError:
         pass
     return line
 
 
 def _prompt_route_call(payload, cfg):
-    """(line or None, whether the router answered). Only the configured decisions API's own answer: no
-    heuristic fallback, no floors, no confidence cut. Nothing is shown when no router is configured or it
-    doesn't answer in time. Skips slash commands, harness messages (agent notifications), and very short
-    replies ("ok", "merge")."""
+    """(line or None, status). Only the configured decisions API's own answer: no heuristic fallback, no floors,
+    no confidence cut. status: "answered" (it replied, even unusably), "notice" (this call started a pause),
+    "down" (it couldn't be used: the line is the "unavailable" label), or None (not sent). Nothing is shown when
+    no router is configured or it replies unusably. Skips slash commands, harness messages (agent
+    notifications), and very short replies ("ok", "merge")."""
     name = str(cfg.get("MODEL_PICKER_ROUTER") or "heuristic").lower()
     router = routers.ROUTERS.get(name)
     prompt = str(payload.get("prompt") or "").strip()
     if not router or not prompt or prompt[0] in "/<!" or len(prompt.split()) < 3:
-        return None, False
-    if router_paused(cfg, scope="prompt"):
-        return None, False  # don't make every prompt wait on a router that is down
+        return None, None
+    paused = router_paused(cfg, scope="prompt")
+    if paused:  # don't make every prompt wait on a router that is down; say so instead
+        return unavailable_label(cfg, f"{paused}, paused", fallback=False), "down"
     # Only the first 200 characters, whatever MODEL_PICKER_ROUTER_INPUT says (that setting is for launches).
     inp = {"description": _short(prompt, 200), "subagent_type": "main-session"}
     # Router subprocesses (command router, key command) must finish inside the deadline, not be orphaned.
@@ -1217,19 +1258,21 @@ def _prompt_route_call(payload, cfg):
     res = box.get("res")
     notice = record_router(cfg, res, scope="prompt")
     if notice:
-        return notice, False
+        return notice, "notice"
+    why = _unavailable(res)
+    if why:  # connection failures, timeouts, rejections and a missing key keep the break open
+        return unavailable_label(cfg, why, fallback=False), "down"
     if not isinstance(res, dict) or res.get("tier") not in TIERS:
         # The router was reached and replied, just not usably (malformed, a tier it wasn't offered): that
         # still closes the break, or a billed-but-unusable gateway would be called on every prompt.
-        # Connection failures, timeouts and rejections keep it open.
-        return None, isinstance(res, dict) or _failure(res) == "other"
+        return None, "answered"
     ms = int((time.monotonic() - started) * 1000)
     ledger.append(cfg, {"kind": "prompt", "session": payload.get("session_id"), "rec_tier": res["tier"],
                         "rec_effort": res.get("effort"), "source": res.get("source"), "confidence": res.get("confidence"),
                         "router_ms": ms, "session_tier": ledger.tier_of(ledger.last_model(payload.get("transcript_path")))})
     label = ledger._rec_label(res.get("source") or name)
     conf = f"{res['confidence']:.2f}, " if isinstance(res.get("confidence"), (int, float)) else ""
-    return f"model-picker: {label} → {res['tier']}/{res.get('effort') or 'medium'} ({conf}{ms} ms)", True
+    return f"model-picker: {label} → {res['tier']}/{res.get('effort') or 'medium'} ({conf}{ms} ms)", "answered"
 
 
 def _human_prompt(payload):

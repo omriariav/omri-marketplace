@@ -1,5 +1,11 @@
 # Releases
 
+## model-picker v0.5.1 (2026-11-18)
+
+- **A label when the router can't be used.** If the decisions API can't be reached or refuses the call (a gateway behind a VPN that is off, a timeout, an HTTP error), has no API key, or is paused after failing, a launch shows `model-picker: gpt-6-luna unavailable (timed out); keyword rules used`, and a prompt that would have been routed shows `model-picker: gpt-6-luna unavailable (unreachable, paused)`. Before, a failed call showed nothing until the third failure started a pause, and nothing during the pause, so a missing pick looked like a skipped one. The line that starts a pause still replaces the label. A router that answered, even unsure or unusably, gets no label. With `MODEL_PICKER_PROMPT_ROUTE=1` the prompt label shows once per natural break (the break stays open until the router answers, so mid-task prompts stay quiet); with `always`, on every prompt.
+- A missing API key now keeps a prompt break open, like a connection failure, instead of closing it as if the router had answered.
+- Tests: 348.
+
 ## model-picker v0.5.0 (2026-11-17)
 
 - **The prompt line calls the router only at natural breaks.** With `MODEL_PICKER_PROMPT_ROUTE=1` the decisions API is called for a session's first prompt, the first after `/compact` or a resume, and the first after `MODEL_PICKER_PROMPT_ROUTE_IDLE` minutes (default 60) without a prompt, and not for mid-task prompts. Guide rule 7 says to switch the session model only at such breaks, so a mid-task pick was paid for and not acted on. In one working session the old behavior made 106 router calls, and the pick changed on 70 of 105 consecutive prompts. A break stays open until the router replies to an eligible prompt (an unusable reply also closes it), so a short reply, a slash command, a paused router or a connection failure doesn't use it up. `MODEL_PICKER_PROMPT_ROUTE=always` keeps the old every-prompt behavior. Launch routing is unchanged.

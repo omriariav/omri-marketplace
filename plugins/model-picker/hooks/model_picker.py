@@ -303,11 +303,13 @@ _SCRUB = [  # belt and braces: the guide already asks for kinds, not names, path
     (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b"), "[email]"),
     (re.compile(r"\b[A-Za-z]:\\\S+"), "[path]"),                                  # Windows paths
     (re.compile(r"(?<![\w/])(?:~|\.{1,2})?/[\w.@-]+(?:/[\w.@-]*)*"                 # /abs, ~/x, ./x
-                r"|\b[\w.-]+(?:/[\w.-]+)+\.[A-Za-z0-9]{1,5}\b"), "[path]"),        # dir/file.ext
+                r"|\b[\w.-]+(?:/[\w.-]+)+\.[A-Za-z][A-Za-z0-9]{0,4}\b"), "[path]"),  # dir/file.ext
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), "[id]"),
+    (re.compile(r"\bxox[a-z]-[\w-]+"), "[token]"),                                 # Slack tokens
     (re.compile(r"\bAKIA[A-Z0-9]{16}\b"
                 r"|\b(?=[A-Za-z0-9_]*\d)(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{20,}\b"), "[token]"),
 ]
-_MARKUP = re.compile(r"\*\*|__|^[\s>#*_`-]+")
+_MARKUP = re.compile(r"^[\s>#*_`-]+|(?:\*\*|__)(?=\s*(?:task|stakes)\s*:)|(?<=:)(?:\*\*|__)", re.I)
 
 
 def _split_summary(prompt):
@@ -341,9 +343,15 @@ def summary_line(prompt):
 
 
 def _heuristic_text(inp, keys=("description", "prompt", "name")):
-    """Text for the keyword rules, without the Task/Stakes line: its words ("read the verdict", "a missed
-    bug ships") describe stakes, not the work, and would skew the keyword match."""
-    return " ".join(_split_summary(inp.get(k))[1] if k == "prompt" else str(inp.get(k) or "") for k in keys)
+    """Text for the keyword rules, without the Stakes part of the Task/Stakes line: its words ("read the
+    verdict", "a missed bug ships") describe consequences, not the work, and would skew the keyword match.
+    The Task part stays: it says what the work is."""
+    def text(k):
+        if k != "prompt":
+            return str(inp.get(k) or "")
+        summary, rest = _split_summary(inp.get(k))
+        return re.split(r"\bstakes\s*:", summary, maxsplit=1, flags=re.I)[0] + "\n" + rest
+    return " ".join(text(k) for k in keys)
 
 
 ROUTER_DEADLINE = 7.0  # seconds; stays under the 10 s hook timeout

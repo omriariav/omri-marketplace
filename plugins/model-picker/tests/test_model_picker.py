@@ -1926,7 +1926,23 @@ krow = ledger.read(kst)[-1]
 results.append(check("shadow: the key command runs once for both calls",
                      Path(kdir, "n").read_text().count("x") == 1 and krow.get("shadow", {}).get("tier") == "sonnet"
                      and str(krow.get("source")).startswith("openai-decisions:")))
+fk = {**QS2, **fresh_state(), "OPENAI_API_KEY": "", "MODEL_PICKER_ROUTER_API_KEY_CMD": "exit 3"}
+fouts = [run({**agent(description="d", model="sonnet", prompt="Task: Q:review"), "session_id": "s", "tool_use_id": f"x{i}"}, "advise", fk) for i in range(3)]
+frs = ledger.read(fk)
+results.append(check("shadow on: a failing key command keeps the 0.5.1 label and pause, shadow logs the error",
+                     "unavailable" in json.dumps(fouts[0]) and "paused" in json.dumps(fouts[2])
+                     and all(r.get("shadow", {}).get("error") == "CalledProcessError" for r in frs)))
 q_srv2.shutdown()
+
+# v0.6.0 round 2.
+results += [
+    check("heuristic: work words in the Task part still count; only Stakes is ignored",
+          mp.decide({"description": "step 2", "prompt": "Task: search the logs for the timeout and report matching lines. Stakes: low.\nBackground: x"}, {}, use_router=False)["tier"] == "haiku"
+          and mp.decide({"description": "step 2", "prompt": "Task: implement the retry feature and add tests. Stakes: low.\nContext: x"}, {}, use_router=False)["tier"] == "sonnet"),
+    check("summary: model names and dunder files survive; UUIDs and Slack tokens don't",
+          sl("Task: compare gpt-4.1/gpt-5.5 and fix __init__.py for 123e4567-e89b-12d3-a456-426614174000 xoxb-123-456-abc")
+          == "Task: compare gpt-4.1/gpt-5.5 and fix __init__.py for [id] [token]"),
+]
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

@@ -143,7 +143,16 @@ class Mock(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         SEEN.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
         conf = 0.2 if "UNSURE" in json.dumps(body) else 0.9
-        if self.path == "/v1/decisions":
+        names = [q.get("name") for q in body.get("questions", []) if isinstance(q, dict)]
+        if self.path == "/v1/decisions" and "simple" in names:  # yes/no questions (MODEL_PICKER_ROUTER_QUESTIONS)
+            text = str(body.get("input"))
+            if "QFAIL" in text:
+                self.send_response(500)
+                self.end_headers()
+                return
+            out = {"answers": [{"type": "choice", "name": n, "choice": "yes" if f"Q:{n}" in text else "no",
+                                "confidence": 0.8} for n in names if not ("QMISSING" in text and n == "stakes")]}
+        elif self.path == "/v1/decisions":
             out = {"answers": [{"type": "choice", "name": "tier", "choice": "fable", "confidence": conf},
                                {"type": "choice", "name": "effort", "choice": "high", "confidence": 0.8}]}
         elif self.path == "/api/chat":
@@ -1783,6 +1792,85 @@ results += [
           {"rec_tier": "sonnet", "rec_effort": "high", "source": "heuristic + floor", "chosen_tier": "opus",
            "outcome": "explicit", "floor_effort": "high"}, "medium")),
 ]
+
+# v0.6.0: yes/no router questions (shadow) and the Task/Stakes summary line.
+tfa = routers.tier_from_answers
+results += [
+    check("questions: leading other agents -> opus", tfa({"lead": True}) == ("opus", "medium")),
+    check("questions: render-and-check -> opus, high when costly", tfa({"visual": True, "stakes": True}) == ("opus", "high")),
+    check("questions: a scoped review -> sonnet/high, never haiku",
+          tfa({"review": True}) == ("sonnet", "high") and tfa({"review": True, "readonly": True, "simple": True}) == ("sonnet", "high")),
+    check("questions: a review across many parts -> opus/high", tfa({"review": True, "large": True}) == ("opus", "high")),
+    check("questions: tests that check the result keep effort at medium",
+          tfa({"review": True, "autocheck": True}) == ("sonnet", "medium") and tfa({"stakes": True, "autocheck": True}) == ("sonnet", "medium")),
+    check("questions: mechanical or read-only side work -> haiku/low",
+          tfa({"simple": True, "stakes": True}) == ("haiku", "low") and tfa({"readonly": True}) == ("haiku", "low")),
+    check("questions: expert judgment keeps simple work off haiku", tfa({"simple": True, "judgment": True}) == ("sonnet", "medium")),
+    check("questions: large building work -> opus; a large read-only investigation -> sonnet",
+          tfa({"large": True}) == ("opus", "medium") and tfa({"large": True, "readonly": True}) == ("sonnet", "medium")),
+    check("questions: no yes answers -> sonnet/medium", tfa({}) == ("sonnet", "medium")),
+]
+sl = mp.summary_line
+results += [
+    check("summary: Task/Stakes line taken, rest of the prompt not",
+          sl("Task: review a hook diff. Stakes: gates a merge.\nSECRET details here") == "Task: review a hook diff. Stakes: gates a merge."),
+    check("summary: a Stakes line right after the Task line is joined",
+          sl("\n  task: copy rows into a sheet.\nStakes: low, easy to recheck.\nmore") == "task: copy rows into a sheet. Stakes: low, easy to recheck."),
+    check("summary: no Task line -> nothing", sl("Review this diff.\nTask: later") == "" and sl("") == "" and sl(None) == ""),
+    check("summary: emails, URLs, paths and long tokens scrubbed",
+          sl("Task: mail a@b.co about https://x.io/p and /Users/me/f.txt key tok9f8e7d6c5b4a3f2e1d0c9b8a7f") ==
+          "Task: mail [email] about [url] and [path] key [token]"),
+    check("summary: capped at 300 characters", len(sl("Task: " + "x" * 900)) == 300),
+    check("summary input: only the summary line leaves with the description",
+          mp.task_text({"description": "Label batch", "prompt": "Task: label rows. Stakes: low.\nSECRET"}, {"MODEL_PICKER_ROUTER_INPUT": "summary"})
+          == "Agent type: general-purpose. Task: Label batch\n\nTask: label rows. Stakes: low."
+          and mp.task_text({"description": "Label batch", "prompt": "SECRET"}, {"MODEL_PICKER_ROUTER_INPUT": "summary"})
+          == "Agent type: general-purpose. Task: Label batch"),
+    check("questions: shadow only for openai-decisions",
+          mp._shadow_on("openai-decisions", {"MODEL_PICKER_ROUTER_QUESTIONS": "shadow"})
+          and not mp._shadow_on("google-decisions", {"MODEL_PICKER_ROUTER_QUESTIONS": "shadow"})
+          and not mp._shadow_on("openai-decisions", {})),
+]
+q_srv = HTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=q_srv.serve_forever, daemon=True).start()
+QA = {**OA, "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{q_srv.server_port}"}
+QS = {**QA, "MODEL_PICKER_ROUTER_QUESTIONS": "shadow", "MODEL_PICKER_ROUTER_INPUT": "summary",
+      "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+qst = {**QS, **fresh_state()}
+SEEN.clear()
+qout = json.dumps(run({**agent(description="Review diff", model="sonnet",
+                               prompt="Task: Q:review Q:large hook diff. Stakes: Q:stakes\nSECRET-PROMPT"),
+                       "session_id": "s", "tool_use_id": "q1"}, "advise", qst))
+qrow = ledger.read(qst)[-1]
+results += [
+    check("shadow: both the normal and the yes/no request are sent; the prompt body never is",
+          len(SEEN) == 2 and sorted(len(r["body"]["questions"]) for r in SEEN) == [2, 9]
+          and "SECRET-PROMPT" not in json.dumps(SEEN)),
+    check("shadow: logged next to the normal pick, which is unchanged",
+          qrow.get("source", "").startswith("openai-decisions:") and qrow.get("rec_effort") == "high"),
+    check("shadow: pick, effort, answers and latency logged",
+          qrow.get("shadow", {}).get("tier") == "opus" and qrow["shadow"].get("effort") == "high"
+          and qrow["shadow"].get("answers") == ["large", "review", "stakes"] and isinstance(qrow["shadow"].get("ms"), int)),
+    check("shadow: nothing about it shown to Claude or the user", "shadow" not in qout and "questions" not in qout),
+]
+SEEN.clear()
+run(agent(description="d", prompt="Task: x"), "advise", {**QA, **fresh_state()})
+results.append(check("shadow: off by default (one request)", len(SEEN) == 1))
+fst = {**QS, **fresh_state()}
+for i in range(4):
+    fo = run({**agent(description="d", model="sonnet", prompt="Task: QFAIL"), "session_id": "s", "tool_use_id": f"f{i}"}, "advise", fst)
+frows = ledger.read(fst)
+results += [
+    check("shadow: a failing yes/no call is logged as an error and never pauses the router",
+          len(frows) == 4 and all(r.get("shadow", {}).get("error") == "HTTPError" for r in frows)
+          and all(str(r.get("source")).startswith("openai-decisions:") for r in frows)
+          and not mp.router_paused(fst)),
+]
+mst = {**QS, **fresh_state()}
+run({**agent(description="d", model="sonnet", prompt="Task: QMISSING"), "session_id": "s", "tool_use_id": "m1"}, "advise", mst)
+results.append(check("shadow: a missing answer is an error, not a guess",
+                     ledger.read(mst)[-1].get("shadow", {}).get("error") == "ValueError"))
+q_srv.shutdown()
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

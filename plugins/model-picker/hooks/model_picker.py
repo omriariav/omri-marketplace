@@ -288,7 +288,34 @@ def task_text(inp, cfg):
         return f"{agent}Task: {desc}\n\n{prompt[:8000]}"
     if level == "brief":
         return f"{agent}Task: {desc}\n\n{prompt[:500]}"
-    return f"{agent}Task: {desc}" if desc else agent.strip()
+    head = f"{agent}Task: {desc}" if desc else agent.strip()
+    if level == "summary":
+        line = summary_line(prompt)
+        return f"{head}\n\n{line}" if line else head
+    return head
+
+
+SUMMARY_MAX = 300
+_SCRUB = [  # belt and braces: the guide already asks for kinds, not names, paths or data
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
+    (re.compile(r"\b(?:https?|ftp)://\S+|\bwww\.\S+", re.I), "[url]"),
+    (re.compile(r"(?:~|\.{1,2})?/(?:[\w.@-]+/)+[\w.@-]*"), "[path]"),
+    (re.compile(r"\b(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{24,}\b"), "[token]"),
+]
+
+
+def summary_line(prompt):
+    """The `Task: ... Stakes: ...` line the guide asks Claude to open an agent prompt with, scrubbed and
+    capped; "" when the prompt does not open with one (then only the description is sent)."""
+    lines = [ln.strip() for ln in str(prompt or "").lstrip().splitlines()[:2]]
+    if not lines or not re.match(r"task\s*:", lines[0], re.I):
+        return ""
+    text = lines[0]
+    if len(lines) > 1 and re.match(r"stakes\s*:", lines[1], re.I):
+        text += " " + lines[1]
+    for rx, repl in _SCRUB:
+        text = rx.sub(repl, text)
+    return text[:SUMMARY_MAX]
 
 
 ROUTER_DEADLINE = 7.0  # seconds; stays under the 10 s hook timeout
@@ -489,10 +516,51 @@ def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
     box = {}
     worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, local)), daemon=True)
     started = time.monotonic()
+    shadow = _start_shadow(name, inp, cfg, local)
     worker.start()
     worker.join(ROUTER_DEADLINE)
     fallback["router_ms"] = int((time.monotonic() - started) * 1000)
+    rec = _decide_answer(box.get("res"), fallback, cfg, track)
+    if shadow:
+        rec["shadow"] = _finish_shadow(shadow, started)
+    return rec
+
+
+def _shadow_on(name, cfg):
+    return name == "openai-decisions" and str(cfg.get("MODEL_PICKER_ROUTER_QUESTIONS") or "").lower() == "shadow"
+
+
+def _start_shadow(name, inp, cfg, local):
+    """MODEL_PICKER_ROUTER_QUESTIONS=shadow: ask the yes/no questions too, in parallel, and only log the pick.
+    Never counted toward a router pause and never changes the recommendation."""
+    if not _shadow_on(name, cfg):
+        return None
+    box = {}
+
+    def run():
+        t0 = time.monotonic()
+        res = _route(routers.openai_questions, name, inp, cfg, local)
+        box.update(res=res, ms=int((time.monotonic() - t0) * 1000))
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    return worker, box
+
+
+def _finish_shadow(shadow, started):
+    worker, box = shadow
+    worker.join(max(0.0, ROUTER_DEADLINE - (time.monotonic() - started)))
     res = box.get("res")
+    if res is None:
+        return {"error": "timeout"}
+    if isinstance(res, Exception):
+        return {"error": type(res).__name__}
+    return {"tier": res["tier"], "effort": res["effort"], "confidence": round(res["confidence"], 2),
+            "answers": res.get("answers", []), "ms": box.get("ms")}
+
+
+def _decide_answer(res, fallback, cfg, track):
+    """Turn the router's result into a recommendation, or annotate the heuristic fallback."""
     notice = record_router(cfg, res) if track else None
     if notice:
         fallback["notice"] = notice
@@ -968,6 +1036,8 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
                       # A fallback guess can't judge an explicit choice: leave "followed" unknown.
                       "followed": None if (not chosen_tier or rec.get("unsure")) else
                       (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))})
+        if rec.get("shadow"):
+            entry["shadow"] = rec["shadow"]
     ledger.append(cfg, entry)
 
 

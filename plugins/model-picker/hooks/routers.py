@@ -84,6 +84,81 @@ def openai_decisions(task, tiers, cfg):
                    f"openai-decisions:{model}")
 
 
+# Yes/no questions instead of one "which tier?" question. Decision models answer narrow questions
+# better than one broad choice; plain code then maps the answers to a tier and effort, so every rule
+# can be read, tested and backtested. Asked in one request, so latency matches a single question.
+QUESTIONS = {
+    "simple": "Is this a simple, mechanical task (copy data, upload a file, make one API call, look something up) "
+              "that someone could do by following clear steps without judgment?",
+    "readonly": "Does the agent only search, read or summarize material and report back, without writing code, "
+                "documents or decisions?",
+    "review": "Is the task to review or verify someone else's work (code, a document, edits) before it is accepted?",
+    "judgment": "Does the task need expert judgment on long or specialized material (legal, compliance, financial, "
+                "architecture, product strategy)?",
+    "large": "Is the work large or open-ended: many components, a multi-part feature, a broad investigation, "
+             "or a failure whose cause is unknown?",
+    "lead": "Will the agent coordinate or delegate to other agents or helpers?",
+    "visual": "Must the agent render its output and check it by eye (slides, diagrams, screenshots of a UI)?",
+    "stakes": "Is a mistake both costly and hard to notice: it gates a merge or release, or people act on the "
+              "result without re-checking it?",
+    "autocheck": "Does the task include writing or running automated tests or a script that checks the result?",
+}
+
+
+def tier_from_answers(yes):
+    """Map yes/no answers ({name: bool}) to (tier, effort). Mirrors the guide's task table."""
+    def y(k):
+        return bool(yes.get(k))
+    if y("lead") or y("visual"):
+        tier = "opus"                                   # leading agents; render-and-check loops
+    elif y("review") and (y("large") or y("judgment")):
+        tier = "opus"                                   # reviews across many parts or specialized material
+    elif y("judgment") and y("large"):
+        tier = "opus"
+    elif y("large") and not y("readonly"):
+        tier = "opus"                                   # multi-part features, unknown failures
+    elif y("review"):
+        tier = "sonnet"                                 # a scoped review is never haiku work
+    elif y("simple") and not y("judgment"):
+        tier = "haiku"
+    elif y("readonly") and not y("judgment") and not y("large"):
+        tier = "haiku"
+    else:
+        tier = "sonnet"
+    if tier == "haiku":
+        effort = "low"
+    elif (y("stakes") or y("review")) and not y("autocheck"):
+        effort = "high"                                 # costly work no automatic check covers
+    else:
+        effort = "medium"
+    return tier, effort
+
+
+def openai_questions(task, tiers, cfg):
+    """OpenAI Decisions format, asked as yes/no QUESTIONS; tier and effort come from tier_from_answers."""
+    base = (cfg.get("MODEL_PICKER_ROUTER_URL") or "https://api.openai.com").rstrip("/")
+    model = cfg.get("MODEL_PICKER_ROUTER_MODEL") or "gpt-6-luna"
+    yes_no = [{"value": "yes", "description": "yes"}, {"value": "no", "description": "no"}]
+    body = {"model": model, "input": task,
+            "questions": [{"type": "choice", "name": n, "instructions": q, "choices": yes_no}
+                          for n, q in QUESTIONS.items()]}
+    if cfg.get("_metadata"):
+        body["metadata"] = cfg["_metadata"]
+    auth = {"Authorization": f"Bearer {cfg['_api_key']}"} if cfg.get("_api_key") else {}
+    data = _post(f"{base}/v1/decisions", body, {**auth, **cfg.get("_headers", {})}, cfg["_timeout"])
+    answers = {a.get("name"): a for a in data.get("answers", []) if isinstance(a, dict)}
+    yes, confs = {}, []
+    for name in QUESTIONS:
+        a = answers.get(name) or {}
+        if a.get("choice") not in ("yes", "no"):
+            raise ValueError(f"no usable answer to {name!r}")
+        yes[name] = a["choice"] == "yes"
+        confs.append(_confidence(a, a["choice"]))
+    tier, effort = tier_from_answers(yes)
+    return {**_result(tier, min(confs), effort, f"openai-questions:{model}"),
+            "answers": sorted(k for k, v in yes.items() if v)}
+
+
 def google_decisions(task, tiers, cfg):
     """Gemini Decisions API: POST {base}/v1beta/decisions."""
     base = (cfg.get("MODEL_PICKER_ROUTER_URL") or "https://generativelanguage.googleapis.com").rstrip("/")

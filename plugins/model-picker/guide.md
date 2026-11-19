@@ -18,4 +18,5 @@ Rules:
 5. With automatic outcome checks, run everything at low effort and re-run only failures at high.
 6. Fan out parallel workers only for work larger than one context window. A chain of dependent steps or work that fits one context stays on one agent.
 7. Switch the session model only at a natural break (after /compact or in a fresh session); the prompt cache belongs to the model that wrote it.
+8. Open every Agent, teammate, or workflow agent() prompt with one line: `Task: <kind of work and its output>. Stakes: <who relies on it and what a mistake costs; say "low" when it is easy to recheck>.` Describe kinds of material, never names, paths, data, or secrets: model-picker may send this line to its router.
 </model-picker-guide>

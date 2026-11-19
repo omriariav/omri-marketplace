@@ -288,7 +288,70 @@ def task_text(inp, cfg):
         return f"{agent}Task: {desc}\n\n{prompt[:8000]}"
     if level == "brief":
         return f"{agent}Task: {desc}\n\n{prompt[:500]}"
-    return f"{agent}Task: {desc}" if desc else agent.strip()
+    head = f"{agent}Task: {desc}" if desc else agent.strip()
+    if level == "summary":
+        line = summary_line(prompt)
+        return f"{head}\n\n{line}" if line else head
+    return head
+
+
+SUMMARY_MAX = 300
+SUMMARY_SCAN = 2000  # characters of the Task/Stakes lines scrubbed; bounds the regex work on a pasted blob
+_SCRUB = [  # belt and braces: the guide already asks for kinds, not names, paths or data. Names aren't caught.
+    (re.compile(r"\b[a-z][a-z0-9+.-]*://\S+|\bwww\.\S+", re.I), "[url]"),
+    (re.compile(r"\b[\w.-]+@[\w.-]+:[\w./~-]+"), "[url]"),                       # scp-style remotes
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b"), "[email]"),
+    (re.compile(r"\b[A-Za-z]:\\\S+"), "[path]"),                                  # Windows paths
+    (re.compile(r"(?<![\w/])(?:~|\.{1,2})?/[\w.@-]+(?:/[\w.@-]*)*"                 # /abs, ~/x, ./x
+                r"|\b[\w.-]+(?:/[\w.-]+)+\.[A-Za-z][A-Za-z0-9]{0,4}\b"), "[path]"),  # dir/file.ext
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), "[id]"),
+    (re.compile(r"\bxox[a-z]-[\w-]+"), "[token]"),                                 # Slack tokens
+    (re.compile(r"\bAKIA[A-Z0-9]{16}\b"
+                r"|\b(?=[A-Za-z0-9_]*\d)(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{20,}\b"), "[token]"),
+]
+_MARKUP = re.compile(r"^[\s>#*_`-]+|(?:\*\*|__)(?=\s*(?:task|stakes)\s*:)|(?<=:)(?:\*\*|__)", re.I)
+
+
+def _split_summary(prompt):
+    """(the prompt's opening `Task: ...` line plus a following `Stakes: ...` line, the rest of the prompt).
+    Blank lines and Markdown emphasis around them are allowed; ("", prompt) when it doesn't open that way."""
+    prompt = str(prompt or "")
+    lines = prompt[:8000].splitlines(True)
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    head = lambda k: _MARKUP.sub("", lines[k][:SUMMARY_SCAN]).strip()  # noqa: E731
+    if i >= len(lines) or not re.match(r"task\s*:", head(i), re.I):
+        return "", prompt
+    parts, i = [head(i)], i + 1
+    j = i
+    while j < len(lines) and not lines[j].strip():
+        j += 1
+    if j < len(lines) and re.match(r"stakes\s*:", head(j), re.I):
+        parts.append(head(j))
+        i = j + 1
+    return " ".join(parts), prompt[sum(len(x) for x in lines[:i]):]
+
+
+def summary_line(prompt):
+    """The `Task: ... Stakes: ...` line the guide asks Claude to open an agent prompt with, scrubbed and
+    capped; "" when the prompt does not open with one (then only the description is sent)."""
+    text = _split_summary(prompt)[0][:SUMMARY_SCAN]
+    for rx, repl in _SCRUB:
+        text = rx.sub(repl, text)
+    return text[:SUMMARY_MAX]
+
+
+def _heuristic_text(inp, keys=("description", "prompt", "name")):
+    """Text for the keyword rules, without the Stakes part of the Task/Stakes line: its words ("read the
+    verdict", "a missed bug ships") describe consequences, not the work, and would skew the keyword match.
+    The Task part stays: it says what the work is."""
+    def text(k):
+        if k != "prompt":
+            return str(inp.get(k) or "")
+        summary, rest = _split_summary(inp.get(k))
+        return re.split(r"\bstakes\s*:", summary, maxsplit=1, flags=re.I)[0] + "\n" + rest
+    return " ".join(text(k) for k in keys)
 
 
 ROUTER_DEADLINE = 7.0  # seconds; stays under the 10 s hook timeout
@@ -361,7 +424,7 @@ def guard_local(rec, inp, cfg):
         return rec
     if not (isinstance(rec.get("confidence"), (int, float)) and rec["confidence"] < LOCAL_MIN_CONFIDENCE):
         return rec
-    text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt")).lower()[:2000]
+    text = _heuristic_text(inp, ("description", "prompt")).lower()[:2000]
     tier, why = recommend(text, str(inp.get("subagent_type") or ""), local=False)
     note = f"local confidence {rec['confidence']:.2f} too low"
     return {**rec, "tier": tier, "effort": "medium", "reason": f"{why} (not local: {note})",
@@ -466,15 +529,15 @@ def decide(inp, cfg, use_router=True, for_launch=False, track=True):
     """
     rec = _decide(inp, cfg, use_router, allow_local=not for_launch, track=track)
     # Fit first, so a floor compares against a model that can actually run here.
-    return fit_to_available(apply_floors(fit_to_available(guard_local(rec, inp, cfg), cfg), inp, cfg), cfg)
+    out = fit_to_available(apply_floors(fit_to_available(guard_local(rec, inp, cfg), cfg), inp, cfg), cfg)
+    return _fit_shadow(out, inp, cfg)
 
 
 def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
     """Router first (if configured), heuristic fallback; may name a tier that is not available."""
     local = allow_local and local_enabled(cfg)
     agent_type = str(inp.get("subagent_type") or "")
-    text = " ".join(str(inp.get(k) or "") for k in ("description", "prompt", "name"))
-    tier, why = recommend(text, agent_type, local)
+    tier, why = recommend(_heuristic_text(inp), agent_type, local)
     fallback = {"tier": tier, "effort": "medium", "reason": why, "source": "heuristic",
                 "confidence": None, "router_ms": None, "unsure": why == UNSURE_REASON}
     name = str(cfg.get("MODEL_PICKER_ROUTER") or "heuristic").lower()
@@ -486,13 +549,71 @@ def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
         fallback["source"] = f"heuristic (router paused: {paused})"
         fallback["unavailable"] = f"{paused}, paused"
         return fallback
+    started = time.monotonic()
+    shadow = None
+    if track and _shadow_on(name, cfg):  # not for `route` (track=False): it would print the pick and log nothing
+        cfg = {**cfg, "_key": _key_or_error(name, cfg)}  # run a key command once for both calls
+        shadow = _start_shadow(name, inp, cfg, local)
     box = {}
     worker = threading.Thread(target=lambda: box.update(res=_route(router, name, inp, cfg, local)), daemon=True)
-    started = time.monotonic()
     worker.start()
-    worker.join(ROUTER_DEADLINE)
+    worker.join(max(0.0, ROUTER_DEADLINE - (time.monotonic() - started)))
     fallback["router_ms"] = int((time.monotonic() - started) * 1000)
+    rec = _decide_answer(box.get("res"), fallback, cfg, track)
+    if shadow:
+        rec["shadow"] = _finish_shadow(shadow, started)
+    return rec
+
+
+SHADOW_GRACE = 0.5  # seconds a shadow call may run past the real one; it never holds up a launch for longer
+
+
+def _shadow_on(name, cfg):
+    return name == "openai-decisions" and str(cfg.get("MODEL_PICKER_ROUTER_QUESTIONS") or "").lower() == "shadow"
+
+
+def _start_shadow(name, inp, cfg, local):
+    """MODEL_PICKER_ROUTER_QUESTIONS=shadow: ask the yes/no questions too, in parallel, and only log the pick.
+    Never counted toward a router pause and never changes the recommendation."""
+    box = {}
+
+    def run():
+        t0 = time.monotonic()
+        res = _route(routers.openai_questions, name, inp, cfg, local)
+        box.update(res=res, ms=int((time.monotonic() - t0) * 1000))
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    return worker, box
+
+
+def _finish_shadow(shadow, started):
+    worker, box = shadow
+    worker.join(min(SHADOW_GRACE, max(0.0, ROUTER_DEADLINE - (time.monotonic() - started))))
     res = box.get("res")
+    if res is None:
+        return {"error": "timeout"}
+    if isinstance(res, Exception):
+        return {"error": type(res).__name__}
+    return {"tier": res["tier"], "effort": res["effort"], "confidence": round(res["confidence"], 2),
+            "answers": res.get("answers", []), "ms": box.get("ms")}
+
+
+def _fit_shadow(rec, inp, cfg):
+    """Fit the logged shadow pick to the available tiers and floors, like the real one, so the two compare."""
+    sh = rec.get("shadow")
+    if not isinstance(sh, dict) or "tier" not in sh:
+        return rec
+    raw = {"tier": sh["tier"], "effort": sh["effort"], "reason": "", "source": "shadow", "unsure": False}
+    fit = fit_to_available(apply_floors(fit_to_available(raw, cfg), inp, cfg), cfg)
+    out = {**sh, "tier": fit["tier"], "effort": fit["effort"]}
+    if (fit["tier"], fit["effort"]) != (sh["tier"], sh["effort"]):
+        out["raw"] = f"{sh['tier']}/{sh['effort']}"
+    return {**rec, "shadow": out}
+
+
+def _decide_answer(res, fallback, cfg, track):
+    """Turn the router's result into a recommendation, or annotate the heuristic fallback."""
     notice = record_router(cfg, res) if track else None
     if notice:
         fallback["notice"] = notice
@@ -525,6 +646,21 @@ def _unavailable(res):
     return "no API key" if isinstance(res, NoApiKey) else None
 
 
+def _key_or_error(name, cfg):
+    """The router's API key ("" for a keyless gateway), or the exception that stopped us getting one."""
+    try:
+        key_env = str(cfg.get("MODEL_PICKER_ROUTER_API_KEY_ENV") or routers.DEFAULT_KEY_ENV.get(name, ""))
+        if key_env.lower() == "none":
+            return ""  # gateway on a private network that needs no key
+        key = os.environ.get(key_env, "")
+        if not key and cfg.get("MODEL_PICKER_ROUTER_API_KEY_CMD"):
+            timeout = min(_num(cfg, "MODEL_PICKER_ROUTER_TIMEOUT", 3), ROUTER_DEADLINE * 0.9, 2)
+            key = routers.run_shell(cfg["MODEL_PICKER_ROUTER_API_KEY_CMD"], timeout).strip()
+        return key or NoApiKey("no API key")
+    except Exception as exc:
+        return exc
+
+
 def _route(router, name, inp, cfg, local):
     """Call the router; returns its result dict or the exception (never raises)."""
     try:
@@ -532,15 +668,10 @@ def _route(router, name, inp, cfg, local):
         rcfg["_timeout"] = min(_num(cfg, "MODEL_PICKER_ROUTER_TIMEOUT", 3), ROUTER_DEADLINE * 0.9)  # finish before the join gives up
         rcfg["_headers"] = _json_obj(cfg.get("MODEL_PICKER_ROUTER_HEADERS"))
         rcfg["_metadata"] = _json_obj(cfg.get("MODEL_PICKER_ROUTER_METADATA"))
-        key_env = str(cfg.get("MODEL_PICKER_ROUTER_API_KEY_ENV") or routers.DEFAULT_KEY_ENV.get(name, ""))
-        if name != "command" and key_env.lower() == "none":
-            rcfg["_api_key"] = ""  # gateway on a private network that needs no key
-        elif name != "command":
-            key = os.environ.get(key_env, "")
-            if not key and cfg.get("MODEL_PICKER_ROUTER_API_KEY_CMD"):
-                key = routers.run_shell(cfg["MODEL_PICKER_ROUTER_API_KEY_CMD"], min(rcfg["_timeout"], 2)).strip()
-            if not key:
-                raise NoApiKey("no API key")
+        if name != "command":
+            key = cfg["_key"] if "_key" in cfg else _key_or_error(name, cfg)
+            if isinstance(key, Exception):
+                raise key
             rcfg["_api_key"] = key
         tiers = [t for t in available_tiers(cfg) if local or t != "local"]
         return router(task_text(inp, cfg), tiers, rcfg)
@@ -968,6 +1099,8 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
                       # A fallback guess can't judge an explicit choice: leave "followed" unknown.
                       "followed": None if (not chosen_tier or rec.get("unsure")) else
                       (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))})
+        if rec.get("shadow"):
+            entry["shadow"] = rec["shadow"]
     ledger.append(cfg, entry)
 
 

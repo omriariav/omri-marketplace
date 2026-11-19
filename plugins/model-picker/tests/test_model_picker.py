@@ -146,6 +146,9 @@ class Mock(BaseHTTPRequestHandler):
         names = [q.get("name") for q in body.get("questions", []) if isinstance(q, dict)]
         if self.path == "/v1/decisions" and "simple" in names:  # yes/no questions (MODEL_PICKER_ROUTER_QUESTIONS)
             text = str(body.get("input"))
+            if "QSLOW" in text:
+                import time as _t
+                _t.sleep(3)
             if "QFAIL" in text:
                 self.send_response(500)
                 self.end_headers()
@@ -1798,13 +1801,15 @@ tfa = routers.tier_from_answers
 results += [
     check("questions: leading other agents -> opus", tfa({"lead": True}) == ("opus", "medium")),
     check("questions: render-and-check -> opus, high when costly", tfa({"visual": True, "stakes": True}) == ("opus", "high")),
-    check("questions: a scoped review -> sonnet/high, never haiku",
-          tfa({"review": True}) == ("sonnet", "high") and tfa({"review": True, "readonly": True, "simple": True}) == ("sonnet", "high")),
-    check("questions: a review across many parts -> opus/high", tfa({"review": True, "large": True}) == ("opus", "high")),
+    check("questions: a scoped review -> sonnet, never haiku; high only when a mistake is costly",
+          tfa({"review": True}) == ("sonnet", "medium") and tfa({"review": True, "readonly": True, "simple": True}) == ("sonnet", "medium")
+          and tfa({"review": True, "stakes": True}) == ("sonnet", "high")),
+    check("questions: a review across many parts -> opus", tfa({"review": True, "large": True, "stakes": True}) == ("opus", "high")),
     check("questions: tests that check the result keep effort at medium",
           tfa({"review": True, "autocheck": True}) == ("sonnet", "medium") and tfa({"stakes": True, "autocheck": True}) == ("sonnet", "medium")),
-    check("questions: mechanical or read-only side work -> haiku/low",
-          tfa({"simple": True, "stakes": True}) == ("haiku", "low") and tfa({"readonly": True}) == ("haiku", "low")),
+    check("questions: mechanical or read-only side work -> haiku/low; a costly mistake keeps it off haiku",
+          tfa({"simple": True}) == ("haiku", "low") and tfa({"readonly": True}) == ("haiku", "low")
+          and tfa({"simple": True, "stakes": True}) == ("sonnet", "high")),
     check("questions: expert judgment keeps simple work off haiku", tfa({"simple": True, "judgment": True}) == ("sonnet", "medium")),
     check("questions: large building work -> opus; a large read-only investigation -> sonnet",
           tfa({"large": True}) == ("opus", "medium") and tfa({"large": True, "readonly": True}) == ("sonnet", "medium")),
@@ -1831,7 +1836,8 @@ results += [
           and not mp._shadow_on("google-decisions", {"MODEL_PICKER_ROUTER_QUESTIONS": "shadow"})
           and not mp._shadow_on("openai-decisions", {})),
 ]
-q_srv = HTTPServer(("127.0.0.1", 0), Mock)
+from http.server import ThreadingHTTPServer  # noqa: E402
+q_srv = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
 threading.Thread(target=q_srv.serve_forever, daemon=True).start()
 QA = {**OA, "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{q_srv.server_port}"}
 QS = {**QA, "MODEL_PICKER_ROUTER_QUESTIONS": "shadow", "MODEL_PICKER_ROUTER_INPUT": "summary",
@@ -1871,6 +1877,56 @@ run({**agent(description="d", model="sonnet", prompt="Task: QMISSING"), "session
 results.append(check("shadow: a missing answer is an error, not a guess",
                      ledger.read(mst)[-1].get("shadow", {}).get("error") == "ValueError"))
 q_srv.shutdown()
+
+# v0.6.0 review fixes.
+import time as _time  # noqa: E402
+rv = "Review the PR diff for correctness and report issues."
+line = "Task: review a hook diff and report findings. Stakes: the owner will read the verdict before merging; a missed bug ships.\n"
+results += [
+    check("heuristic: the Task/Stakes line doesn't change the keyword pick",
+          mp.decide({"description": "Review PR", "prompt": line + rv}, {}, use_router=False)["tier"]
+          == mp.decide({"description": "Review PR", "prompt": rv}, {}, use_router=False)["tier"]),
+    check("summary: Markdown emphasis and a blank line before Stakes are handled",
+          sl("**Task:** copy rows.\n\n**Stakes:** low.\nbody") == "Task: copy rows. Stakes: low."),
+    check("summary: ordinary text survives the scrub",
+          sl("Task: and/or CI/CD read/write/execute react@18.3.1 claude-sonnet-4-5-20250929 v0.6.0")
+          == "Task: and/or CI/CD read/write/execute react@18.3.1 claude-sonnet-4-5-20250929 v0.6.0"),
+    check("summary: home, relative and Windows paths, other URL schemes, git remotes and AWS keys scrubbed",
+          sl(r"Task: ~/payroll.xlsx data/customers.csv C:\Users\me\x s3://bucket/k git@github.com:acme/repo.git AKIAABCDEFGHIJKLMNOP")
+          == "Task: [path] [path] [path] [url] [url] [token]"),
+]
+t0 = _time.monotonic()
+sl("Task: " + "a1" * 100000)
+results.append(check("summary: a huge Task line is scrubbed quickly", _time.monotonic() - t0 < 1.0))
+q_srv2 = ThreadingHTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=q_srv2.serve_forever, daemon=True).start()
+QS2 = {**QS, "MODEL_PICKER_ROUTER_URL": f"http://127.0.0.1:{q_srv2.server_port}"}
+sst = {**QS2, **fresh_state()}
+t0 = _time.monotonic()
+run({**agent(description="d", model="sonnet", prompt="Task: QSLOW"), "session_id": "s", "tool_use_id": "s1"}, "advise", sst)
+slow_s = _time.monotonic() - t0
+results.append(check("shadow: a slow yes/no call never holds the launch past a short grace",
+                     slow_s < 2.5 and ledger.read(sst)[-1].get("shadow", {}).get("error") == "timeout"))
+SEEN.clear()
+e = {k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")}
+e.update({**QS2, "MODEL_PICKER_CONFIG": "/nonexistent/model-picker.json", **fresh_state()})
+rout = subprocess.run([sys.executable, "-I", str(HOOK), "route"], input="Task: Q:lead review", capture_output=True, text=True, env=e).stdout
+results.append(check("shadow: the route command makes no yes/no call and prints no shadow pick",
+                     "shadow" not in rout and len(SEEN) == 1))
+tst = {**QS2, **fresh_state(), "MODEL_PICKER_TIERS": "haiku,sonnet"}
+run({**agent(description="d", model="sonnet", prompt="Task: Q:lead"), "session_id": "s", "tool_use_id": "t1"}, "advise", tst)
+tsh = ledger.read(tst)[-1].get("shadow", {})
+results.append(check("shadow: the logged pick is fitted to the available tiers like the real one",
+                     tsh.get("tier") == "sonnet" and tsh.get("raw") == "opus/medium"))
+kdir = tempfile.mkdtemp(prefix="model-picker-key-")
+kst = {**QS2, **fresh_state(), "OPENAI_API_KEY": "",
+       "MODEL_PICKER_ROUTER_API_KEY_CMD": f"echo x >> {kdir}/n; echo k"}
+run({**agent(description="d", model="sonnet", prompt="Task: Q:review"), "session_id": "s", "tool_use_id": "k1"}, "advise", kst)
+krow = ledger.read(kst)[-1]
+results.append(check("shadow: the key command runs once for both calls",
+                     Path(kdir, "n").read_text().count("x") == 1 and krow.get("shadow", {}).get("tier") == "sonnet"
+                     and str(krow.get("source")).startswith("openai-decisions:")))
+q_srv2.shutdown()
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

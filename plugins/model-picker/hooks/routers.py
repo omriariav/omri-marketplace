@@ -106,7 +106,9 @@ QUESTIONS = {
 
 
 def tier_from_answers(yes):
-    """Map yes/no answers ({name: bool}) to (tier, effort). Mirrors the guide's task table."""
+    """Map yes/no answers ({name: bool}) to (tier, effort), following the guide's task table and effort
+    rules. Never fable: no question singles out fable-level work, so it stays a stronger-model call for
+    the caller. Haiku only for side work that is cheap to verify (no costly mistake, no expert judgment)."""
     def y(k):
         return bool(yes.get(k))
     if y("lead") or y("visual"):
@@ -114,21 +116,19 @@ def tier_from_answers(yes):
     elif y("review") and (y("large") or y("judgment")):
         tier = "opus"                                   # reviews across many parts or specialized material
     elif y("judgment") and y("large"):
-        tier = "opus"
+        tier = "opus"                                   # large-source or specialized documents
     elif y("large") and not y("readonly"):
         tier = "opus"                                   # multi-part features, unknown failures
-    elif y("review"):
-        tier = "sonnet"                                 # a scoped review is never haiku work
-    elif y("simple") and not y("judgment"):
-        tier = "haiku"
-    elif y("readonly") and not y("judgment") and not y("large"):
+    elif y("review") or y("stakes") or y("judgment"):
+        tier = "sonnet"                                 # not cheap to verify: never haiku
+    elif y("simple") or (y("readonly") and not y("large")):
         tier = "haiku"
     else:
         tier = "sonnet"
     if tier == "haiku":
         effort = "low"
-    elif (y("stakes") or y("review")) and not y("autocheck"):
-        effort = "high"                                 # costly work no automatic check covers
+    elif y("stakes") and not y("autocheck"):
+        effort = "high"                                 # costly to get wrong and no automatic check
     else:
         effort = "medium"
     return tier, effort

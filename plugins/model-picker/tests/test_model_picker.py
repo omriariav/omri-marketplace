@@ -2166,5 +2166,18 @@ results += [
           profiles.current(mine, profiles.profiles(mine)) == "off"),
 ]
 
+nullp = rr / "null.json"
+nullp.write_text(json.dumps({"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_PROFILES": {
+    "off": {"settings": {"MODEL_PICKER_ROUTER": None}, "on_leave": f"echo leave-off >> {order}"},
+    "on": {"settings": {"MODEL_PICKER_ROUTER": "command"}}}}))
+n1 = profiles.select(nullp, "off", environ={})
+n2 = profiles.select(nullp, "off", environ={})
+n3 = profiles.select(nullp, "on", environ={})
+results += [
+    check("profiles: a profile setting the router to null matches once selected, and its on_leave runs",
+          "-> off" in n1 and "Already on 'off'" in n2 and "on_leave (off): ok" in n3 and "leave-off" in order.read_text()),
+    check("profiles: the output names where the config and its backup were written", f"Saved to {real.resolve()}" in sw),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

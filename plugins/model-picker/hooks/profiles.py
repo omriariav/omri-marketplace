@@ -64,13 +64,13 @@ def profiles(raw):
     return out
 
 
-def _effective(raw, key):
-    value = raw.get(key)
-    return "heuristic" if key == "MODEL_PICKER_ROUTER" and value is None else value  # absent = the default
+def _effective(key, value):
+    """A missing or empty router means the default, the keyword heuristic, on both sides of a comparison."""
+    return "heuristic" if key == "MODEL_PICKER_ROUTER" and value in (None, "") else value
 
 
 def _matches(raw, profile):
-    return all(_effective(raw, k) == v for k, v in profile["settings"].items())
+    return all(_effective(k, raw.get(k)) == _effective(k, v) for k, v in profile["settings"].items())
 
 
 def current(raw, profs):
@@ -89,9 +89,9 @@ def _write(path, raw):
     if path.exists():
         prev = path.with_name(path.name + ".prev")
         fd = os.open(prev, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.fchmod(fd, 0o600)  # an older .prev may have had other modes: fix them before writing
         with os.fdopen(fd, "wb") as fh:
             fh.write(path.read_bytes())
-        os.chmod(prev, 0o600)  # an older .prev may have had other modes
     fd, tmp = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -99,6 +99,7 @@ def _write(path, raw):
             fh.write("\n")
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        return path
     except BaseException:
         try:
             os.unlink(tmp)
@@ -169,8 +170,9 @@ def select(path, name, environ=None):
             new.pop(k, None)
         else:
             new[k] = v
-    _write(path, new)
-    lines = [f"Router profile: {before or 'custom settings'} -> {name}. Saved to {path} (previous file: {path.name}.prev).",
+    written = _write(path, new)
+    lines = [f"Router profile: {before or 'custom settings'} -> {name}. Saved to {written} (previous file: "
+             f"{written.name}.prev next to it).",
              "Takes effect on the next agent launch or prompt; no restart needed."]
     if before and before in profs:
         lines.append(_run_hook(f"on_leave ({before})", profs[before].get("on_leave")))

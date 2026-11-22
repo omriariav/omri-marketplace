@@ -494,17 +494,18 @@ def apply_floors(rec, inp, cfg):
     effort = max((h[2] for h in at_top if h[2]), key=_effort_rank, default=None)
     tier, effort = _fitted_floor(top, effort, cfg)
     floor_min = f"{tier}/{effort}" if effort else tier
+    rules = ", ".join(dict.fromkeys(h[0] for h in hits))
     # Name only the rules that set the minimum: the top-tier ones, and of those the one giving the effort.
     labels = ", ".join(dict.fromkeys(h[0] for h in at_top if not h[2] or h[2] == effort or tier != top))
     minimum = f"{tier}/{effort} effort" if effort else tier
     cur = rec["tier"] if rec["tier"] in CLAUDE_TIERS else None
     if cur and CLAUDE_TIERS.index(cur) > CLAUDE_TIERS.index(tier):
-        return {**rec, "floor_min": floor_min}  # a stronger model meets the floor
+        return {**rec, "floor_min": floor_min, "floor_rules": rules}  # a stronger model meets the floor
     raise_tier = not cur or CLAUDE_TIERS.index(cur) < CLAUDE_TIERS.index(tier)
     new_effort = effort if effort and _effort_rank(effort) > _effort_rank(rec.get("effort")) else rec.get("effort")
     if not raise_tier and new_effort == rec.get("effort"):
-        return {**rec, "floor_min": floor_min}  # already meets the floor
-    out = {**rec, "tier": tier, "effort": new_effort, "unsure": False, "floor_min": floor_min,
+        return {**rec, "floor_min": floor_min, "floor_rules": rules}  # already meets the floor
+    out = {**rec, "tier": tier, "effort": new_effort, "unsure": False, "floor_min": floor_min, "floor_rules": rules,
            "source": f"{rec['source']} + floor"}
     if raise_tier:
         out.update(reason=f"your rule: \"{labels}\" tasks get at least {minimum} (MODEL_PICKER_FLOORS)",
@@ -1187,7 +1188,9 @@ def handle_agent(payload, mode, cfg):
         if honored:
             emit(system=note)
         elif below:
-            emit(context=f"model-picker: `{label}` matches your MODEL_PICKER_FLOORS rule (at least {below}); it was "
+            rules = [r for r in str(rec.get("floor_rules") or "").split(", ") if r]
+            named = f"rule{'s' if len(rules) > 1 else ''} {', '.join(repr(r) for r in rules)}" if rules else "rule"
+            emit(context=f"model-picker: this `{label}` launch matches your MODEL_PICKER_FLOORS {named} (at least {below}); it was "
                          f"launched on {chosen}{f' at {launch_effort} effort' if launch_effort else ' with no effort set'}. "
                          "Use at least that for similar launches.", system=note)
         elif chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:

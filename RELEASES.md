@@ -1,5 +1,10 @@
 # Releases
 
+## model-picker v0.6.1 (2026-11-22)
+
+- **A tenth yes/no question: synthesis.** The router questions (`MODEL_PICKER_ROUTER_QUESTIONS=shadow`) now also ask whether the agent must combine several sources into one synthesis, comparison or brief that someone will use to decide or act. A yes keeps read-only or simple work off haiku: it goes to sonnet/medium instead. Why: research briefs answered "read-only" and landed on haiku, though someone acts on the result. On 79 of the author's past launches not used to write the question (data not published), compared with a reviewer's pick, the right model went from 63 to 65 and no pick got worse.
+- **Floor reminders name the rule.** A launch under a `MODEL_PICKER_FLOORS` minimum now names the rule or rules the task matched (`matches your MODEL_PICKER_FLOORS rule 'review'`), not just the agent type.
+
 ## model-picker v0.6.0 (2026-11-19)
 
 - **Yes/no router questions, in shadow.** With `MODEL_PICKER_ROUTER_QUESTIONS=shadow` (`openai-decisions` only), each routed launch also asks the decisions API nine yes/no questions about the task: simple? read-only? a review? needs expert judgment? large? leads other agents? render-and-check? a costly mistake? checked by tests? Plain rules map the answers to a model and effort (`routers.tier_from_answers`, following the guide's table; never fable), and the pick is logged as `shadow` next to the normal one, fitted to your tiers and floors, with the yes answers and latency. What you and Claude see doesn't change, and shadow failures never pause the router. The second call runs in parallel and may add at most 0.5 s; the API-key command still runs once. Launches that set a model are routed (and shadowed) only with `MODEL_PICKER_ROUTER_ON_EXPLICIT=1`. Why: decision models answer narrow questions better than one broad "which tier?" choice, and rules can be read, tested and backtested. On 50 of the author's past launches (data not published), compared with a reviewer's pick, the questions plus a summary line chose the right model 44 times and too weak a model once; one question on the description alone chose right 16 times and too weak 30 times.

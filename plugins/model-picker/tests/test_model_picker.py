@@ -1746,9 +1746,13 @@ below = run(agent(description="Review PR 60 for bugs", prompt="p", model="opus")
 at = run(agent(description="Review PR 60 for bugs", prompt="p", model="opus", effort="high"), "advise", fst2)
 results += [
     check("floor effort: a launch under the floor (no effort set) is reminded of the rule",
-          "matches your MODEL_PICKER_FLOORS rule (at least opus/high effort)" in json.dumps(below)
+          "launch matches your MODEL_PICKER_FLOORS rule 'review' (at least opus/high effort)" in json.dumps(below)
           and "with no effort set" in json.dumps(below)),
     check("floor effort: a launch that meets the floor gets no reminder", "MODEL_PICKER_FLOORS" not in json.dumps(at)),
+    check("floor reminder: names every rule the task matched, not the agent type alone",
+          "rules 'review', 'docs'" in json.dumps(run(agent(description="Review the docs PR", prompt="p", model="sonnet"),
+                                                       "advise", fst2))
+          and mp.apply_floors(base_rec, {"description": "review docs"}, FE)["floor_rules"] == "review, docs"),
 ]
 
 # v0.4.10 review: fitted floors, stronger tiers meet effort floors, labels, stamp effort.
@@ -1811,6 +1815,10 @@ results += [
           tfa({"simple": True}) == ("haiku", "low") and tfa({"readonly": True}) == ("haiku", "low")
           and tfa({"simple": True, "stakes": True}) == ("sonnet", "high")),
     check("questions: expert judgment keeps simple work off haiku", tfa({"simple": True, "judgment": True}) == ("sonnet", "medium")),
+    check("questions: a synthesis someone acts on keeps read-only or simple work off haiku",
+          tfa({"readonly": True, "synth": True}) == ("sonnet", "medium") and tfa({"simple": True, "synth": True}) == ("sonnet", "medium")
+          and tfa({"readonly": True}) == ("haiku", "low") and tfa({"synth": True, "large": True}) == ("opus", "medium")),
+    check("questions: synth is asked with the others", "synth" in routers.QUESTIONS),
     check("questions: large building work -> opus; a large read-only investigation -> sonnet",
           tfa({"large": True}) == ("opus", "medium") and tfa({"large": True, "readonly": True}) == ("sonnet", "medium")),
     check("questions: no yes answers -> sonnet/medium", tfa({}) == ("sonnet", "medium")),
@@ -1850,7 +1858,7 @@ qout = json.dumps(run({**agent(description="Review diff", model="sonnet",
 qrow = ledger.read(qst)[-1]
 results += [
     check("shadow: both the normal and the yes/no request are sent; the prompt body never is",
-          len(SEEN) == 2 and sorted(len(r["body"]["questions"]) for r in SEEN) == [2, 9]
+          len(SEEN) == 2 and sorted(len(r["body"]["questions"]) for r in SEEN) == [2, len(routers.QUESTIONS)]
           and "SECRET-PROMPT" not in json.dumps(SEEN)),
     check("shadow: logged next to the normal pick, which is unchanged",
           qrow.get("source", "").startswith("openai-decisions:") and qrow.get("rec_effort") == "high"),

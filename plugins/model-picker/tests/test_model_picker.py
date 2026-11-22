@@ -2028,5 +2028,15 @@ results += [
           eg_row.get("router_error") == "server busy (503)" and "server busy" not in json.dumps(eg_out or {})),
 ]
 
+route_out = subprocess.run([sys.executable, "-I", str(HOOK), "route"], input="Debug the flaky login test", capture_output=True,
+                           text=True, env={**{k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")},
+                                           "MODEL_PICKER_CONFIG": "/nonexistent/model-picker.json",
+                                           **fresh_state(), **ERR_CMD}).stdout
+results += [
+    check("route: the skill's JSON carries no router stderr and no internal flags",
+          '"source": "heuristic (router error: CalledProcessError)"' in route_out
+          and "server busy" not in route_out and "router_fallback" not in route_out),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

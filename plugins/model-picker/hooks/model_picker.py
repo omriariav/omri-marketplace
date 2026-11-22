@@ -1576,7 +1576,9 @@ def main():
     cfg = load_config()
     if event == "route":
         task = (" ".join(sys.argv[2:3]) or sys.stdin.read()).strip()
-        print(json.dumps(decide({"description": task[:200], "prompt": task}, cfg, track=False), indent=2))
+        rec = decide({"description": task[:200], "prompt": task}, cfg, track=False)
+        # The skill reads this output into Claude's context: no router stderr (it may echo headers), no internals.
+        print(json.dumps({k: v for k, v in rec.items() if k not in ("router_error", "router_fallback")}, indent=2))
         return
     if event == "report":
         args = sys.argv[2:]

@@ -2038,5 +2038,77 @@ results += [
           and "server busy" not in route_out and "router_fallback" not in route_out),
 ]
 
+# v0.8.0: router profiles.
+import profiles  # noqa: E402
+pdir = Path(tempfile.mkdtemp(prefix="model-picker-profiles-"))
+pcfg = pdir / "config.json"
+marks = pdir / "marks"
+pcfg.write_text(json.dumps({
+    "_NOTE": "kept", "MODEL_PICKER_TIERS": "haiku,sonnet,opus", "MODEL_PICKER_ROUTER": "command",
+    "MODEL_PICKER_ROUTER_CMD": "/x/local.py", "MODEL_PICKER_ROUTER_INPUT": "summary",
+    "MODEL_PICKER_ROUTER_PROFILES": {
+        "local": {"description": "local model", "settings": {"MODEL_PICKER_ROUTER": "command",
+                  "MODEL_PICKER_ROUTER_CMD": "/x/local.py", "MODEL_PICKER_ROUTER_INPUT": "summary"},
+                  "on_select": f"echo start >> {marks}", "on_leave": f"echo stop >> {marks}"},
+        "hosted": {"description": "hosted API", "settings": {"MODEL_PICKER_ROUTER": "openai-decisions",
+                   "MODEL_PICKER_ROUTER_INPUT": "description", "MODEL_PICKER_ROUTER_CMD": None},
+                   "on_select": "echo 'server down' >&2; exit 4"}}}))
+listing = profiles.describe(pcfg, environ={})
+sel = profiles.select(pcfg, "hosted", environ={})
+after = json.loads(pcfg.read_text())
+again = profiles.select(pcfg, "hosted", environ={})
+back = profiles.select(pcfg, "local", environ={"MODEL_PICKER_ROUTER_INPUT": "description"})
+marks_back = marks.read_text().split()
+kw = profiles.select(pcfg, "keywords", environ={})
+results += [
+    check("profiles: the list marks the current profile and includes the built-in keywords",
+          "* local — local model  (current)" in listing and "  keywords — built-in" in listing and "  hosted — hosted API" in listing),
+    check("profiles: switching writes the profile's settings, removes null ones, keeps every other key",
+          after["MODEL_PICKER_ROUTER"] == "openai-decisions" and after["MODEL_PICKER_ROUTER_INPUT"] == "description"
+          and "MODEL_PICKER_ROUTER_CMD" not in after and after["_NOTE"] == "kept"
+          and after["MODEL_PICKER_TIERS"] == "haiku,sonnet,opus" and "local" in after["MODEL_PICKER_ROUTER_PROFILES"]),
+    check("profiles: the previous file is kept as config.json.prev",
+          json.loads((pdir / "config.json.prev").read_text())["MODEL_PICKER_ROUTER"] == "command"),
+    check("profiles: on_leave of the old profile runs; a failing on_select is reported and the switch stays",
+          "on_leave (local): ok" in sel and "on_select (hosted): FAILED (server down)" in sel
+          and "local -> hosted" in sel),
+    check("profiles: selecting the current profile changes nothing", "Already on 'hosted'" in again),
+    check("profiles: switching back runs on_select, and an environment override is pointed out",
+          "on_select (local): ok" in back and "MODEL_PICKER_ROUTER_INPUT set in the environment overrides" in back
+          and marks_back == ["stop", "start"]),
+    check("profiles: built-in keywords switches the router off and leaves the rest",
+          json.loads(pcfg.read_text())["MODEL_PICKER_ROUTER"] == "heuristic" and "on_leave (local): ok" in kw and marks.read_text().split() == ["stop", "start", "stop"]
+          and json.loads(pcfg.read_text())["MODEL_PICKER_ROUTER_CMD"] == "/x/local.py"),
+    check("profiles: the config file stays private (0600)", oct(pcfg.stat().st_mode & 0o777) == "0o600"),
+]
+def _perr(data, name=None):
+    f = Path(tempfile.mkdtemp()) / "c.json"
+    f.write_text(json.dumps(data) if not isinstance(data, str) else data)
+    try:
+        profiles.select(f, name, environ={}) if name else profiles.describe(f, environ={})
+    except profiles.ProfileError as exc:
+        return str(exc)
+    return None
+def _cli(cfgfile, *args):
+    return subprocess.run([sys.executable, "-I", str(HOOK), "router", *args], capture_output=True, text=True,
+                          env={**{k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")},
+                               "MODEL_PICKER_CONFIG": str(cfgfile)})
+nocfg = Path(tempfile.mkdtemp()) / "none.json"
+cli_bad = _cli(pcfg, "nope")
+results += [
+    check("profiles: a setting that isn't a model-picker key is refused",
+          "is not a model-picker setting" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"settings": {"PATH": "/"}}}}) or "")),
+    check("profiles: a profile without settings, or with unknown fields, is refused",
+          "needs a \"settings\" object" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"description": "d"}}}) or "")
+          and "unknown fields: run" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"settings": {}, "run": "y"}}}) or "")),
+    check("profiles: a config that isn't valid JSON is never overwritten", "not valid JSON" in (_perr("{oops", "keywords") or "")),
+    check("profiles: CLI lists with no config file yet, and suggests adding profiles",
+          "No profiles of your own yet" in _cli(nocfg).stdout and not nocfg.exists()),
+    check("profiles: CLI rejects an unknown profile with exit 2 and the list of names",
+          cli_bad.returncode == 2 and "no profile 'nope'" in cli_bad.stderr and "keywords" in cli_bad.stderr),
+    check("profiles: CLI switching creates the config file when there is none",
+          "-> keywords" in _cli(nocfg, "keywords").stdout and json.loads(nocfg.read_text()) == {"MODEL_PICKER_ROUTER": "heuristic"}),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

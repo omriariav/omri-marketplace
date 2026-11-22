@@ -1,5 +1,9 @@
 # Releases
 
+## model-picker v0.8.0 (2026-11-22)
+
+- **Router profiles and `/model-picker:router`.** Keep several router setups in the config (`MODEL_PICKER_ROUTER_PROFILES`: a hosted decisions API, a local model behind the `command` router, ...) and switch with one command. `/model-picker:router` lists the profiles and marks the current one; `/model-picker:router <name>` writes that profile's settings into the config (`null` removes a key), keeps every other key, and saves the previous file as `config.json.prev`. Optional `on_leave` / `on_select` shell commands run on a switch, for example to stop one local model server and start another; a failure is reported and the switch stays. A built-in `keywords` profile turns the router off. Why: switching routers meant editing several keys by hand, and forgetting one (say, the input level a hosted API may see) carried a setting over to the wrong router. Hooks read the config on every call, so a switch needs no restart; environment variables still override the file, and the command says when one does.
+
 ## model-picker v0.7.0 (2026-11-22)
 
 - **Parallel launches no longer trip the router pause.** Launches sent in one message call the router at the same time; a router that answers one request at a time can time out on all of them together. Failures of calls that overlapped the last counted one now count once, so one burst can't pause the router for 10 minutes. Failures one after another still add up and pause as before.

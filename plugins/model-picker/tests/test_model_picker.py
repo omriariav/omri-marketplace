@@ -1983,12 +1983,49 @@ results += [
 ERR_CMD = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "echo noise >&2; echo 'server busy (503)' >&2; exit 3"}
 err_rec = mp.decide({"description": "x"}, {**fresh_state(), **ERR_CMD}, for_launch=True)
 results += [
-    check("command error: the last stderr line is kept in the source",
-          err_rec["source"] == "heuristic (router error: CalledProcessError: server busy (503))"),
+    check("command error: the last stderr line is kept for the ledger, never in the source Claude sees",
+          err_rec["source"] == "heuristic (router error: CalledProcessError)" and err_rec["router_error"] == "server busy (503)"),
     check("command error: the API-key command's stderr is never kept",
           "SECRET-KEY" not in json.dumps(mp.decide({"description": "x"}, {**fresh_state(), **DOWN,
               "MODEL_PICKER_ROUTER_API_KEY_ENV": "MP_TEST_NO_SUCH_VAR",
               "MODEL_PICKER_ROUTER_API_KEY_CMD": "echo SECRET-KEY >&2; exit 1"}, for_launch=True))),
+]
+
+# v0.7.0 review round.
+ok_cmd = f"{sys.executable} -c \"print('{{\\\"tier\\\": \\\"sonnet\\\", \\\"confidence\\\": 0.9}}')\""
+t_bg = time.monotonic()
+bg_rec = mp.decide({"description": "x"}, {**fresh_state(), "MODEL_PICKER_ROUTER": "command",
+                    "MODEL_PICKER_ROUTER_CMD": f"(sleep 3 >/dev/null &); {ok_cmd}", "MODEL_PICKER_ROUTER_TIMEOUT": "2"}, for_launch=True)
+bg_secs = time.monotonic() - t_bg
+bad_rec = mp.decide({"description": "x"}, {**fresh_state(), "MODEL_PICKER_ROUTER": "command",
+                     "MODEL_PICKER_ROUTER_CMD": f"printf '\\377' >&2; {ok_cmd}"}, for_launch=True)
+long_rec = mp.decide({"description": "x"}, {**fresh_state(), "MODEL_PICKER_ROUTER": "command",
+                      "MODEL_PICKER_ROUTER_CMD": "yes x | head -c 200000 >&2; echo >&2; echo last-line >&2; exit 2",
+                      "MODEL_PICKER_ROUTER_TIMEOUT": "6"},
+                     for_launch=True)
+cst = {**fresh_state(), **DOWN}
+c0 = time.time()
+for i in range(8):  # calls 3 s long starting every 1.5 s: each overlaps the one before, never the last counted
+    mp.record_router(cst, None, now=c0 + 3 + i * 1.5, started=c0 + i * 1.5)
+results += [
+    check("command stderr: a helper left holding stderr doesn't make the call wait out the timeout",
+          bg_rec["source"].startswith("command") and bg_secs < 1.5),
+    check("command stderr: bytes that aren't UTF-8 don't discard a good answer", bad_rec["source"].startswith("command")),
+    check("command stderr: a huge stderr keeps only its last line", long_rec.get("router_error") == "last-line"),
+    check("burst: a chain of overlapping calls still adds up and pauses (overlap is with the last counted failure)",
+          mp.router_paused(cst, now=c0 + 20) == "timed out"),
+]
+lg = {**fresh_state(), **SLOW_CMD, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+run(agent(description="Find the retry limit in the config", prompt="p", model="opus"), "advise", lg)
+lg_row = [json.loads(l) for l in (Path(lg["MODEL_PICKER_STATE_DIR"]) / "log.jsonl").read_text().splitlines()][-1]
+eg = {**fresh_state(), **ERR_CMD, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+eg_out = run(agent(description="Debug the flaky login test", prompt="p", model="opus"), "advise", {**eg, "MODEL_PICKER_VERBOSE": "1"})
+eg_row = [json.loads(l) for l in (Path(eg["MODEL_PICKER_STATE_DIR"]) / "log.jsonl").read_text().splitlines()][-1]
+results += [
+    check("ledger: a launch judged by a fallback is neither followed nor not followed",
+          lg_row.get("followed") is None and "router_fallback" not in lg_row),
+    check("ledger: the router command's stderr tail is logged, and not shown to Claude",
+          eg_row.get("router_error") == "server busy (503)" and "server busy" not in json.dumps(eg_out or {})),
 ]
 
 print(f"\n{sum(results)}/{len(results)} passed")

@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import subprocess
+import tempfile
 import urllib.request
 
 EFFORTS = ["low", "medium", "high"]
@@ -189,12 +190,14 @@ def run_shell(cmd, timeout, stdin=None, keep_stderr=False):
     """Run a shell command with a hard timeout that also kills its children (`a; b`, pipes), so a slow
     command never outlives the hook. Returns stdout; raises on timeout or a non-zero exit.
     keep_stderr: on a non-zero exit, the error carries the last line of stderr (`stderr`), so a failing
-    router command can say why. Off for the API-key command, whose errors may echo secrets."""
-    with subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE if keep_stderr else subprocess.DEVNULL,
-                          text=True, start_new_session=True) as proc:
+    router command can say why. Off for the API-key command, whose errors may echo secrets. stderr goes to a
+    temp file, not a pipe: a helper the command leaves running may hold stderr open, and waiting for a pipe's
+    end would then time every call out."""
+    with tempfile.TemporaryFile() if keep_stderr else open(os.devnull, "wb") as errf, \
+            subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf,
+                             text=True, start_new_session=True) as proc:
         try:
-            out, err = proc.communicate(stdin, timeout=timeout)
+            out, _ = proc.communicate(stdin, timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -202,9 +205,13 @@ def run_shell(cmd, timeout, stdin=None, keep_stderr=False):
                 proc.kill()
             proc.wait()
             raise
-    if proc.returncode:
-        lines = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
-        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=lines[-1][:160] if lines else None)
+        if proc.returncode:
+            tail = None
+            if keep_stderr:
+                errf.seek(max(0, errf.seek(0, os.SEEK_END) - 4096))  # the end is enough for the last line
+                lines = [ln.strip() for ln in errf.read().decode("utf-8", "replace").splitlines() if ln.strip()]
+                tail = lines[-1][:160] if lines else None
+            raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=tail)
     return out
 
 

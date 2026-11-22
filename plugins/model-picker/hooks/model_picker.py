@@ -626,8 +626,10 @@ def _decide_answer(res, fallback, cfg, track, started=None):
     if res is None:
         fallback["source"] = "heuristic (router timed out)"
     elif isinstance(res, Exception):
+        fallback["source"] = f"heuristic (router error: {type(res).__name__})"
         detail = getattr(res, "stderr", None) if isinstance(res, subprocess.CalledProcessError) else None
-        fallback["source"] = f"heuristic (router error: {type(res).__name__}{f': {detail}' if detail else ''})"
+        if isinstance(detail, str) and detail:
+            fallback["router_error"] = detail  # ledger only: never shown to Claude (a verbose command may echo headers)
     elif res["confidence"] < _num(cfg, "MODEL_PICKER_ROUTER_MIN_CONFIDENCE", 0.5):
         fallback["source"] = f"heuristic (router {res['source']} unsure: {res['confidence']:.2f})"
     else:
@@ -856,7 +858,7 @@ def _failure(res):
 
 def _clear(h, prefix):
     changed = False
-    for k in ("fails", "reason", "rejected", "last", "paused_until"):
+    for k in ("fails", "reason", "rejected", "last", "counted", "paused_until"):
         changed = h.pop(prefix + k, None) is not None or changed
     return changed
 
@@ -904,8 +906,10 @@ def record_router(cfg, res, now=None, scope="launch", started=None):
             prev = h.get(pre + "fails") if isinstance(h.get(pre + "fails"), int) else 0
             # Parallel launches fail together (one slow router, one queue): a call that was already running when
             # the last failure was counted overlaps it and counts with it. One after another still adds up.
-            burst = not rejected and prev and started is not None and started < _num_field(h, pre + "last")
+            burst = not rejected and prev and started is not None and started < _num_field(h, pre + "counted")
             fails = prev if burst else prev + 1
+            if not burst:
+                h[pre + "counted"] = now
             h.update({pre + "fails": fails, pre + "reason": reason, pre + "rejected": rejected, pre + "last": now})
             if not rejected and fails < ROUTER_FAILS_TO_PAUSE:
                 h.pop(pre + "paused_until", None)
@@ -1107,8 +1111,10 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
                       "unsure": bool(rec.get("unsure")), "floor": rec.get("floor"),
                       "floor_effort": rec.get("floor_effort"),
                       # A fallback guess can't judge an explicit choice: leave "followed" unknown.
-                      "followed": None if (not chosen_tier or rec.get("unsure")) else
+                      "followed": None if (not chosen_tier or rec.get("unsure") or rec.get("router_fallback")) else
                       (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))})
+        if rec.get("router_error"):
+            entry["router_error"] = rec["router_error"]
         if rec.get("shadow"):
             entry["shadow"] = rec["shadow"]
     ledger.append(cfg, entry)

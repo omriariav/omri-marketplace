@@ -494,7 +494,7 @@ def apply_floors(rec, inp, cfg):
     effort = max((h[2] for h in at_top if h[2]), key=_effort_rank, default=None)
     tier, effort = _fitted_floor(top, effort, cfg)
     floor_min = f"{tier}/{effort}" if effort else tier
-    rules = ", ".join(dict.fromkeys(h[0] for h in hits))
+    rules = list(dict.fromkeys(h[0] for h in hits))
     # Name only the rules that set the minimum: the top-tier ones, and of those the one giving the effort.
     labels = ", ".join(dict.fromkeys(h[0] for h in at_top if not h[2] or h[2] == effort or tier != top))
     minimum = f"{tier}/{effort} effort" if effort else tier
@@ -1188,8 +1188,8 @@ def handle_agent(payload, mode, cfg):
         if honored:
             emit(system=note)
         elif below:
-            rules = [r for r in str(rec.get("floor_rules") or "").split(", ") if r]
-            named = f"rule{'s' if len(rules) > 1 else ''} {', '.join(repr(r) for r in rules)}" if rules else "rule"
+            rules = rec.get("floor_rules") or []
+            named = f"rule{'s' if len(rules) > 1 else ''} {', '.join(f'"{r}"' for r in rules)}" if rules else "rule"
             emit(context=f"model-picker: this `{label}` launch matches your MODEL_PICKER_FLOORS {named} (at least {below}); it was "
                          f"launched on {chosen}{f' at {launch_effort} effort' if launch_effort else ' with no effort set'}. "
                          "Use at least that for similar launches.", system=note)

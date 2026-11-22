@@ -3,7 +3,7 @@
 ## model-picker v0.6.1 (2026-11-22)
 
 - **A tenth yes/no question: synthesis.** The router questions (`MODEL_PICKER_ROUTER_QUESTIONS=shadow`) now also ask whether the agent must combine several sources into one synthesis, comparison or brief that someone will use to decide or act. A yes keeps read-only or simple work off haiku: it goes to sonnet/medium instead. Why: research briefs answered "read-only" and landed on haiku, though someone acts on the result. On 79 of the author's past launches not used to write the question (data not published), compared with a reviewer's pick, the right model went from 63 to 65 and no pick got worse.
-- **Floor reminders name the rule.** A launch under a `MODEL_PICKER_FLOORS` minimum now names the rule or rules the task matched (`matches your MODEL_PICKER_FLOORS rule 'review'`), not just the agent type.
+- **Floor reminders name the rule.** A launch under a `MODEL_PICKER_FLOORS` minimum now names the rule or rules the task matched (`matches your MODEL_PICKER_FLOORS rule "review"`), not just the agent type.
 
 ## model-picker v0.6.0 (2026-11-19)
 

@@ -1746,13 +1746,16 @@ below = run(agent(description="Review PR 60 for bugs", prompt="p", model="opus")
 at = run(agent(description="Review PR 60 for bugs", prompt="p", model="opus", effort="high"), "advise", fst2)
 results += [
     check("floor effort: a launch under the floor (no effort set) is reminded of the rule",
-          "launch matches your MODEL_PICKER_FLOORS rule 'review' (at least opus/high effort)" in json.dumps(below)
+          "launch matches your MODEL_PICKER_FLOORS rule \"review\" (at least opus/high effort)" in str(below)
           and "with no effort set" in json.dumps(below)),
     check("floor effort: a launch that meets the floor gets no reminder", "MODEL_PICKER_FLOORS" not in json.dumps(at)),
     check("floor reminder: names every rule the task matched, not the agent type alone",
-          "rules 'review', 'docs'" in json.dumps(run(agent(description="Review the docs PR", prompt="p", model="sonnet"),
-                                                       "advise", fst2))
-          and mp.apply_floors(base_rec, {"description": "review docs"}, FE)["floor_rules"] == "review, docs"),
+          'rules "review", "docs"' in str(run(agent(description="Review the docs PR", prompt="p", model="sonnet"),
+                                              "advise", fst2))
+          and mp.apply_floors(base_rec, {"description": "review docs"}, FE)["floor_rules"] == ["review", "docs"]),
+    check("floor reminder: a rule name with a comma stays one rule, shown as written",
+          'rule "review|a, b"' in str(run(agent(description="Review it", prompt="p", model="haiku"), "advise",
+                                                    {**fresh_state(), "MODEL_PICKER_FLOORS": json.dumps({"review|a, b": "opus"})}))),
 ]
 
 # v0.4.10 review: fitted floors, stronger tiers meet effort floors, labels, stamp effort.

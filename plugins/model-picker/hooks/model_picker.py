@@ -547,10 +547,11 @@ def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
         return fallback
     paused = router_paused(cfg)
     if paused:
+        fallback["router_fallback"] = True
         fallback["source"] = f"heuristic (router paused: {paused})"
         fallback["unavailable"] = f"{paused}, paused"
         return fallback
-    started = time.monotonic()
+    started, started_wall = time.monotonic(), time.time()
     shadow = None
     if track and _shadow_on(name, cfg):  # not for `route` (track=False): it would print the pick and log nothing
         cfg = {**cfg, "_key": _key_or_error(name, cfg)}  # run a key command once for both calls
@@ -560,7 +561,7 @@ def _decide(inp, cfg, use_router=True, allow_local=True, track=True):
     worker.start()
     worker.join(max(0.0, ROUTER_DEADLINE - (time.monotonic() - started)))
     fallback["router_ms"] = int((time.monotonic() - started) * 1000)
-    rec = _decide_answer(box.get("res"), fallback, cfg, track)
+    rec = _decide_answer(box.get("res"), fallback, cfg, track, started_wall)
     if shadow:
         rec["shadow"] = _finish_shadow(shadow, started)
     return rec
@@ -613,21 +614,26 @@ def _fit_shadow(rec, inp, cfg):
     return {**rec, "shadow": out}
 
 
-def _decide_answer(res, fallback, cfg, track):
+def _decide_answer(res, fallback, cfg, track, started=None):
     """Turn the router's result into a recommendation, or annotate the heuristic fallback."""
-    notice = record_router(cfg, res) if track else None
+    notice = record_router(cfg, res, started=started) if track else None
     if notice:
         fallback["notice"] = notice
     why = _unavailable(res)
     if why:  # a bad or unsure answer means it is up: no label
         fallback["unavailable"] = why
+    fallback["router_fallback"] = True  # a router was asked but its answer isn't used; cleared below when it is
     if res is None:
         fallback["source"] = "heuristic (router timed out)"
     elif isinstance(res, Exception):
         fallback["source"] = f"heuristic (router error: {type(res).__name__})"
+        detail = getattr(res, "stderr", None) if isinstance(res, subprocess.CalledProcessError) else None
+        if isinstance(detail, str) and detail:
+            fallback["router_error"] = detail  # ledger only: never shown to Claude (a verbose command may echo headers)
     elif res["confidence"] < _num(cfg, "MODEL_PICKER_ROUTER_MIN_CONFIDENCE", 0.5):
         fallback["source"] = f"heuristic (router {res['source']} unsure: {res['confidence']:.2f})"
     else:
+        fallback.pop("router_fallback", None)
         return {"tier": res["tier"], "effort": res["effort"], "reason": routers.TIER_CRITERIA[res["tier"]],
                 "source": f"{res['source']} ({res['confidence']:.2f})", "confidence": res["confidence"],
                 "router_ms": fallback["router_ms"], "unsure": False}
@@ -852,12 +858,12 @@ def _failure(res):
 
 def _clear(h, prefix):
     changed = False
-    for k in ("fails", "reason", "rejected", "last", "paused_until"):
+    for k in ("fails", "reason", "rejected", "last", "counted", "paused_until"):
         changed = h.pop(prefix + k, None) is not None or changed
     return changed
 
 
-def record_router(cfg, res, now=None, scope="launch"):
+def record_router(cfg, res, now=None, scope="launch", started=None):
     """Count this router call in the shared state. Returns a one-line notice when it starts a pause.
 
     Three counts per router, each "in a row" for what it measures:
@@ -866,7 +872,8 @@ def record_router(cfg, res, now=None, scope="launch"):
       which shows a one-line label on a failure anyway; a prompt answer clears it.
     - launch_: every launch failure; pauses only launches; a launch answer clears it (a short prompt answering
       in time says nothing about a long launch input).
-    A retry that fails right after a pause, for the same kind of reason, pauses again quietly (the user was told)."""
+    A retry that fails right after a pause, for the same kind of reason, pauses again quietly (the user was told).
+    started: wall-clock start of this call; a failure of a call that overlapped the last counted one isn't counted."""
     pause = _pause_seconds(cfg)
     if pause <= 0:
         return None
@@ -896,7 +903,13 @@ def record_router(cfg, res, now=None, scope="launch"):
         counts = [own] + ([] if slow else [""])
         for pre in counts:
             until = _paused_until(h, pre)
-            fails = h[pre + "fails"] + 1 if isinstance(h.get(pre + "fails"), int) else 1
+            prev = h.get(pre + "fails") if isinstance(h.get(pre + "fails"), int) else 0
+            # Parallel launches fail together (one slow router, one queue): a call that was already running when
+            # the last failure was counted overlaps it and counts with it. One after another still adds up.
+            burst = not rejected and prev and started is not None and started < _num_field(h, pre + "counted")
+            fails = prev if burst else prev + 1
+            if not burst:
+                h[pre + "counted"] = now
             h.update({pre + "fails": fails, pre + "reason": reason, pre + "rejected": rejected, pre + "last": now})
             if not rejected and fails < ROUTER_FAILS_TO_PAUSE:
                 h.pop(pre + "paused_until", None)
@@ -1098,8 +1111,10 @@ def log_decision(cfg, payload, inp, outcome, chosen=None, rec=None, session_mode
                       "unsure": bool(rec.get("unsure")), "floor": rec.get("floor"),
                       "floor_effort": rec.get("floor_effort"),
                       # A fallback guess can't judge an explicit choice: leave "followed" unknown.
-                      "followed": None if (not chosen_tier or rec.get("unsure")) else
+                      "followed": None if (not chosen_tier or rec.get("unsure") or rec.get("router_fallback")) else
                       (chosen_tier == rec["tier"] or (rec["tier"] == "local" and chosen_tier == "haiku"))})
+        if rec.get("router_error"):
+            entry["router_error"] = rec["router_error"]
         if rec.get("shadow"):
             entry["shadow"] = rec["shadow"]
     ledger.append(cfg, entry)
@@ -1193,7 +1208,9 @@ def handle_agent(payload, mode, cfg):
             emit(context=f"model-picker: this `{label}` launch matches your MODEL_PICKER_FLOORS {named} (at least {below}); it was "
                          f"launched on {chosen}{f' at {launch_effort} effort' if launch_effort else ' with no effort set'}. "
                          "Use at least that for similar launches.", system=note)
-        elif chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2:
+        elif chosen and not rec.get("unsure") and abs(TIERS.index(chosen) - TIERS.index(rec["tier"])) >= 2 and not (
+                rec.get("router_fallback") and TIERS.index(rec["tier"]) < TIERS.index(chosen)):
+            # The keyword rules standing in for a failed router are too weak to argue a launch down.
             emit(context=f"model-picker: `{label}` launched on {chosen}, but the task reads as "
                          f"{describe(rec, cfg)}. Prefer that for similar launches unless you have a specific reason.",
                  system=note)
@@ -1559,7 +1576,9 @@ def main():
     cfg = load_config()
     if event == "route":
         task = (" ".join(sys.argv[2:3]) or sys.stdin.read()).strip()
-        print(json.dumps(decide({"description": task[:200], "prompt": task}, cfg, track=False), indent=2))
+        rec = decide({"description": task[:200], "prompt": task}, cfg, track=False)
+        # The skill reads this output into Claude's context: no router stderr (it may echo headers), no internals.
+        print(json.dumps({k: v for k, v in rec.items() if k not in ("router_error", "router_fallback")}, indent=2))
         return
     if event == "report":
         args = sys.argv[2:]

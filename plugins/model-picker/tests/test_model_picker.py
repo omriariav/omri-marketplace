@@ -1955,5 +1955,88 @@ results += [
           == "Task: compare gpt-4.1/gpt-5.5 and fix __init__.py for [id] [token]"),
 ]
 
+# v0.7.0: parallel failures count once; a fallback never argues a launch down; command errors say why.
+ost2 = {**fresh_state(), **DOWN}
+t0 = time.time()
+burst = [mp.record_router(ost2, None, now=t0 + i * 0.1, started=t0 - 6) for i in range(3)]
+h_burst = mp._health_read(ost2)
+seq = [mp.record_router(ost2, None, now=t0 + 20 + i * 7, started=t0 + 14 + i * 7) for i in range(2)]
+results += [
+    check("burst: parallel timeouts (calls overlapping the last counted one) count once, no pause",
+          burst == [None, None, None] and h_burst.get("launch_fails") == 1 and mp.router_paused(ost2, now=t0 + 1) is None),
+    check("burst: failures one after another still add up and pause",
+          mp._health_read(ost2).get("launch_fails") == 3 and mp.router_paused(ost2, now=t0 + 35) == "timed out"),
+]
+SLOW_CMD = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "sleep 5", "MODEL_PICKER_ROUTER_TIMEOUT": "0.3"}
+fb_down = run(agent(description="Find the retry limit in the config", prompt="p", model="opus"), "advise",
+              {**fresh_state(), **SLOW_CMD, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"})
+fb_rec = mp.decide({"description": "Find the retry limit in the config"}, {**fresh_state(), **SLOW_CMD}, for_launch=True)
+no_router = run(agent(description="Find the retry limit in the config", prompt="p", model="opus"), "advise", fresh_state())
+results += [
+    check("fallback: keyword rules standing in for a failed router don't argue an opus launch down to haiku",
+          fb_rec["tier"] == "haiku" and fb_rec.get("router_fallback") and "Prefer that" not in json.dumps(fb_down or {})),
+    check("fallback: with no router configured, the keyword rules still nudge as before",
+          "Prefer that" in json.dumps(no_router or {})),
+    check("fallback: a router answer carries no fallback flag",
+          not mp.decide({"description": "x"}, {**fresh_state(), **CMD}, for_launch=True).get("router_fallback")),
+]
+ERR_CMD = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "echo noise >&2; echo 'server busy (503)' >&2; exit 3"}
+err_rec = mp.decide({"description": "x"}, {**fresh_state(), **ERR_CMD}, for_launch=True)
+results += [
+    check("command error: the last stderr line is kept for the ledger, never in the source Claude sees",
+          err_rec["source"] == "heuristic (router error: CalledProcessError)" and err_rec["router_error"] == "server busy (503)"),
+    check("command error: the API-key command's stderr is never kept",
+          "SECRET-KEY" not in json.dumps(mp.decide({"description": "x"}, {**fresh_state(), **DOWN,
+              "MODEL_PICKER_ROUTER_API_KEY_ENV": "MP_TEST_NO_SUCH_VAR",
+              "MODEL_PICKER_ROUTER_API_KEY_CMD": "echo SECRET-KEY >&2; exit 1"}, for_launch=True))),
+]
+
+# v0.7.0 review round.
+ok_cmd = f"{sys.executable} -c \"print('{{\\\"tier\\\": \\\"sonnet\\\", \\\"confidence\\\": 0.9}}')\""
+t_bg = time.monotonic()
+bg_rec = mp.decide({"description": "x"}, {**fresh_state(), "MODEL_PICKER_ROUTER": "command",
+                    "MODEL_PICKER_ROUTER_CMD": f"(sleep 3 >/dev/null &); {ok_cmd}", "MODEL_PICKER_ROUTER_TIMEOUT": "2"}, for_launch=True)
+bg_secs = time.monotonic() - t_bg
+bad_rec = mp.decide({"description": "x"}, {**fresh_state(), "MODEL_PICKER_ROUTER": "command",
+                     "MODEL_PICKER_ROUTER_CMD": f"printf '\\377' >&2; {ok_cmd}"}, for_launch=True)
+long_rec = mp.decide({"description": "x"}, {**fresh_state(), "MODEL_PICKER_ROUTER": "command",
+                      "MODEL_PICKER_ROUTER_CMD": "yes x | head -c 200000 >&2; echo >&2; echo last-line >&2; exit 2",
+                      "MODEL_PICKER_ROUTER_TIMEOUT": "6"},
+                     for_launch=True)
+cst = {**fresh_state(), **DOWN}
+c0 = time.time()
+for i in range(8):  # calls 3 s long starting every 1.5 s: each overlaps the one before, never the last counted
+    mp.record_router(cst, None, now=c0 + 3 + i * 1.5, started=c0 + i * 1.5)
+results += [
+    check("command stderr: a helper left holding stderr doesn't make the call wait out the timeout",
+          bg_rec["source"].startswith("command") and bg_secs < 1.5),
+    check("command stderr: bytes that aren't UTF-8 don't discard a good answer", bad_rec["source"].startswith("command")),
+    check("command stderr: a huge stderr keeps only its last line", long_rec.get("router_error") == "last-line"),
+    check("burst: a chain of overlapping calls still adds up and pauses (overlap is with the last counted failure)",
+          mp.router_paused(cst, now=c0 + 20) == "timed out"),
+]
+lg = {**fresh_state(), **SLOW_CMD, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+run(agent(description="Find the retry limit in the config", prompt="p", model="opus"), "advise", lg)
+lg_row = [json.loads(l) for l in (Path(lg["MODEL_PICKER_STATE_DIR"]) / "log.jsonl").read_text().splitlines()][-1]
+eg = {**fresh_state(), **ERR_CMD, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"}
+eg_out = run(agent(description="Debug the flaky login test", prompt="p", model="opus"), "advise", {**eg, "MODEL_PICKER_VERBOSE": "1"})
+eg_row = [json.loads(l) for l in (Path(eg["MODEL_PICKER_STATE_DIR"]) / "log.jsonl").read_text().splitlines()][-1]
+results += [
+    check("ledger: a launch judged by a fallback is neither followed nor not followed",
+          lg_row.get("followed") is None and "router_fallback" not in lg_row),
+    check("ledger: the router command's stderr tail is logged, and not shown to Claude",
+          eg_row.get("router_error") == "server busy (503)" and "server busy" not in json.dumps(eg_out or {})),
+]
+
+route_out = subprocess.run([sys.executable, "-I", str(HOOK), "route"], input="Debug the flaky login test", capture_output=True,
+                           text=True, env={**{k: v for k, v in os.environ.items() if not k.startswith("MODEL_PICKER_")},
+                                           "MODEL_PICKER_CONFIG": "/nonexistent/model-picker.json",
+                                           **fresh_state(), **ERR_CMD}).stdout
+results += [
+    check("route: the skill's JSON carries no router stderr and no internal flags",
+          '"source": "heuristic (router error: CalledProcessError)"' in route_out
+          and "server busy" not in route_out and "router_fallback" not in route_out),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

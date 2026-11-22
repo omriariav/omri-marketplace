@@ -47,6 +47,7 @@ keys at $MODEL_PICKER_CONFIG (default ~/.config/model-picker/config.json):
                                  (or one rejected request, e.g. HTTP 401), skip router calls for this long
 
 Also: model_picker.py report [today|24h|7d|30d|all] [--json] [--html [--out PATH] [--open]]
+      model_picker.py router [PROFILE]   list router profiles (MODEL_PICKER_ROUTER_PROFILES), or switch to one
 """
 
 import fcntl
@@ -65,6 +66,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ledger  # noqa: E402
+import profiles  # noqa: E402
 import routers  # noqa: E402
 
 TIERS = ["local", "haiku", "sonnet", "opus", "fable"]
@@ -1579,6 +1581,15 @@ def main():
         rec = decide({"description": task[:200], "prompt": task}, cfg, track=False)
         # The skill reads this output into Claude's context: no router stderr (it may echo headers), no internals.
         print(json.dumps({k: v for k, v in rec.items() if k not in ("router_error", "router_fallback")}, indent=2))
+        return
+    if event == "router":
+        # List router profiles, or switch to one: `model_picker.py router [name]`.
+        try:
+            name = sys.argv[2] if len(sys.argv) > 2 else None
+            print(profiles.select(config_path(), name) if name else profiles.describe(config_path()))
+        except (profiles.ProfileError, OSError) as exc:
+            print(f"model-picker router: {exc}", file=sys.stderr)
+            sys.exit(2)
         return
     if event == "report":
         args = sys.argv[2:]

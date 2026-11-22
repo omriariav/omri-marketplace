@@ -45,6 +45,7 @@ Set as environment variables (for example in `settings.json` → `env`), or as t
 | `MODEL_PICKER_ROUTER_QUESTIONS` | `shadow` (`openai-decisions` only): also ask the router ten yes/no questions about the task (simple? read-only? a review? needs expert judgment? large? leads other agents? render-and-check? a costly mistake? checked by tests? a synthesis someone acts on?), map the answers to a model and effort with plain rules (`routers.tier_from_answers`), and log that pick as `shadow` next to the normal one, fitted to your tiers and floors. Nothing you or Claude see changes. It doubles decisions-API calls; they run in parallel and a slow one adds at most 0.5 s. Launches that set a model are only routed with `MODEL_PICKER_ROUTER_ON_EXPLICIT=1`. Best with `MODEL_PICKER_ROUTER_INPUT=summary` | off |
 | `MODEL_PICKER_ROUTER_TIMEOUT` | Seconds | `3` |
 | `MODEL_PICKER_ASK` | `0` stops noticing a model or effort you name in your prompt (see [You asked for it](#you-asked-for-it)) | `1` |
+| `MODEL_PICKER_ROUTER_PROFILES` | Named router setups to switch between with `/model-picker:router` (see Router profiles). Config file only: an environment variable is ignored | unset |
 | `MODEL_PICKER_ROUTER_PAUSE` | Minutes to skip router calls after 3 failures in a row (calls that ran in parallel and failed together, such as launches sent in one message, count once; timeouts, connection or HTTP errors, a router/key command exiting non-zero) or one rejected request (HTTP 400/401/403/404/405/407). Connection failures and rejections pause every call (launches use the keyword heuristic, the prompt line skips the call); repeated prompt or launch failures pause only that kind of call (see the decisions API section). One line tells you when a pause starts. Otherwise a launch whose router call fails, has no key, or is skipped by a pause shows `model-picker: gpt-6-luna unavailable (timed out); keyword rules used`, and so does a prompt the prompt line would have routed, without the last part (with `1`, once per break). Shared by all sessions (`router-health.json` in the state dir; delete it to retry at once). `0` never pauses | `10` |
 | `MODEL_PICKER_ROUTER_MIN_CONFIDENCE` | Below this, the heuristic decides | `0.5` |
 | `MODEL_PICKER_ROUTER_ON_EXPLICIT` | `1` also asks the router about launches that already set a model, so every launch gets a real verdict (follow rate and credited savings depend on it). Costs one router call (~0.7 s) per launch | `0` |
@@ -88,6 +89,28 @@ Example (LiteLLM gateway, in `~/.config/model-picker/config.json`):
   "MODEL_PICKER_ROUTER_API_KEY_ENV": "LITELLM_API_KEY",
   "MODEL_PICKER_ROUTER_HEADERS": {"x-litellm-enable-message-redaction": "true"},
   "MODEL_PICKER_ROUTER_METADATA": {"tags": ["service:model-picker"]}
+}
+```
+
+### Router profiles
+
+Keep several router setups in the config and switch with one command: `/model-picker:router` lists them and marks the current one, and `/model-picker:router <name>` switches (from a shell: `python3 hooks/model_picker.py router [name]`). A profile's `settings` are written into the config file (`null` removes a key) and everything else is kept; the previous file is saved as `config.json.prev` next to it (next to the link's target when the config is a symlink). Optional `on_leave` and `on_select` shell commands run when you switch away from or to a profile, for example to stop or start a local model server. Their output is discarded, so a server started in the background returns at once; a command still running after 60 s is stopped. A failing command is reported by its exit code only (run it by hand to see why), and the switch stays. Put every setting that differs between profiles in each profile, so a switch never carries one over (here, the hosted API sees only the description, while the local router also reads the summary line). `keywords` is built in: no router, keyword rules only. Hooks read the config on every call, so a switch needs no restart; a `MODEL_PICKER_*` environment variable still overrides the file, and the command says so.
+
+```json
+"MODEL_PICKER_ROUTER_PROFILES": {
+  "hosted": {
+    "description": "hosted decisions API, task description only",
+    "settings": {"MODEL_PICKER_ROUTER": "openai-decisions", "MODEL_PICKER_ROUTER_MODEL": "gpt-6-luna",
+                 "MODEL_PICKER_ROUTER_INPUT": "description", "MODEL_PICKER_ROUTER_CMD": null,
+                 "MODEL_PICKER_ROUTER_TIMEOUT": null}
+  },
+  "local": {
+    "description": "local model through the command router",
+    "settings": {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "~/routers/local_router.py",
+                 "MODEL_PICKER_ROUTER_INPUT": "summary", "MODEL_PICKER_ROUTER_TIMEOUT": "6"},
+    "on_select": "~/routers/start-server.sh",
+    "on_leave": "~/routers/stop-server.sh"
+  }
 }
 ```
 

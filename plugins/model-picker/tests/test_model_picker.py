@@ -3,6 +3,7 @@
 import json
 import re
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2070,7 +2071,8 @@ results += [
     check("profiles: the previous file is kept as config.json.prev",
           json.loads((pdir / "config.json.prev").read_text())["MODEL_PICKER_ROUTER"] == "command"),
     check("profiles: on_leave of the old profile runs; a failing on_select is reported and the switch stays",
-          "on_leave (local): ok" in sel and "on_select (hosted): FAILED (server down)" in sel
+          "on_leave (local): ok" in sel and "on_select (hosted): FAILED (exit 4; run it by hand to see why)" in sel
+          and "server down" not in sel
           and "local -> hosted" in sel),
     check("profiles: selecting the current profile changes nothing", "Already on 'hosted'" in again),
     check("profiles: switching back runs on_select, and an environment override is pointed out",
@@ -2099,15 +2101,69 @@ results += [
     check("profiles: a setting that isn't a model-picker key is refused",
           "is not a model-picker setting" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"settings": {"PATH": "/"}}}}) or "")),
     check("profiles: a profile without settings, or with unknown fields, is refused",
-          "needs a \"settings\" object" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"description": "d"}}}) or "")
-          and "unknown fields: run" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"settings": {}, "run": "y"}}}) or "")),
+          "needs a non-empty \"settings\" object" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"description": "d"}}}) or "")
+          and "non-empty" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"settings": {}}}}) or "")
+          and "unknown fields: run" in (_perr({"MODEL_PICKER_ROUTER_PROFILES": {"x": {"settings": {"MODEL_PICKER_ROUTER": "heuristic"}, "run": "y"}}}) or "")),
     check("profiles: a config that isn't valid JSON is never overwritten", "not valid JSON" in (_perr("{oops", "keywords") or "")),
     check("profiles: CLI lists with no config file yet, and suggests adding profiles",
           "No profiles of your own yet" in _cli(nocfg).stdout and not nocfg.exists()),
     check("profiles: CLI rejects an unknown profile with exit 2 and the list of names",
           cli_bad.returncode == 2 and "no profile 'nope'" in cli_bad.stderr and "keywords" in cli_bad.stderr),
-    check("profiles: CLI switching creates the config file when there is none",
-          "-> keywords" in _cli(nocfg, "keywords").stdout and json.loads(nocfg.read_text()) == {"MODEL_PICKER_ROUTER": "heuristic"}),
+    check("profiles: with no config file, the default router counts as the built-in keywords profile",
+          "Already on 'keywords'" in _cli(nocfg, "keywords").stdout and not nocfg.exists()),
+]
+
+# v0.8.0 review round.
+rr = Path(tempfile.mkdtemp(prefix="model-picker-profiles2-"))
+order = rr / "order"
+srv = rr / "srv.pid"
+two = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "/a",
+       "MODEL_PICKER_ROUTER_PROFILES": {
+           "a": {"settings": {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "/a"}, "on_leave": f"echo leave-a >> {order}"},
+           "b": {"settings": {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "/b"},
+                 "on_select": f"echo select-b >> {order}; sleep 30 & echo $! > {srv}"}}}
+real = rr / "dots" / "config.json"
+real.parent.mkdir()
+real.write_text(json.dumps(two))
+link = rr / "config.json"
+link.symlink_to(real)
+t_sw = time.monotonic()
+sw = profiles.select(link, "b", environ={})
+sw_secs = time.monotonic() - t_sw
+pid = int(srv.read_text().strip())
+try:
+    os.kill(pid, 0)
+    alive = True
+except OSError:
+    alive = False
+if alive:
+    os.kill(pid, signal.SIGKILL)
+prev = real.with_name("config.json.prev")
+results += [
+    check("profiles: one switch runs the old on_leave, then the new on_select", order.read_text().split() == ["leave-a", "select-b"]),
+    check("profiles: a server started in the background returns at once and keeps running",
+          "on_select (b): ok" in sw and sw_secs < 5 and alive),
+    check("profiles: a symlinked config is written at its target; the link stays",
+          link.is_symlink() and json.loads(real.read_text())["MODEL_PICKER_ROUTER_CMD"] == "/b"),
+    check("profiles: the .prev backup is private and holds the old settings",
+          oct(prev.stat().st_mode & 0o777) == "0o600" and json.loads(prev.read_text())["MODEL_PICKER_ROUTER_CMD"] == "/a"),
+]
+badjson = rr / "bad.json"
+badjson.write_text("{oops")
+_perr_bad = _cli(badjson, "keywords")
+ro = rr / "ro"
+ro.mkdir()
+(ro / "config.json").write_text(json.dumps({"MODEL_PICKER_ROUTER": "command"}))
+os.chmod(ro, 0o500)
+ro_out = _cli(ro / "config.json", "keywords")
+os.chmod(ro, 0o700)
+mine = {"MODEL_PICKER_ROUTER": "heuristic", "MODEL_PICKER_ROUTER_PROFILES": {"off": {"settings": {"MODEL_PICKER_ROUTER": "heuristic"}}}}
+results += [
+    check("profiles: invalid JSON is left byte-for-byte unchanged", _perr_bad.returncode == 2 and badjson.read_text() == "{oops"),
+    check("profiles: a write error exits 2 with a router message, not a hook error",
+          ro_out.returncode == 2 and ro_out.stderr.startswith("model-picker router:") and "hook error" not in ro_out.stdout),
+    check("profiles: on a tie, the user's own profile is current, not the built-in one",
+          profiles.current(mine, profiles.profiles(mine)) == "off"),
 ]
 
 print(f"\n{sum(results)}/{len(results)} passed")

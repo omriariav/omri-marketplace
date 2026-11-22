@@ -9,9 +9,9 @@ A built-in "keywords" profile (no router, keyword rules only) exists unless the 
 """
 import json
 import os
+import signal
+import subprocess
 import tempfile
-
-import routers
 
 PROFILES_KEY = "MODEL_PICKER_ROUTER_PROFILES"
 PROFILE_FIELDS = {"description", "settings", "on_select", "on_leave"}
@@ -49,8 +49,8 @@ def profiles(raw):
         raise ProfileError(f"{PROFILES_KEY} must be an object of name -> profile")
     out = dict(BUILTIN)
     for name, p in user.items():
-        if not isinstance(p, dict) or not isinstance(p.get("settings"), dict):
-            raise ProfileError(f"profile {name!r} needs a \"settings\" object")
+        if not isinstance(p, dict) or not isinstance(p.get("settings"), dict) or not p["settings"]:
+            raise ProfileError(f"profile {name!r} needs a non-empty \"settings\" object")
         extra = set(p) - PROFILE_FIELDS
         if extra:
             raise ProfileError(f"profile {name!r} has unknown fields: {', '.join(sorted(extra))}")
@@ -64,23 +64,34 @@ def profiles(raw):
     return out
 
 
+def _effective(raw, key):
+    value = raw.get(key)
+    return "heuristic" if key == "MODEL_PICKER_ROUTER" and value is None else value  # absent = the default
+
+
 def _matches(raw, profile):
-    return all(raw.get(k) == v for k, v in profile["settings"].items())
+    return all(_effective(raw, k) == v for k, v in profile["settings"].items())
 
 
 def current(raw, profs):
-    """The profile whose settings all match the config (the most specific when several do), or None."""
+    """The profile whose settings all match the config, or None. When several match: the most specific, and
+    the user's own over a built-in one."""
     hits = [n for n, p in profs.items() if _matches(raw, p)]
-    return max(hits, key=lambda n: len(profs[n]["settings"])) if hits else None
+    return max(hits, key=lambda n: (len(profs[n]["settings"]), n not in BUILTIN or profs[n] is not BUILTIN.get(n))) \
+        if hits else None
 
 
 def _write(path, raw):
-    """Atomic write; the previous file is kept as <name>.prev."""
+    """Atomic write; the previous file is kept as <name>.prev (0600 from the start, never through a symlink).
+    A symlinked config is written at its target, so a link into a dotfiles repo keeps working."""
+    path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         prev = path.with_name(path.name + ".prev")
-        prev.write_bytes(path.read_bytes())
-        os.chmod(prev, 0o600)
+        fd = os.open(prev, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(path.read_bytes())
+        os.chmod(prev, 0o600)  # an older .prev may have had other modes
     fd, tmp = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -97,14 +108,26 @@ def _write(path, raw):
 
 
 def _run_hook(label, cmd):
+    """Run an on_select / on_leave command. Its output goes nowhere, so a server it starts in the background
+    can't hold the call open; only the shell is waited for. Only the exit code is reported: this text reaches
+    Claude, and a command's own output may echo secrets."""
     if not cmd:
         return None
     try:
-        routers.run_shell(cmd, HOOK_TIMEOUT, keep_stderr=True)
-        return f"{label}: ok"
-    except Exception as exc:  # report, never undo the switch
-        why = getattr(exc, "stderr", None) or type(exc).__name__
-        return f"{label}: FAILED ({why})"
+        proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        return f"{label}: FAILED ({type(exc).__name__})"
+    try:
+        code = proc.wait(timeout=HOOK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, AttributeError):
+            proc.kill()
+        proc.wait()
+        return f"{label}: FAILED (still running after {HOOK_TIMEOUT} s; stopped)"
+    return f"{label}: ok" if code == 0 else f"{label}: FAILED (exit {code}; run it by hand to see why)"
 
 
 def describe(path, environ=None):

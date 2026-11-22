@@ -1587,7 +1587,7 @@ def main():
         try:
             name = sys.argv[2] if len(sys.argv) > 2 else None
             print(profiles.select(config_path(), name) if name else profiles.describe(config_path()))
-        except profiles.ProfileError as exc:
+        except (profiles.ProfileError, OSError) as exc:
             print(f"model-picker router: {exc}", file=sys.stderr)
             sys.exit(2)
         return

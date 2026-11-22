@@ -185,13 +185,16 @@ def google_decisions(task, tiers, cfg):
                    f"google-decisions:{model}")
 
 
-def run_shell(cmd, timeout, stdin=None):
+def run_shell(cmd, timeout, stdin=None, keep_stderr=False):
     """Run a shell command with a hard timeout that also kills its children (`a; b`, pipes), so a slow
-    command never outlives the hook. Returns stdout; raises on timeout or a non-zero exit."""
-    with subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    command never outlives the hook. Returns stdout; raises on timeout or a non-zero exit.
+    keep_stderr: on a non-zero exit, the error carries the last line of stderr (`stderr`), so a failing
+    router command can say why. Off for the API-key command, whose errors may echo secrets."""
+    with subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE if keep_stderr else subprocess.DEVNULL,
                           text=True, start_new_session=True) as proc:
         try:
-            out, _ = proc.communicate(stdin, timeout=timeout)
+            out, err = proc.communicate(stdin, timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -200,7 +203,8 @@ def run_shell(cmd, timeout, stdin=None):
             proc.wait()
             raise
     if proc.returncode:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+        lines = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=lines[-1][:160] if lines else None)
     return out
 
 
@@ -210,7 +214,8 @@ def command(task, tiers, cfg):
     cmd = cfg.get("MODEL_PICKER_ROUTER_CMD")
     if not cmd:
         raise ValueError("MODEL_PICKER_ROUTER_CMD is not set")
-    out = run_shell(cmd, cfg["_timeout"], json.dumps({"task": task, "tiers": tiers, "efforts": EFFORTS}))
+    out = run_shell(cmd, cfg["_timeout"], json.dumps({"task": task, "tiers": tiers, "efforts": EFFORTS}),
+                    keep_stderr=True)
     data = json.loads(out)
     if data.get("tier") not in tiers:
         raise ValueError(f"command returned tier {data.get('tier')!r}")

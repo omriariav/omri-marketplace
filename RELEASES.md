@@ -1,5 +1,11 @@
 # Releases
 
+## model-picker v0.7.0 (2026-11-22)
+
+- **Parallel launches no longer trip the router pause.** Launches sent in one message call the router at the same time; a router that answers one request at a time can time out on all of them together. Failures of calls that overlapped the last counted one now count once, so one burst can't pause the router for 10 minutes. Failures one after another still add up and pause as before.
+- **The keyword fallback never argues a launch down.** When the keyword heuristic stands in for a router that failed, was paused or was unsure, model-picker no longer tells Claude that an Opus launch "reads as haiku". The heuristic is too rough for that: it would push judgment work (a deck, a review reply) to the cheapest model. With no router configured, its nudges are unchanged.
+- **`command` router errors say why.** On a non-zero exit, the last line the command wrote to stderr is kept in the recommendation's `source` and the ledger (`router error: CalledProcessError: server busy (503)`), so a failing router can be diagnosed. The API-key command's stderr is still discarded, since it may echo secrets.
+
 ## model-picker v0.6.1 (2026-11-22)
 
 - **A tenth yes/no question: synthesis.** The router questions (`MODEL_PICKER_ROUTER_QUESTIONS=shadow`) now also ask whether the agent must combine several sources into one synthesis, comparison or brief that someone will use to decide or act. A yes keeps read-only or simple work off haiku: it goes to sonnet/medium instead. Why: research briefs answered "read-only" and landed on haiku, though someone acts on the result. On 79 of the author's past launches not used to write the question (data not published), compared with a reviewer's pick, the right model went from 63 to 65 and no pick got worse.

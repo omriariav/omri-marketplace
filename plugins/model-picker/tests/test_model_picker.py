@@ -1955,5 +1955,41 @@ results += [
           == "Task: compare gpt-4.1/gpt-5.5 and fix __init__.py for [id] [token]"),
 ]
 
+# v0.7.0: parallel failures count once; a fallback never argues a launch down; command errors say why.
+ost2 = {**fresh_state(), **DOWN}
+t0 = time.time()
+burst = [mp.record_router(ost2, None, now=t0 + i * 0.1, started=t0 - 6) for i in range(3)]
+h_burst = mp._health_read(ost2)
+seq = [mp.record_router(ost2, None, now=t0 + 20 + i * 7, started=t0 + 14 + i * 7) for i in range(2)]
+results += [
+    check("burst: parallel timeouts (calls overlapping the last counted one) count once, no pause",
+          burst == [None, None, None] and h_burst.get("launch_fails") == 1 and mp.router_paused(ost2, now=t0 + 1) is None),
+    check("burst: failures one after another still add up and pause",
+          mp._health_read(ost2).get("launch_fails") == 3 and mp.router_paused(ost2, now=t0 + 35) == "timed out"),
+]
+SLOW_CMD = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "sleep 5", "MODEL_PICKER_ROUTER_TIMEOUT": "0.3"}
+fb_down = run(agent(description="Find the retry limit in the config", prompt="p", model="opus"), "advise",
+              {**fresh_state(), **SLOW_CMD, "MODEL_PICKER_ROUTER_ON_EXPLICIT": "1"})
+fb_rec = mp.decide({"description": "Find the retry limit in the config"}, {**fresh_state(), **SLOW_CMD}, for_launch=True)
+no_router = run(agent(description="Find the retry limit in the config", prompt="p", model="opus"), "advise", fresh_state())
+results += [
+    check("fallback: keyword rules standing in for a failed router don't argue an opus launch down to haiku",
+          fb_rec["tier"] == "haiku" and fb_rec.get("router_fallback") and "Prefer that" not in json.dumps(fb_down or {})),
+    check("fallback: with no router configured, the keyword rules still nudge as before",
+          "Prefer that" in json.dumps(no_router or {})),
+    check("fallback: a router answer carries no fallback flag",
+          not mp.decide({"description": "x"}, {**fresh_state(), **CMD}, for_launch=True).get("router_fallback")),
+]
+ERR_CMD = {"MODEL_PICKER_ROUTER": "command", "MODEL_PICKER_ROUTER_CMD": "echo noise >&2; echo 'server busy (503)' >&2; exit 3"}
+err_rec = mp.decide({"description": "x"}, {**fresh_state(), **ERR_CMD}, for_launch=True)
+results += [
+    check("command error: the last stderr line is kept in the source",
+          err_rec["source"] == "heuristic (router error: CalledProcessError: server busy (503))"),
+    check("command error: the API-key command's stderr is never kept",
+          "SECRET-KEY" not in json.dumps(mp.decide({"description": "x"}, {**fresh_state(), **DOWN,
+              "MODEL_PICKER_ROUTER_API_KEY_ENV": "MP_TEST_NO_SUCH_VAR",
+              "MODEL_PICKER_ROUTER_API_KEY_CMD": "echo SECRET-KEY >&2; exit 1"}, for_launch=True))),
+]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

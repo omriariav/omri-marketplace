@@ -102,6 +102,8 @@ QUESTIONS = {
     "stakes": "Is a mistake both costly and hard to notice: it gates a merge or release, or people act on the "
               "result without re-checking it?",
     "autocheck": "Does the task include writing or running automated tests or a script that checks the result?",
+    "synth": "Must the agent combine several sources into one synthesis, comparison or brief that someone will use "
+             "to decide or act?",
 }
 
 
@@ -121,8 +123,8 @@ def tier_from_answers(yes):
         tier = "opus"                                   # multi-part features, unknown failures
     elif y("review") or y("stakes") or y("judgment"):
         tier = "sonnet"                                 # not cheap to verify: never haiku
-    elif y("simple") or (y("readonly") and not y("large")):
-        tier = "haiku"
+    elif (y("simple") or (y("readonly") and not y("large"))) and not y("synth"):
+        tier = "haiku"                                  # a brief someone acts on is not side work
     else:
         tier = "sonnet"
     if tier == "haiku":

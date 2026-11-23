@@ -653,6 +653,37 @@ def _diverged(r):
     return f"; of the rest, {up} went to a stronger model, {down} to a cheaper one"
 
 
+PACE_DAYS = {"24h": 1, "7d": 7}  # periods long enough, and fixed enough, to extrapolate a monthly figure
+
+
+def _pace(r):
+    """" At this pace, about $X a month." for a fixed 24h/7d window with a credited saving, else ""."""
+    days = PACE_DAYS.get(r.get("period"))
+    monthly = (r.get("credited_saving") or 0) * 30 / days if days else 0
+    return f" At this pace, about ${monthly:,.0f} a month." if monthly >= 1 else ""
+
+
+def _credited_agents(r):
+    return (r.get("saving_by_attribution") or {}).get("model-picker", {}).get("agents", 0)
+
+
+def _headline(r):
+    """(label, amount, note, is_saving) for the credited saving. Following model-picker can cost more than the
+    session model (it recommended a stronger model); that is said plainly, never shown as a negative saving."""
+    saved = round(r.get("credited_saving") or 0, 2)
+    note = f"{_credited_agents(r)} agent(s) followed its recommendation."
+    if saved < 0:
+        return ("Extra cost of model-picker's picks", _money(-saved),
+                note + " It recommended stronger models than the session's.", False)
+    return "Saved by model-picker", _money(saved), note + _pace(r), True
+
+
+def _total_line(r):
+    return (f"Total difference vs the session model: {_money(r['saving'])} "
+            f"({_pct(r['saving'], r['baseline_cost'])} of {_money(r['baseline_cost'])}), including your rules, "
+            "agent definitions and own picks; the breakdown below the table says who gets credit.")
+
+
 def _prompts_line(r):
     tiers = ", ".join(f"{k} {v}" for k, v in sorted(r["prompt_tiers"].items(), key=lambda kv: -kv[1]))
     return (f"Prompts routed: {r['prompts_routed']} ({tiers}); {r['prompts_cheaper']} looked like work for a cheaper "
@@ -667,6 +698,9 @@ def format_report(r):
         return "\n".join(lines + ["No launches logged yet. The ledger fills as agents launch "
                                   "(`MODEL_PICKER_LOG` must not be `0`)."])
     tiers = ", ".join(f"{k} {v}" for k, v in sorted(r["launch_tiers"].items(), key=lambda kv: -kv[1]))
+    if r["by_model"]:
+        label, amount, note, _ = _headline(r)
+        lines += [f"**{label}: {amount}**. {note}", f"- {_total_line(r)}", ""]
     lines += [
         f"- Launches: {r['launches']} ({r['checked']} checked, {r['skipped']} skipped as fork/pinned/built-in"
         + (f"; {r['denied']} denied in enforce mode and retried" if r.get("denied") else "") + ")",
@@ -684,8 +718,8 @@ def format_report(r):
                   "|---|---:|---:|---:|---:|---:|---:|---:|"]
         for key, row in sorted(r["by_model"].items(), key=lambda kv: -kv[1]["cost"]):
             lines.append(f"| {key} | {row['agents']} | {_tok(row['input'] + row['cache_write'])} | "
-                         f"{_tok(row['output'])} | {_tok(row['cache_read'])} | ${row['cost']:.2f} | "
-                         f"${row['baseline_cost']:.2f} | ${row['saving']:.2f} |")
+                         f"{_tok(row['output'])} | {_tok(row['cache_read'])} | {_money(row['cost'])} | "
+                         f"{_money(row['baseline_cost'])} | {_money(row['saving'])} |")
         labels = {"model-picker": "followed model-picker's recommendation",
                   "rule": "followed your own MODEL_PICKER_FLOORS rule",
                   "user": "the model you asked for in your prompt",
@@ -695,15 +729,15 @@ def format_report(r):
                   "inherited": "inherited the session model", "unknown": "no launch record"}
         attr = r.get("saving_by_attribution") or {}
         lines += ["",
-                  f"- Subagent spend: ${r['cost']:.2f}; at the session model it would have been "
-                  f"${r['baseline_cost']:.2f}. Total difference: ${r['saving']:.2f} "
+                  f"- Subagent spend: {_money(r['cost'])}; at the session model it would have been "
+                  f"{_money(r['baseline_cost'])}. Total difference: {_money(r['saving'])} "
                   f"({_pct(r['saving'], r['baseline_cost'])}).",
-                  f"- **Credited to model-picker: ${r.get('credited_saving', 0):.2f}** "
-                  f"({attr.get('model-picker', {}).get('agents', 0)} agent(s) that followed its recommendation)."]
+                  f"- Credited to model-picker: {_money(r.get('credited_saving', 0))} "
+                  f"({_credited_agents(r)} agent(s) that followed its recommendation)."]
         for key in ("rule", "user", "definition", "explicit", "unjudged", "inherited", "unknown"):
             if key in attr:
                 lines.append(f"  - Not credited, {labels[key]}: {attr[key]['agents']} agent(s), "
-                             f"${attr[key]['saving']:.2f}")
+                             f"{_money(attr[key]['saving'])}")
         if r["local_agents"]:
             lines.append(f"- {r['local_agents']} subagent(s) ran on a local model, counted at $0.")
         lines += ["", "_Estimate: same tokens at list prices; a larger model may have used fewer tokens._"]
@@ -739,7 +773,8 @@ h2{font-size:15px;margin:32px 0 12px;color:var(--ink2);font-weight:600}.sub{colo
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(170px,100%),1fr));gap:12px;margin-top:24px}
 .tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
 .tile .k{font-size:12px;color:var(--ink2)}.tile .v{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums}
-.tile .n{font-size:12px;color:var(--muted)}.tile.hero .v{color:var(--good)}
+.tile .n{font-size:12px;color:var(--muted)}.tile.hero{margin-top:24px;padding:20px 22px}
+.tile.hero .k{font-size:14px}.tile.hero .v{font-size:44px;line-height:1.1}.tile.hero.good .v{color:var(--good)}.tile.hero .n{font-size:14px;color:var(--ink2)}
 .card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;overflow-x:auto}
 .legend{display:flex;gap:16px;font-size:12px;color:var(--ink2);margin-bottom:10px}
 .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
@@ -757,7 +792,7 @@ ul.facts{margin:0;padding-left:18px;color:var(--ink2);font-size:13px}.foot{margi
 
 
 def _money(x):
-    return f"${x:,.2f}"
+    return f"-${-x:,.2f}" if round(x, 2) < 0 else f"${abs(x):,.2f}"  # abs: never "$-0.00"
 
 
 def format_html(r, generated=None):
@@ -772,20 +807,24 @@ def format_html(r, generated=None):
     if not r["launches"] and not r["subagents"] and not r.get("local_calls") and not r.get("prompts_routed"):
         return head + "<p>No launches logged yet. The ledger fills as agents launch.</p></main></body></html>"
     attr = r.get("saving_by_attribution") or {}
-    credited_agents = attr.get("model-picker", {}).get("agents", 0)
+    out = [head]
+    if r["by_model"]:
+        label, amount, note, good = _headline(r)
+        out.append(f"<div class='tile hero{' good' if good else ''}'><div class=k>{e(label)}</div>"
+                   f"<div class=v>{e(amount)}</div><div class=n>{e(note)}</div></div>")
     tiles = [
         ("Subagent spend", _money(r["cost"]), f"{r['subagents']} subagent(s)", ""),
         ("At the session model", _money(r["baseline_cost"]),
-         f"difference {_money(r['saving'])} ({_pct(r['saving'], r['baseline_cost'])})", ""),
-        ("Credited to model-picker", _money(r.get("credited_saving", 0)),
-         f"{credited_agents} agent(s) that followed it", " hero"),
+         "if every subagent had run on it", ""),
+        ("Total difference", _money(r["saving"]), "vs the session model, including your rules, agent definitions "
+         "and own picks", ""),
         ("Followed recommendation", _pct(r["followed"], r["compared"]),
          f"{r['followed']} of {r['compared']} launches" + (f"; {r.get('went_stronger', 0)} went stronger, "
                                                            f"{r.get('went_cheaper', 0)} cheaper"
                                                            if r.get("went_stronger") or r.get("went_cheaper") else "")
          + (f"; {r['user_picks']} you picked" if r.get("user_picks") else ""), ""),
     ]
-    out = [head, "<div class=tiles>"]
+    out.append("<div class=tiles>")
     for k, v, n, cls in tiles:
         out.append(f"<div class='tile{cls}'><div class=k>{e(k)}</div><div class=v>{e(v)}</div><div class=n>{e(n)}</div></div>")
     out.append("</div>")
@@ -824,7 +863,7 @@ def format_html(r, generated=None):
         out.append("<h2>Who gets credit for the difference</h2><div class=card><table><thead><tr><th>Why the model "
                    "was cheaper</th><th>Agents</th><th>Saved</th></tr></thead><tbody>")
         for key in sorted(attr, key=lambda k: (k != "model-picker", -attr[k]["saving"])):
-            cls = " class=credited" if key == "model-picker" else ""
+            cls = " class=credited" if key == "model-picker" and attr[key]["saving"] >= 0 else ""
             out.append(f"<tr><td>{e(_ATTR_LABELS.get(key, key))}</td><td>{attr[key]['agents']}</td>"
                        f"<td{cls}>{_money(attr[key]['saving'])}</td></tr>")
         out.append("</tbody></table></div>")

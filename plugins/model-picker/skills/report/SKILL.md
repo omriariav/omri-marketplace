@@ -27,7 +27,7 @@ Show the output as-is; it is already a short summary plus a Markdown table. It e
 don't claim it opened if that line says it could not. Leave out `--open` if the user asked for text only. Then add at most two
 lines of your own:
 
-1. The saving to quote is **Credited to model-picker**, not the total difference. The total also
+1. The saving to quote is **Saved by model-picker** (the first line after the title), not the total difference. If that line reads **Extra cost of model-picker's picks**, say that following it cost more than the session model, because it recommended stronger models. The total also
    counts agents whose own definition already picked a cheap model, which would have saved money
    with or without model-picker, so quoting it overstates the plugin.
 2. The single most useful observation, for example "8 of 11 launches without a model inherited opus;

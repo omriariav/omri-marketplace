@@ -653,11 +653,13 @@ def _diverged(r):
     return f"; of the rest, {up} went to a stronger model, {down} to a cheaper one"
 
 
-PACE_DAYS = {"24h": 1, "7d": 7}  # periods long enough, and fixed enough, to extrapolate a monthly figure
+# Only a full week is extrapolated to a month: it holds busy days and quiet ones. One day times 30 overstates a busy
+# day; 30d is already a month; today and all have no fixed length.
+PACE_DAYS = {"7d": 7}
 
 
 def _pace(r):
-    """" At this pace, about $X a month." for a fixed 24h/7d window with a credited saving, else ""."""
+    """" At this pace, about $X a month." for the 7d window with a credited saving of $1+ a month, else ""."""
     days = PACE_DAYS.get(r.get("period"))
     monthly = (r.get("credited_saving") or 0) * 30 / days if days else 0
     return f" At this pace, about ${monthly:,.0f} a month." if monthly >= 1 else ""

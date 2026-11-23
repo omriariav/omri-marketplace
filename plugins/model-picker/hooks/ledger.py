@@ -670,7 +670,7 @@ def _credited_agents(r):
 def _headline(r):
     """(label, amount, note, is_saving) for the credited saving. Following model-picker can cost more than the
     session model (it recommended a stronger model); that is said plainly, never shown as a negative saving."""
-    saved = r.get("credited_saving") or 0
+    saved = round(r.get("credited_saving") or 0, 2)
     note = f"{_credited_agents(r)} agent(s) followed its recommendation."
     if saved < 0:
         return ("Extra cost of model-picker's picks", _money(-saved),
@@ -863,7 +863,7 @@ def format_html(r, generated=None):
         out.append("<h2>Who gets credit for the difference</h2><div class=card><table><thead><tr><th>Why the model "
                    "was cheaper</th><th>Agents</th><th>Saved</th></tr></thead><tbody>")
         for key in sorted(attr, key=lambda k: (k != "model-picker", -attr[k]["saving"])):
-            cls = " class=credited" if key == "model-picker" else ""
+            cls = " class=credited" if key == "model-picker" and attr[key]["saving"] >= 0 else ""
             out.append(f"<tr><td>{e(_ATTR_LABELS.get(key, key))}</td><td>{attr[key]['agents']}</td>"
                        f"<td{cls}>{_money(attr[key]['saving'])}</td></tr>")
         out.append("</tbody></table></div>")

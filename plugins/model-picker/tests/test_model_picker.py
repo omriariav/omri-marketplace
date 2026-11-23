@@ -851,14 +851,21 @@ results += [
     check("report: pace under $1 a month is left out",
           "At this pace" not in ledger.format_report({**ledger.report(st, "7d"), "credited_saving": 0.01})),
 ]
-neg = {**ledger.report(st, "24h"), "credited_saving": -1.5}
+st = fresh_state()
+ledger.append(st, {"kind": "usage", "agent_id": "n1", "tier": "opus", "input": 1, "output": 1, "cache_read": 0,
+                   "cache_write": 0, "cost": 3.0, "baseline_cost": 1.5, "saving": -1.5, "attribution": "model-picker"})
+ledger.append(st, {"kind": "usage", "agent_id": "n2", "tier": "haiku", "input": 1, "output": 1, "cache_read": 0,
+                   "cache_write": 0, "cost": 0.5, "baseline_cost": 1.5, "saving": 1.0, "attribution": "definition"})
+neg = ledger.report(st, "24h")
 neg_md, neg_html = ledger.format_report(neg), ledger.format_html(neg)
 results += [
     check("report: a negative credited saving reads as an extra cost, never '$-'",
           "**Extra cost of model-picker's picks: $1.50**" in neg_md and "$-" not in neg_md.split("|")[0]
           and "Saved by model-picker" not in neg_md and "At this pace" not in neg_md),
     check("html: an extra cost is not shown in the saving colour",
-          "tile hero'" in neg_html and "tile hero good" not in neg_html and "$-1.50" not in neg_html),
+          "tile hero'" in neg_html and "tile hero good" not in neg_html and "class=credited" not in neg_html),
+    check("report: an extra cost that rounds to $0.00 is shown as a $0.00 saving",
+          "**Saved by model-picker: $0.00**" in ledger.format_report({**neg, "credited_saving": -0.004})),
 ]
 
 # --- v0.4.4: background stamps delivered on the next turn ------------------------------

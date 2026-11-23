@@ -718,8 +718,8 @@ def format_report(r):
                   "|---|---:|---:|---:|---:|---:|---:|---:|"]
         for key, row in sorted(r["by_model"].items(), key=lambda kv: -kv[1]["cost"]):
             lines.append(f"| {key} | {row['agents']} | {_tok(row['input'] + row['cache_write'])} | "
-                         f"{_tok(row['output'])} | {_tok(row['cache_read'])} | ${row['cost']:.2f} | "
-                         f"${row['baseline_cost']:.2f} | ${row['saving']:.2f} |")
+                         f"{_tok(row['output'])} | {_tok(row['cache_read'])} | {_money(row['cost'])} | "
+                         f"{_money(row['baseline_cost'])} | {_money(row['saving'])} |")
         labels = {"model-picker": "followed model-picker's recommendation",
                   "rule": "followed your own MODEL_PICKER_FLOORS rule",
                   "user": "the model you asked for in your prompt",
@@ -729,15 +729,15 @@ def format_report(r):
                   "inherited": "inherited the session model", "unknown": "no launch record"}
         attr = r.get("saving_by_attribution") or {}
         lines += ["",
-                  f"- Subagent spend: ${r['cost']:.2f}; at the session model it would have been "
-                  f"${r['baseline_cost']:.2f}. Total difference: ${r['saving']:.2f} "
+                  f"- Subagent spend: {_money(r['cost'])}; at the session model it would have been "
+                  f"{_money(r['baseline_cost'])}. Total difference: {_money(r['saving'])} "
                   f"({_pct(r['saving'], r['baseline_cost'])}).",
-                  f"- Credited to model-picker: ${r.get('credited_saving', 0):.2f} "
+                  f"- Credited to model-picker: {_money(r.get('credited_saving', 0))} "
                   f"({_credited_agents(r)} agent(s) that followed its recommendation)."]
         for key in ("rule", "user", "definition", "explicit", "unjudged", "inherited", "unknown"):
             if key in attr:
                 lines.append(f"  - Not credited, {labels[key]}: {attr[key]['agents']} agent(s), "
-                             f"${attr[key]['saving']:.2f}")
+                             f"{_money(attr[key]['saving'])}")
         if r["local_agents"]:
             lines.append(f"- {r['local_agents']} subagent(s) ran on a local model, counted at $0.")
         lines += ["", "_Estimate: same tokens at list prices; a larger model may have used fewer tokens._"]
@@ -792,7 +792,7 @@ ul.facts{margin:0;padding-left:18px;color:var(--ink2);font-size:13px}.foot{margi
 
 
 def _money(x):
-    return f"${x:,.2f}"
+    return f"-${-x:,.2f}" if round(x, 2) < 0 else f"${abs(x):,.2f}"  # abs: never "$-0.00"
 
 
 def format_html(r, generated=None):

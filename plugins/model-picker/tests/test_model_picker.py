@@ -860,7 +860,7 @@ neg = ledger.report(st, "24h")
 neg_md, neg_html = ledger.format_report(neg), ledger.format_html(neg)
 results += [
     check("report: a negative credited saving reads as an extra cost, never '$-'",
-          "**Extra cost of model-picker's picks: $1.50**" in neg_md and "$-" not in neg_md.split("|")[0]
+          "**Extra cost of model-picker's picks: $1.50**" in neg_md and "$-" not in neg_md and "Total difference vs the session model: -$0.50" in neg_md
           and "Saved by model-picker" not in neg_md and "At this pace" not in neg_md),
     check("html: an extra cost is not shown in the saving colour",
           "tile hero'" in neg_html and "tile hero good" not in neg_html and "class=credited" not in neg_html),

@@ -659,12 +659,29 @@ PACE_DAYS = {"24h": 1, "7d": 7}  # periods long enough, and fixed enough, to ext
 def _pace(r):
     """" At this pace, about $X a month." for a fixed 24h/7d window with a credited saving, else ""."""
     days = PACE_DAYS.get(r.get("period"))
-    saved = r.get("credited_saving") or 0
-    return f" At this pace, about ${saved * 30 / days:,.0f} a month." if days and saved > 0 else ""
+    monthly = (r.get("credited_saving") or 0) * 30 / days if days else 0
+    return f" At this pace, about ${monthly:,.0f} a month." if monthly >= 1 else ""
 
 
 def _credited_agents(r):
     return (r.get("saving_by_attribution") or {}).get("model-picker", {}).get("agents", 0)
+
+
+def _headline(r):
+    """(label, amount, note, is_saving) for the credited saving. Following model-picker can cost more than the
+    session model (it recommended a stronger model); that is said plainly, never shown as a negative saving."""
+    saved = r.get("credited_saving") or 0
+    note = f"{_credited_agents(r)} agent(s) followed its recommendation."
+    if saved < 0:
+        return ("Extra cost of model-picker's picks", _money(-saved),
+                note + " It recommended stronger models than the session's.", False)
+    return "Saved by model-picker", _money(saved), note + _pace(r), True
+
+
+def _total_line(r):
+    return (f"Total difference vs the session model: {_money(r['saving'])} "
+            f"({_pct(r['saving'], r['baseline_cost'])} of {_money(r['baseline_cost'])}), including your rules, "
+            "agent definitions and own picks; the breakdown below the table says who gets credit.")
 
 
 def _prompts_line(r):
@@ -682,11 +699,8 @@ def format_report(r):
                                   "(`MODEL_PICKER_LOG` must not be `0`)."])
     tiers = ", ".join(f"{k} {v}" for k, v in sorted(r["launch_tiers"].items(), key=lambda kv: -kv[1]))
     if r["by_model"]:
-        lines += [f"**Saved by model-picker: {_money(r.get('credited_saving', 0))}** ({_credited_agents(r)} agent(s) ran "
-                  f"on the cheaper model it recommended).{_pace(r)}",
-                  f"- All cheaper-than-session runs together: {_money(r['saving'])} "
-                  f"({_pct(r['saving'], r['baseline_cost'])} of {_money(r['baseline_cost'])} at the session model); "
-                  "the breakdown below the table says who gets credit for the rest.", ""]
+        label, amount, note, _ = _headline(r)
+        lines += [f"**{label}: {amount}**. {note}", f"- {_total_line(r)}", ""]
     lines += [
         f"- Launches: {r['launches']} ({r['checked']} checked, {r['skipped']} skipped as fork/pinned/built-in"
         + (f"; {r['denied']} denied in enforce mode and retried" if r.get("denied") else "") + ")",
@@ -760,7 +774,7 @@ h2{font-size:15px;margin:32px 0 12px;color:var(--ink2);font-weight:600}.sub{colo
 .tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
 .tile .k{font-size:12px;color:var(--ink2)}.tile .v{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums}
 .tile .n{font-size:12px;color:var(--muted)}.tile.hero{margin-top:24px;padding:20px 22px}
-.tile.hero .k{font-size:14px}.tile.hero .v{font-size:44px;line-height:1.1;color:var(--good)}.tile.hero .n{font-size:14px;color:var(--ink2)}
+.tile.hero .k{font-size:14px}.tile.hero .v{font-size:44px;line-height:1.1}.tile.hero.good .v{color:var(--good)}.tile.hero .n{font-size:14px;color:var(--ink2)}
 .card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;overflow-x:auto}
 .legend{display:flex;gap:16px;font-size:12px;color:var(--ink2);margin-bottom:10px}
 .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
@@ -795,14 +809,15 @@ def format_html(r, generated=None):
     attr = r.get("saving_by_attribution") or {}
     out = [head]
     if r["by_model"]:
-        out.append(f"<div class='tile hero'><div class=k>Saved by model-picker</div>"
-                   f"<div class=v>{e(_money(r.get('credited_saving', 0)))}</div><div class=n>"
-                   f"{_credited_agents(r)} agent(s) ran on the cheaper model it recommended.{e(_pace(r))}</div></div>")
+        label, amount, note, good = _headline(r)
+        out.append(f"<div class='tile hero{' good' if good else ''}'><div class=k>{e(label)}</div>"
+                   f"<div class=v>{e(amount)}</div><div class=n>{e(note)}</div></div>")
     tiles = [
         ("Subagent spend", _money(r["cost"]), f"{r['subagents']} subagent(s)", ""),
         ("At the session model", _money(r["baseline_cost"]),
          "if every subagent had run on it", ""),
-        ("All cheaper runs saved", _money(r["saving"]), "including your rules, agent definitions and own picks", ""),
+        ("Total difference", _money(r["saving"]), "vs the session model, including your rules, agent definitions "
+         "and own picks", ""),
         ("Followed recommendation", _pct(r["followed"], r["compared"]),
          f"{r['followed']} of {r['compared']} launches" + (f"; {r.get('went_stronger', 0)} went stronger, "
                                                            f"{r.get('went_cheaper', 0)} cheaper"

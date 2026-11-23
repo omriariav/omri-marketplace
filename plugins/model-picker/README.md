@@ -130,8 +130,8 @@ Rotated files are kept as `log.<epoch>.jsonl` (newest 10); writes are serialized
 ```markdown
 **model-picker report (7d)**
 
-**Saved by model-picker: $3.94** (13 agent(s) ran on the cheaper model it recommended). At this pace, about $17 a month.
-- All cheaper-than-session runs together: $5.20 (77% of $6.73 at the session model); the breakdown below the table says who gets credit for the rest.
+**Saved by model-picker: $3.94**. 13 agent(s) followed its recommendation. At this pace, about $17 a month.
+- Total difference vs the session model: $5.20 (77% of $6.73), including your rules, agent definitions and own picks; the breakdown below the table says who gets credit.
 
 - Launches: 23 (19 checked, 4 skipped as fork/pinned/built-in)
 - Explicit model: 17/19 (89%)
@@ -149,7 +149,7 @@ Rotated files are kept as `log.<epoch>.jsonl` (newest 10); writes are serialized
   - Not credited, model set by the agent's own definition (would have happened anyway): 3 agent(s), $1.26
 ```
 
-(Illustrative numbers.) The report opens with the saving credited to model-picker; for `24h` and `7d` it adds a monthly figure at that pace (a straight extrapolation). Prices are Claude API list prices per million tokens: Haiku 5.5 $0.10 input / $0.50 output for prompts up to 100K tokens ($0.50 / $2.50 above), Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20, Fable 5.2 $8 / $40, with cache reads at $0.01 (Haiku), $0.10, $0.20, $0.20. Cache writes use the standard 1.25x (5-minute) and 2x (1-hour) input multipliers. The saving is an estimate: same tokens, different price. A larger model may finish in fewer tokens, so treat it as an upper bound.
+(Illustrative numbers.) The report opens with the saving credited to model-picker; for `24h` and `7d` it adds a monthly figure at that pace (a straight extrapolation, left out under $1). If following model-picker cost more than the session model would have (it recommended stronger models), the first line says "Extra cost of model-picker's picks" instead. Prices are Claude API list prices per million tokens: Haiku 5.5 $0.10 input / $0.50 output for prompts up to 100K tokens ($0.50 / $2.50 above), Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20, Fable 5.2 $8 / $40, with cache reads at $0.01 (Haiku), $0.10, $0.20, $0.20. Cache writes use the standard 1.25x (5-minute) and 2x (1-hour) input multipliers. The saving is an estimate: same tokens, different price. A larger model may finish in fewer tokens, so treat it as an upper bound.
 
 With `MODEL_PICKER_VERBOSE=1` you also see each decision as it happens:
 

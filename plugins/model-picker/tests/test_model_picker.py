@@ -838,15 +838,27 @@ lines = ledger.format_report(ledger.report(st, "24h")).split("\n")
 week = ledger.format_report(ledger.report(st, "7d"))
 results += [
     check("report: first line after the title is the credited saving, with a monthly pace for 24h",
-          lines[2] == "**Saved by model-picker: $2.00** (1 agent(s) ran on the cheaper model it recommended). "
+          lines[2] == "**Saved by model-picker: $2.00**. 1 agent(s) followed its recommendation. "
                       "At this pace, about $60 a month."),
-    check("report: total difference shown next to the credited saving", "together: $3.00 (67% of $4.50" in lines[3]),
+    check("report: total difference shown next to the credited saving",
+          lines[3].startswith("- Total difference vs the session model: $3.00 (67% of $4.50)")),
     check("report: 7d pace divides by the week", "about $9 a month" in week),
     check("report: no pace for all-time or today, or with nothing credited",
           "At this pace" not in ledger.format_report(ledger.report(st, "all"))
           and "At this pace" not in ledger.format_report(ledger.report(st, "today"))
           and "At this pace" not in ledger.format_report({**ledger.report(st, "24h"), "credited_saving": 0})),
     check("html: hero shows the pace", "about $60 a month" in ledger.format_html(ledger.report(st, "24h"))),
+    check("report: pace under $1 a month is left out",
+          "At this pace" not in ledger.format_report({**ledger.report(st, "7d"), "credited_saving": 0.01})),
+]
+neg = {**ledger.report(st, "24h"), "credited_saving": -1.5}
+neg_md, neg_html = ledger.format_report(neg), ledger.format_html(neg)
+results += [
+    check("report: a negative credited saving reads as an extra cost, never '$-'",
+          "**Extra cost of model-picker's picks: $1.50**" in neg_md and "$-" not in neg_md.split("|")[0]
+          and "Saved by model-picker" not in neg_md and "At this pace" not in neg_md),
+    check("html: an extra cost is not shown in the saving colour",
+          "tile hero'" in neg_html and "tile hero good" not in neg_html and "$-1.50" not in neg_html),
 ]
 
 # --- v0.4.4: background stamps delivered on the next turn ------------------------------

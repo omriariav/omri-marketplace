@@ -2,7 +2,7 @@
 
 ## model-picker v0.8.1 (2026-11-23)
 
-- **The report leads with the saving.** `/model-picker:report` now opens with the saving credited to model-picker, in bold in the text and as a large figure at the top of the HTML page, with the number of agents behind it. For `24h` and `7d` it adds a monthly figure at that pace. The total difference (including agents whose own definition, your rules or your own pick chose the cheaper model) follows on the next line. Why: the saving was the last line of the summary, under the launch counts and the spend table.
+- **The report leads with the saving.** `/model-picker:report` now opens with the saving credited to model-picker, in bold in the text and as a large figure at the top of the HTML page, with the number of agents behind it. For `24h` and `7d` it adds a monthly figure at that pace (left out under $1). If following model-picker cost more than the session model (it recommended stronger models), the line says so as an extra cost, never as a negative saving. The total difference (including agents whose own definition, your rules or your own pick chose the cheaper model) follows on the next line. Why: the saving was the last line of the summary, under the launch counts and the spend table.
 
 ## model-picker v0.8.0 (2026-11-22)
 

@@ -366,7 +366,9 @@ with tempfile.TemporaryDirectory() as d:
     cli = subprocess.run([sys.executable, "-I", str(HOOK), "report", "--html", "--out", str(out_html), "all"],
                          capture_output=True, text=True, env={**os.environ, **st}).stdout
     results += [
-        check("html: credited saving and model table", "Credited to model-picker" in page and "<td>haiku</td>" in page),
+        check("html: credited saving is the hero, first on the page, and model table",
+              "Saved by model-picker" in page and page.index("Saved by model-picker") < page.index("Subagent spend")
+              and "<td>haiku</td>" in page),
         check("html: self-contained, no external requests", not re.search(r"(src|href)=|https?://|@import", page)),
         check("html: ledger strings are escaped", "<script>" not in evil and "&lt;script&gt;" in evil),
         check("html: each tier listed once, in tier order",
@@ -824,6 +826,27 @@ results += [
           any(md[i] == "" and md[i + 1].startswith("| Model") for i in range(len(md) - 1))),
     check("report markdown: attribution nested under the credited bullet",
           any(ln.startswith("  - Not credited") for ln in md)),
+]
+
+# --- v0.8.1: the report leads with the saving -----------------------------------------
+st = fresh_state()
+ledger.append(st, {"kind": "usage", "agent_id": "s1", "tier": "haiku", "input": 1, "output": 1, "cache_read": 0,
+                   "cache_write": 0, "cost": 0.5, "baseline_cost": 2.5, "saving": 2.0, "attribution": "model-picker"})
+ledger.append(st, {"kind": "usage", "agent_id": "s2", "tier": "sonnet", "input": 1, "output": 1, "cache_read": 0,
+                   "cache_write": 0, "cost": 1.0, "baseline_cost": 2.0, "saving": 1.0, "attribution": "definition"})
+lines = ledger.format_report(ledger.report(st, "24h")).split("\n")
+week = ledger.format_report(ledger.report(st, "7d"))
+results += [
+    check("report: first line after the title is the credited saving, with a monthly pace for 24h",
+          lines[2] == "**Saved by model-picker: $2.00** (1 agent(s) ran on the cheaper model it recommended). "
+                      "At this pace, about $60 a month."),
+    check("report: total difference shown next to the credited saving", "together: $3.00 (67% of $4.50" in lines[3]),
+    check("report: 7d pace divides by the week", "about $9 a month" in week),
+    check("report: no pace for all-time or today, or with nothing credited",
+          "At this pace" not in ledger.format_report(ledger.report(st, "all"))
+          and "At this pace" not in ledger.format_report(ledger.report(st, "today"))
+          and "At this pace" not in ledger.format_report({**ledger.report(st, "24h"), "credited_saving": 0})),
+    check("html: hero shows the pace", "about $60 a month" in ledger.format_html(ledger.report(st, "24h"))),
 ]
 
 # --- v0.4.4: background stamps delivered on the next turn ------------------------------
